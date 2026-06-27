@@ -68,7 +68,7 @@ private:
     // accept the same files, but is more permissive about dtype remapping
     // and shard boundaries.
     bool read_metadata(std::ifstream& f);
-    bool read_tensor_infos(std::ifstream& f, uint64_t n_tensors);
+    GGUFTensorInfo read_tensor_info(std::ifstream& f);   // one tensor entry
 
     std::vector<GGUFTensorInfo> tensors_;
     size_t data_offset_  = 0;

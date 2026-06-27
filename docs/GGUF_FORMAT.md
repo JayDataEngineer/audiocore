@@ -1,124 +1,188 @@
 # GGUF tensor naming conventions
 
-Every model family we support needs a documented mapping from GGUF tensor
-names → role in the model. Without this, two bad things happen:
+Canonical reference for the tensor names each family reads, and the GGUF KV
+metadata keys it expects. Names here are **verified** against:
 
-1. The loader can't tell whether a tensor is a Qwen3 backbone weight or a
-   codec weight when both live in the same GGUF.
-2. Different community quantizations of "the same" model end up with
-   incompatible tensor names, breaking the loader silently.
+- **MOSS**: [`pwilkin/openmoss`](https://github.com/pwilkin/openmoss) → `src/model.cpp`, `src/codec.cpp`
+- **ACE-Step**: [`ServeurpersoCom/acestep.cpp`](https://github.com/ServeurpersoCom/acestep.cpp) → `qwen3-lm.h`, `vae.h`, `dit.h`
 
-This doc is the canonical reference for **our** naming. Community GGUFs
-(MOSS-TTS-GGUF, ACE-Step-1.5-GGUF) may use different names; the loader
-normalizes them via an alias table.
+The family code in `src/models/<family>/loader.cpp` is the source of truth —
+if this doc and the loader disagree, the loader wins. Please update both
+together.
+
+## Why a single naming doc
+
+Two failure modes it prevents:
+
+1. The loader can't tell a Qwen3 backbone tensor from a family-specific
+   extension tensor when both live in the same GGUF. The naming convention
+   makes the role unambiguous from the prefix.
+2. Community quantizations of "the same" model end up with different tensor
+   names, breaking the loader silently. Naming this doc as the reference gives
+   us one place to push back from.
+
+---
 
 ## MOSS-TTS
 
-Two GGUF files per model:
+**One file.** The community MOSS GGUF (`moss-tts-q8_0.gguf`) ships the Qwen3-8B
+backbone AND the audio extensions in a single file. We never split it.
 
-### `moss-tts-q8_0.gguf` — Qwen3-8B backbone
+### Backbone — standard llama.cpp Qwen3 layout
 
-Tensor name prefix: `backbone.`
+libllama loads the backbone directly. Tensor names are the standard llama.cpp
+Qwen3 names — NO `moss.` prefix on these:
 
-| Prefix | Component |
+| Tensor | Role |
 |---|---|
-| `backbone.token_embd.weight` | Token embedding |
-| `backbone.blk.{i}.attn_q.weight` | Attention Q projection, layer i |
-| `backbone.blk.{i}.attn_k.weight` | Attention K projection |
-| `backbone.blk.{i}.attn_v.weight` | Attention V projection |
-| `backbone.blk.{i}.attn_output.weight` | Attention output projection |
-| `backbone.blk.{i}.ffn_gate.weight` | FFN gate |
-| `backbone.blk.{i}.ffn_up.weight` | FFN up |
-| `backbone.blk.{i}.ffn_down.weight` | FFN down |
-| `backbone.blk.{i}.attn_norm.weight` | Pre-attention RMSNorm |
-| `backbone.blk.{i}.ffn_norm.weight` | Pre-FFN RMSNorm |
-| `backbone.output_norm.weight` | Final RMSNorm |
-| `backbone.output.weight` | Output projection (tied to token_embd if tied) |
+| `token_embd.weight` | Token embedding |
+| `blk.{i}.attn_norm.weight` | Pre-attention RMSNorm |
+| `blk.{i}.attn_q.weight` | Attention Q |
+| `blk.{i}.attn_k.weight` | Attention K |
+| `blk.{i}.attn_v.weight` | Attention V |
+| `blk.{i}.attn_output.weight` | Attention output |
+| `blk.{i}.ffn_norm.weight` | Pre-FFN RMSNorm |
+| `blk.{i}.ffn_gate.weight` | FFN gate (Qwen3 SwiGLU) |
+| `blk.{i}.ffn_up.weight` | FFN up |
+| `blk.{i}.ffn_down.weight` | FFN down |
+| `output_norm.weight` | Final RMSNorm |
+| `output.weight` | Output projection (tied to `token_embd` if tied) |
 
-GGUF general metadata keys we read:
+**We do not bind these ourselves** — `qwen3::Runner::load()` hands the file
+to `llama_model_load_from_file()` and libllama owns them.
+
+### Audio extensions — `moss.*` prefix
+
+These are the tensors libllama doesn't know about. `loader.cpp` binds them
+into a separate `ggml_context` via the framework's `GgufReader`.
+
+| Tensor | Shape | Role |
+|---|---|---|
+| `moss.audio_embed.{i}.weight` | `(audio_vocab_size+1, hidden_size)` | Embeds codec token i into the Qwen3 hidden space; i ∈ [0, `moss.n_vq`) |
+| `moss.audio_head.{i}.weight`  | `(audio_vocab_size+1, hidden_size)` | Projects a hidden state → codec-token logits for stream i |
+| `moss.codec.enc.<spec>.*` | (varies) | Codec encoder (training only, unused at inference) |
+| `moss.codec.dec.<spec>.*` | (varies) | Codec decoder (~1.6B params) — PCM ← codec tokens |
+| `moss.codec.quantizer.q.{i}.codebook.weight` | `(codebook_size, hidden)` | RVQ codebook i |
+| `moss.codec.quantizer.q.{i}.{iproj,oproj}.{wp0,wp1,bias}` | (varies) | Per-stream projections |
+| `moss.codec.quantizer.{iproj,oproj}.{wp0,wp1,bias}` | (varies) | Global quantizer projections |
+
+### KV metadata (read by `loader.cpp`)
+
+Required — missing any of these is a load error:
 
 | Key | Type | Example |
 |---|---|---|
-| `moss.architecture` | string | `"qwen3"` |
-| `moss.backbone.parameter_count` | uint64 | `8000000000` |
-| `moss.audio_codec.codebook_bits` | array<uint32> | `[5,5,5,5,…]` × 32 |
-| `moss.audio_codec.sample_rate_hz` | uint32 | `48000` |
+| `moss.n_vq` | i32 | `32` |
+| `moss.audio_vocab_size` | i32 | `65536` |
+| `moss.sampling_rate` | i32 | `24000` |
 
-### `moss-tts.extras.gguf` — Codec + auxiliary
+Optional — defaults live in `MossConfig`:
 
-| Prefix | Component |
-|---|---|
-| `codec.encoder.*` | Audio codec encoder (used during training; not needed for inference) |
-| `codec.decoder.*` | Audio codec decoder (~1.6B params) |
-| `codec.quantizer.{i}.*` | RVQ codebook i, i ∈ [0, 32) |
-| `speaker_encoder.*` | ECAPA-TDNN speaker embedding network |
+| Key | Type | Default |
+|---|---|---|
+| `moss.audio_pad_code` | i32 | `0` |
+| `moss.downsample_rate` | i32 | `0` |
+| `moss.token.audio_start` | i32 | `0` |
+| `moss.token.audio_end` | i32 | `0` |
+| `moss.token.user_slot` | i32 | `0` |
+| `moss.token.audio_gen_slot` | i32 | `0` |
+| `moss.token.audio_delay_slot` | i32 | `0` |
+| `moss.token.im_start` | i32 | `0` |
+| `moss.token.im_end` | i32 | `0` |
+| `moss.token.pad` | i32 | `0` |
+| `moss.codec.present` | i32 | `0` |
+
+---
 
 ## ACE-Step
 
-Four GGUF files per model configuration; the loader takes a directory and
-discovers files by name pattern.
-
-### `acestep-v15-{turbo|sft}-Q8_0.gguf` — DiT (diffusion transformer)
-
-Tensor name prefix: `dit.`
-
-| Prefix | Component |
-|---|---|
-| `dit.pos_embed.weight` | Positional embedding |
-| `dit.t_embedder.mlp.0.*` | Timestep embedding MLP layer 0 |
-| `dit.t_embedder.mlp.2.*` | Timestep embedding MLP layer 2 |
-| `dit.y_embedder.*` | Conditioning embedding |
-| `dit.blocks.{i}.norm1.*` | Pre-attention norm, block i |
-| `dit.blocks.{i}.attn.qkv.*` | Fused QKV projection |
-| `dit.blocks.{i}.attn.proj.*` | Attention output projection |
-| `dit.blocks.{i}.norm2.*` | Pre-FFN norm |
-| `dit.blocks.{i}.mlp.fc1.*` | FFN up |
-| `dit.blocks.{i}.mlp.fc2.*` | FFN down |
-| `dit.final_layer.*` | Final norm + AdaLN |
-
-Metadata:
-
-| Key | Example | Notes |
-|---|---|---|
-| `acestep.architecture` | `"dit_v1.5"` | |
-| `acestep.variant` | `"turbo"` / `"sft"` / `"xl-turbo"` / `"xl-sft"` / `"xl-base"` | Selects inference schedule |
-| `acestep.dit.parameter_count` | `1100000000` | ~1.1B for the 1.7B-LM-paired DiT |
-| `acestep.dit.inference_steps_default` | `8` | turbo; `50` for sft |
+**Four files per model directory.** Each file is independent; the loader
+locates them by filename pattern.
 
 ### `acestep-5Hz-lm-{1.7B|4B}-Q8_0.gguf` — music-code LM
 
-Tensor name prefix: `lm.` Same Qwen3-style layout as MOSS-TTS backbone but
-with a music-code vocabulary instead of natural-language tokens.
+Qwen3 transformer. ACE-Step **ships these with HF PyTorch names** that
+libllama refuses:
+
+| HF name (shipped) | llama.cpp name (required) |
+|---|---|
+| `model.embed_tokens.weight` | `token_embd.weight` |
+| `model.norm.weight` | `output_norm.weight` |
+| `model.layers.{i}.input_layernorm.weight` | `blk.{i}.attn_norm.weight` |
+| `model.layers.{i}.self_attn.q_proj.weight` | `blk.{i}.attn_q.weight` |
+| `model.layers.{i}.self_attn.k_proj.weight` | `blk.{i}.attn_k.weight` |
+| `model.layers.{i}.self_attn.v_proj.weight` | `blk.{i}.attn_v.weight` |
+| `model.layers.{i}.self_attn.o_proj.weight` | `blk.{i}.attn_output.weight` |
+| `model.layers.{i}.post_attention_layernorm.weight` | `blk.{i}.ffn_norm.weight` |
+| `model.layers.{i}.mlp.gate_proj.weight` | `blk.{i}.ffn_gate.weight` |
+| `model.layers.{i}.mlp.up_proj.weight` | `blk.{i}.ffn_up.weight` |
+| `model.layers.{i}.mlp.down_proj.weight` | `blk.{i}.ffn_down.weight` |
+
+`tools/convert_acestep_gguf.py` rewrites them **once** at download time.
+After conversion the file loads via `qwen3::Runner::load()` exactly like a
+vanilla Qwen3 GGUF. There is no second Qwen3 implementation in audiocore.
 
 ### `Qwen3-Embedding-0.6B-Q8_0.gguf` — text encoder
 
-Tensor name prefix: `te.` Standard Qwen3 embedding layout. Used to encode
-the caption + lyrics into conditioning vectors for the LM.
+Same HF→llama.cpp rename table as the LM above. The text encoder is a
+Qwen3 transformer too — same runner, same libllama, same path.
+
+### `acestep-v15-{turbo|sft|xl-*}-Q8_0.gguf` — DiT (diffusion transformer)
+
+NOT a Qwen3 transformer — we bind these into `ext_ctx_` ourselves. Native
+PyTorch names (no prefix), verified from `acestep.cpp`:
+
+| Tensor | Role |
+|---|---|
+| `decoder.time_embed` | Timestep embedding |
+| `decoder.time_embed_r` | Timestep embedding (second branch) |
+| `decoder.proj_in.1.weight` / `.bias` | Patch projection in |
+| `decoder.condition_embedder.weight` / `.bias` | Conditioning embedder |
+| `decoder.norm_out.weight` | Final norm |
+| `decoder.scale_shift_table` | AdaLN scale/shift table |
+| `decoder.proj_out.1.weight` / `.bias` | Patch projection out |
+| `null_condition_emb` | CFG null conditioning embedding |
+| `decoder.block.{i}.*` | Per-block attention + MLP weights |
 
 ### `vae-BF16.gguf` — audio VAE decoder
 
-Tensor name prefix: `vae.` Converts DiT latents → 48 kHz stereo PCM.
+Also bound into `ext_ctx_`. Verified names from `acestep.cpp:vae.h`. The
+loader prefixes these with `vae.` at bind time to avoid collision with DiT's
+`decoder.*` namespace (see naming-collision note below). VAE graph code looks
+up `vae.decoder.*`; the table shows names as shipped in the GGUF:
 
-| Prefix | Component |
-|---|---|
-| `vae.encoder.conv_in.*` | VAE encoder conv (training only; unused at inference) |
-| `vae.decoder.conv_in.*` | Decoder conv input |
-| `vae.decoder.mid.block_{i}.*` | Mid-block residual layers |
-| `vae.decoder.up.{i}.block_{j}.*` | Upsampling stages |
-| `vae.decoder.conv_out.*` | Final conv → audio samples |
-| `vae.quant_conv.*` | Latent quantization conv (training only) |
+| Tensor (shipped) | Bound as | Role |
+|---|---|---|
+| `decoder.conv1` / `decoder.conv1.bias` | `vae.decoder.conv1` | Initial conv |
+| `decoder.block.{i}.*` | `vae.decoder.block.{i}.*` | Residual blocks (Snake activation) |
+| `decoder.snake1.alpha` / `decoder.snake1.beta` | `vae.decoder.snake1.{alpha,beta}` | Snake activation params |
+| `decoder.conv2` | `vae.decoder.conv2` | Final conv → PCM |
 
-## Versioning
+**Naming collision note:** DiT and VAE both ship with `decoder.*` trees.
+Within any one GGUF file there's no collision, but `loader.cpp` binds both
+into a single `ext_ctx_` so codec graph code can reach both. We resolve the
+collision by prefixing VAE tensor names with `vae.` at bind time — no
+converter step required, no rename at the file level. DiT tensors stay
+unprefixed because the DiT block path is the larger graph and we'd rather
+not retag every `ggml_get_tensor` call inside it.
 
-Family-specific keys are prefixed with the family name to avoid collisions
-when we eventually merge multiple families into a single GGUF bundle (e.g.
-`moss_tts.gguf` + `moss_codec.gguf` → `moss_full.gguf`).
+### KV metadata (DiT file, read by `loader.cpp`)
 
-A `audiocore.gguf_version` uint32 at the top of every file lets us refuse
-incompatible files cleanly:
+| Key | Type | Notes |
+|---|---|---|
+| `acestep.in_channels` | i32 | |
+| `acestep.audio_acoustic_hidden_dim` | i32 | |
+| `acestep.patch_size` | i32 | |
+| `acestep.sliding_window` | i32 | |
+| `acestep.config_json` | string | Full upstream config (fallback) |
+| `acestep.variant` | string | `turbo` / `sft` / `xl-turbo` / `xl-sft` |
 
-```cpp
-if (meta["audiocore.gguf_version"].u32() != 1) {
-    return error("unsupported audiocore GGUF version");
-}
-```
+---
+
+## Why no `audiocore.gguf_version`
+
+We don't write our own GGUFs (yet). When we do — quantizer tool, merged
+multi-family bundles — a top-level `audiocore.gguf_version` uint32 will be
+added at that point and validated at load. Today every file we read was
+written by upstream tools (llama.cpp's quantizer, the community ACE-Step
+release), so a version header we never wrote would just refuse valid input.

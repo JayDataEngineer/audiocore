@@ -7,7 +7,7 @@
 //
 // Model code never sees this directly. It works through Session, which
 // owns a Backend instance and exposes task-specific calls (run_tts,
-// run_asr, …) that map onto the backend's run() primitive.
+// run_music, …) that map onto the backend's run() primitive.
 
 #ifndef AUDIOCORE_FRAMEWORK_CORE_BACKEND_H
 #define AUDIOCORE_FRAMEWORK_CORE_BACKEND_H

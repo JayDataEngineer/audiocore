@@ -1,0 +1,122 @@
+// family.h — ACE-Step music-generation family session.
+//
+// ACE-Step is LM (Qwen3 5Hz) + text encoder (Qwen3-Embedding) + DiT + VAE.
+// The two transformers go through the unified qwen3::Runner (libllama),
+// exactly like MOSS's backbone. The DiT and VAE aren't transformers — they
+// bind into our own ggml_context, same shape as MOSS's moss.* extensions.
+//
+// One GGUF directory in → four GgufReader passes:
+//   • LM GGUF  → qwen3::Runner (after tensor-name conversion, see below)
+//   • TE GGUF  → qwen3::Runner (after conversion)
+//   • DiT GGUF → ext_ctx_ (bound by name from acestep.* tensors)
+//   • VAE GGUF → ext_ctx_ (bound by name from vae.* tensors)
+//
+// Why conversion: ACE-Step's LM and TE ship with HF tensor names
+// (model.embed_tokens.weight, model.layers.0.self_attn.q_proj.weight, …)
+// that libllama refuses. tools/convert_acestep_gguf.py rewrites them once
+// to llama.cpp names (token_embd.weight, blk.0.attn_q.weight, …) so the
+// SAME qwen3::Runner loads them. There is no second Qwen3 impl in audiocore.
+//
+// Verified tensor names from ServeurpersoCom/acestep.cpp — see
+// docs/GGUF_FORMAT.md → "ACE-Step" section.
+
+#ifndef AUDIOCORE_MODELS_ACE_STEP_FAMILY_H
+#define AUDIOCORE_MODELS_ACE_STEP_FAMILY_H
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "audiocore/framework/core/session.h"
+#include "audiocore/framework/io/gguf_reader.h"   // complete type — methods take GgufReader&
+#include "audiocore/models/qwen3/runner.h"
+
+struct ggml_context;
+struct ggml_tensor;
+
+namespace audiocore::acestep {
+
+// Parsed from ACE-Step GGUF KV metadata (DiT file). Verified keys from
+// ServeurpersoCom/acestep.cpp's config loader.
+struct AceConfig {
+    int32_t in_channels             = 0;   // acestep.in_channels
+    int32_t audio_acoustic_hidden_dim = 0; // acestep.audio_acoustic_hidden_dim
+    int32_t patch_size              = 0;   // acestep.patch_size
+    int32_t sliding_window          = 0;   // acestep.sliding_window
+    std::string config_json;               // acestep.config_json (raw)
+    std::string variant;                   // "turbo" | "sft" | "xl-turbo" | …
+};
+
+struct MusicRequest {
+    std::string caption;             // prompt ("lo-fi ambient piano")
+    std::string lyrics;              // optional lyrics text
+    float       duration     = 30.0f; // seconds
+    int32_t     seed         = 0;
+    float       guidance_scale = 7.5f;
+    int32_t     n_diffusion_steps = 0;  // 0 → variant default (turbo=8, sft=50)
+};
+
+struct MusicResponse {
+    std::vector<float> pcm_stereo;   // interleaved L,R,L,R at 48000 Hz
+    int32_t            sampling_rate = 48000;
+    int32_t            channels      = 2;
+    std::string        error;
+};
+
+class AceStepSession : public Session {
+public:
+    ~AceStepSession() override;
+    std::string family_name() const override { return "ace_step"; }
+    bool load(const std::string& model_path,
+              const LoadOptions& opts,
+              const BackendConfig& backend_cfg,
+              std::string* error = nullptr) override;
+    bool run_music(const void* request, void* response,
+                   std::string* error = nullptr) override;
+
+    const AceConfig& config() const { return cfg_; }
+
+private:
+    // Step 1 of the two-step pipeline. Encodes caption+lyrics via TE, runs
+    // the 5Hz LM with classifier-free guidance → music codes. Output:
+    // (n_codes,) int32. Cached on the session so step 2 can run separately.
+    bool run_lm(const MusicRequest& req, std::vector<int32_t>* music_codes,
+                std::string* error);
+
+    // Step 2. DiT diffusion conditioned on music_codes → latents, then VAE
+    // decode latents → 48 kHz stereo PCM.
+    bool run_dit_and_vae(const MusicRequest& req,
+                         const std::vector<int32_t>& music_codes,
+                         std::vector<float>* pcm_stereo,
+                         std::string* error);
+
+    // Bind every dit.* / vae.* tensor into ext_ctx_, anchoring a few hot
+    // tensors on the session for fast access during graph build.
+    bool bind_dit_and_vae(const GgufReader& dit,
+                          const GgufReader& vae,
+                          std::string* error);
+
+    // Refuses if the GGUF at `path` still has HF-style names. libllama only
+    // loads llama.cpp-style names; ACE-Step ships the former, so callers must
+    // run tools/convert_acestep_gguf.py first.
+    bool check_llamacpp_layout(const GgufReader& r,
+                               const char* role, std::string* error);
+
+    std::unique_ptr<qwen3::Runner> lm_;   // 5Hz music-code LM
+    std::unique_ptr<qwen3::Runner> te_;   // Qwen3-Embedding text encoder
+    ggml_context*  ext_ctx_   = nullptr;  // DiT (decoder.*) + VAE (vae.decoder.*).
+    // Anchored hot tensors. DiT names are unprefixed; VAE names are
+    // `vae.`-prefixed at bind time to dodge the `decoder.block.{i}.*`
+    // collision with DiT (both upstream files use the same `decoder.*` tree).
+    ggml_tensor*   dit_proj_in_   = nullptr;   // decoder.proj_in.1.weight
+    ggml_tensor*   dit_proj_out_  = nullptr;   // decoder.proj_out.1.weight
+    ggml_tensor*   dit_time_embed_= nullptr;   // decoder.time_embed
+    ggml_tensor*   vae_conv_in_   = nullptr;   // vae.decoder.conv1 (bound as vae.*)
+    ggml_tensor*   vae_conv_out_  = nullptr;   // vae.decoder.conv2
+    AceConfig      cfg_;
+    bool           owns_ext_ctx_ = false;
+};
+
+}  // namespace audiocore::acestep
+
+#endif  // AUDIOCORE_MODELS_ACE_STEP_FAMILY_H

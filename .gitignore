@@ -10,8 +10,6 @@ build/
 .cache/
 .clangd/
 compile_commands.json
-third_party/ggml/
-third_party/onnxruntime/
 *.gguf
 *.safetensors
 *.onnx
