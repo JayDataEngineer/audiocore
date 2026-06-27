@@ -1,0 +1,56 @@
+{
+  "host": "127.0.0.1",
+  "port": 8080,
+  "device": 0,
+  "threads": 1,
+  "models": [
+    {
+      "id": "moss-tts",
+      "family": "moss_tts",
+      "path": "/mnt/data/models/audio/moss-tts/moss-tts-q8_0.gguf",
+      "task": "tts",
+      "mode": "offline",
+      "backend": "ggml_cuda",
+      "load_options": {
+        "extras_path": "/mnt/data/models/audio/moss-tts/moss-tts.extras.gguf",
+        "keep_in_vram": true
+      }
+    },
+    {
+      "id": "ace-step-turbo",
+      "family": "ace_step",
+      "path": "/mnt/data/models/audio/acestep-cpp",
+      "task": "music",
+      "mode": "offline",
+      "backend": "ggml_cuda",
+      "load_options": {
+        "dit_model": "acestep-v15-turbo-Q8_0.gguf",
+        "lm_model":  "acestep-5Hz-lm-1.7B-Q8_0.gguf",
+        "text_encoder": "Qwen3-Embedding-0.6B-Q8_0.gguf",
+        "vae_model": "vae-BF16.gguf",
+        "inference_steps": 8,
+        "guidance_scale": 1.0,
+        "shift": 3.0,
+        "keep_in_vram": true
+      }
+    },
+    {
+      "id": "ace-step-sft",
+      "family": "ace_step",
+      "path": "/mnt/data/models/audio/acestep-cpp",
+      "task": "music",
+      "mode": "offline",
+      "backend": "ggml_cuda",
+      "load_options": {
+        "dit_model": "acestep-v15-sft-Q8_0.gguf",
+        "lm_model":  "acestep-5Hz-lm-1.7B-Q8_0.gguf",
+        "text_encoder": "Qwen3-Embedding-0.6B-Q8_0.gguf",
+        "vae_model": "vae-BF16.gguf",
+        "inference_steps": 50,
+        "guidance_scale": 1.0,
+        "shift": 1.0,
+        "keep_in_vram": true
+      }
+    }
+  ]
+}
