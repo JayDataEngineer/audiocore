@@ -27,7 +27,7 @@ Pre-alpha. Currently scaffolding:
 - [x] Backend abstraction (ggml CUDA/CPU now, ONNX Runtime later)
 - [ ] MOSS-TTS family: loader, session, codec wiring
 - [ ] ACE-Step family: loader, two-step pipeline (LM / DiT / VAE)
-- [ ] Server: `/v1/audio/speech`, `/v1/audio/transcriptions`, `/health`, `/v1/models`
+- [ ] Server: `/v1/audio/speech`, `/v1/audio/music`, `/health`, `/v1/models`
 - [ ] CLI: `--task tts --family moss_tts --model /path …`
 - [ ] Weight converter: `safetensors → gguf` for MOSS + ACE-Step
 - [ ] ONNX Runtime backend (Phase 2)

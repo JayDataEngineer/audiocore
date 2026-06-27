@@ -14,9 +14,15 @@
 #include "audiocore/framework/io/gguf_reader.h"
 
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "audiocore/framework/io/gguf_reader_ext.h"
 
@@ -29,6 +35,22 @@ void set_error(std::string* error, const std::string& message) {
 }
 
 }  // namespace
+
+// RAII wrapper around mmap(). Forward-declared in the header (without sys/mman.h)
+// and defined here so the rest of the project doesn't need to see POSIX types.
+// Windows support goes through a future MapViewOfFile branch — marked TODO.
+struct MMapHandle {
+    void*  base = MAP_FAILED;
+    size_t size = 0;
+    int    fd   = -1;
+    ~MMapHandle() {
+        if (base != MAP_FAILED) munmap(static_cast<char*>(base), size);
+        if (fd   != -1)         close(fd);
+    }
+};
+
+GgufReader::GgufReader() = default;   // out-of-line so member cleanup sees full MMapHandle
+GgufReader::~GgufReader() = default;
 
 bool GgufReader::is_gguf_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -47,10 +69,35 @@ bool GgufReader::load(const std::string& path, std::string* error) {
     tensors_.clear();
 
     // ── Path 1: try upstream ggml GGUF parser ─────────────────────────────
-    // Handles well-formed files written by gguf_init_empty()/gguf_write_to_file(),
-    // including the standard quantization types (Q4_0 … Q8_0, F16, BF16, …).
+    // no_alloc=true so meta_ctx_ holds tensor structs only; the actual weight
+    // bytes stay in our mmap below (zero-copy, see tensor_data_ptr()).
     ctx_ = gguf_init_from_file(path.c_str(), {.no_alloc = true, .ctx = &meta_ctx_});
     if (ctx_) {
+        // mmap the whole file once. tensor_data_ptr() returns
+        // mmap_base_ + t.offset, so family code gets zero-copy access to
+        // multi-GB weights without doubling RSS.
+        std::unique_ptr<MMapHandle> mm(new MMapHandle);
+        mm->fd = ::open(path.c_str(), O_RDONLY);
+        if (mm->fd < 0) {
+            set_error(error, "open() failed for '" + path + "'");
+            return false;
+        }
+        struct stat st {};
+        if (::fstat(mm->fd, &st) != 0) {
+            set_error(error, "fstat() failed for '" + path + "'");
+            return false;
+        }
+        mm->size = static_cast<size_t>(st.st_size);
+        mm->base = ::mmap(nullptr, mm->size, PROT_READ, MAP_PRIVATE, mm->fd, 0);
+        if (mm->base == MAP_FAILED) {
+            set_error(error, "mmap() failed for '" + path + "'");
+            return false;
+        }
+        // Keep the mmap alive for our lifetime. Released in destructor via
+        // the unique_ptr below.
+        mmap_owner_ = std::move(mm);
+        mmap_base_  = static_cast<const char*>(mmap_owner_->base);
+
         const int n_tensors = static_cast<int>(gguf_get_n_tensors(ctx_));
         const size_t data_offset = gguf_get_data_offset(ctx_);
         tensors_.reserve(n_tensors);
@@ -75,6 +122,8 @@ bool GgufReader::load(const std::string& path, std::string* error) {
 
     // ── Path 2: fallback manual reader ────────────────────────────────────
     // For files the stock parser rejects. Same TensorStorage output shape.
+    // No mmap here — materialize() will read on demand. (Rare path; the cost
+    // of always-mmap'ing files that fall through to Path 2 isn't worth it.)
     GGUFReaderExt reader;
     if (!reader.load(path)) {
         set_error(error, "failed to open '" + path + "' with GGUFReaderExt");
@@ -97,9 +146,16 @@ bool GgufReader::load(const std::string& path, std::string* error) {
 
 bool GgufReader::materialize(const TensorStorage& t, void* dst,
                              std::string* error) const {
-    // Single-file GGUF: open, seek, read. Multi-file (sharded) variants
-    // would key off t.storage_key instead. MOSS/ACE GGUFs are single-file
-    // today; sharding is a Phase 2 concern.
+    // Fast path: alias the mmap.
+    if (mmap_base_) {
+        if (t.offset + t.nbytes_to_read() > mmap_owner_->size) {
+            set_error(error, "tensor '" + t.name + "' runs past EOF");
+            return false;
+        }
+        std::memcpy(dst, mmap_base_ + t.offset, t.nbytes_to_read());
+        return true;
+    }
+    // Fallback path (Path 2 above): open, seek, read.
     std::ifstream f(path_, std::ios::binary);
     if (!f.is_open()) {
         set_error(error, "could not reopen '" + path_ + "'");
@@ -112,9 +168,67 @@ bool GgufReader::materialize(const TensorStorage& t, void* dst,
         set_error(error, "short read on tensor '" + t.name + "'");
         return false;
     }
-    // f8/f64/i64 unpack → f16/f32. Same conversion rules as sd.cpp.
-    // (Defer to a shared convert pass; see materialize_conversions.cpp.)
     return true;
+}
+
+// ---- Typed KV getters ----------------------------------------------------
+// Thin wrappers over gguf_get_val_* so family code doesn't have to know the
+// enum-as-int dance. All return false on missing key or type mismatch.
+
+bool GgufReader::get_kv_i32(const char* key, int32_t* out) const {
+    if (!ctx_) return false;
+    const int64_t k = gguf_find_key(ctx_, key);
+    if (k < 0) return false;
+    if (gguf_get_kv_type(ctx_, k) != GGUF_TYPE_INT32) return false;
+    *out = gguf_get_val_i32(ctx_, k);
+    return true;
+}
+
+bool GgufReader::get_kv_i64(const char* key, int64_t* out) const {
+    if (!ctx_) return false;
+    const int64_t k = gguf_find_key(ctx_, key);
+    if (k < 0) return false;
+    if (gguf_get_kv_type(ctx_, k) != GGUF_TYPE_INT64) return false;
+    *out = gguf_get_val_i64(ctx_, k);
+    return true;
+}
+
+bool GgufReader::get_kv_u32(const char* key, uint32_t* out) const {
+    if (!ctx_) return false;
+    const int64_t k = gguf_find_key(ctx_, key);
+    if (k < 0) return false;
+    if (gguf_get_kv_type(ctx_, k) != GGUF_TYPE_UINT32) return false;
+    *out = gguf_get_val_u32(ctx_, k);
+    return true;
+}
+
+bool GgufReader::get_kv_bool(const char* key, bool* out) const {
+    if (!ctx_) return false;
+    const int64_t k = gguf_find_key(ctx_, key);
+    if (k < 0) return false;
+    if (gguf_get_kv_type(ctx_, k) != GGUF_TYPE_BOOL) return false;
+    *out = gguf_get_val_bool(ctx_, k);
+    return true;
+}
+
+bool GgufReader::get_kv_str(const char* key, std::string* out) const {
+    if (!ctx_) return false;
+    const int64_t k = gguf_find_key(ctx_, key);
+    if (k < 0) return false;
+    if (gguf_get_kv_type(ctx_, k) != GGUF_TYPE_STRING) return false;
+    *out = gguf_get_val_str(ctx_, k);
+    return true;
+}
+
+const void* GgufReader::tensor_data_ptr(const TensorStorage& t) const {
+    if (mmap_base_) {
+        // Bounds check; on overflow return null so callers can fall back to
+        // materialize() rather than reading garbage.
+        if (t.offset + t.nbytes_to_read() > mmap_owner_->size) return nullptr;
+        return mmap_base_ + t.offset;
+    }
+    // Path 2 has no mmap; caller must use materialize() instead.
+    return nullptr;
 }
 
 bool write_gguf_file(const std::string& path,

@@ -47,17 +47,25 @@ public:
     // Concrete I/O structs (TtsRequest, MusicRequest, …) are defined in
     // headers under include/audiocore/framework/runtime/tasks.h (to be
     // added when the first family lands).
+    //
+    // Scope: TTS + music generation only. ASR / transcription is explicitly
+    // out of scope — those go through CrispASR / whisper.cpp upstream, not
+    // here.
     virtual bool run_tts(const void* request, void* response,
                          std::string* error = nullptr)   { return false; }
     virtual bool run_music(const void* request, void* response,
                            std::string* error = nullptr) { return false; }
-    virtual bool run_asr(const void* request, void* response,
-                         std::string* error = nullptr)   { return false; }
 
     bool loaded() const { return loaded_; }
 
 protected:
+    // Primary weight loader (single-file families). The mmap backing any
+    // tensor pointers the family code captured during load() stays alive
+    // for the session's lifetime because loader_ holds the WeightLoader.
     std::unique_ptr<WeightLoader> loader_;
+    // Multi-file families (e.g. ACE-Step has 4 GGUFs) keep their additional
+    // readers here so the same lifetime guarantee applies to every file.
+    std::vector<std::unique_ptr<WeightLoader>> extra_loaders_;
     std::unique_ptr<Backend>      backend_;
     bool loaded_ = false;
 };

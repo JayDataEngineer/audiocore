@@ -48,7 +48,7 @@ native shape and submit them.
               │  Session (one per configured model id)                  │
               │  • owns WeightLoader (reads weights on demand)          │
               │  • owns Backend (submits graphs for execution)          │
-              │  • exposes run_tts / run_music / run_asr                │
+              │  • exposes run_tts / run_music                          │
               └────────────────────────────┬─────────────────────────────┘
                                            │
               ┌────────────────────────────┴─────────────────────────────┐
@@ -104,7 +104,7 @@ run on ONNX Runtime tomorrow by changing one line in `server.json`:
 
 ## What changes for each new model family
 
-Adding a new family (e.g. `kokoro_tts`, `spark_tts`, `whisper`):
+Adding a new family (e.g. `kokoro_tts`, `spark_tts`, `chatterbox`):
 
 1. Create `src/models/<family>/{loader.cpp,session.cpp,…}`.
 2. Document the tensor map in `docs/GGUF_FORMAT.md`.

@@ -36,9 +36,22 @@ option(ENGINE_BUILD_CLI          "Build audiocore_cli"          ON)
 option(ENGINE_BUILD_SERVER       "Build audiocore_server"       ON)
 option(ENGINE_BUILD_TESTS        "Build unit tests"             OFF)
 
-# ── ggml (subtree in third_party/ggml) ───────────────────────────────────
-# Pinned via git submodule. Same source llama.cpp / stable-diffusion.cpp use.
-add_subdirectory(third_party/ggml EXCLUDE_FROM_ALL)
+# ── llama.cpp (subtree in third_party/llama.cpp) ─────────────────────────
+# Pinned via git submodule. Provides libllama (Qwen3 inference) AND vendors
+# its own ggml under llama.cpp/ggml/. We use the llama.cpp copy and drop our
+# standalone third_party/ggml submodule to avoid symbol clashes.
+#
+# Build flags passed through to llama.cpp's build:
+set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
+set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
+set(GGML_BUILD_TESTS     OFF CACHE BOOL "" FORCE)
+set(GGML_BUILD_EXAMPLES  OFF CACHE BOOL "" FORCE)
+if(ENGINE_ENABLE_CUDA)
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+endif()
+add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
 
 # ── audiocore framework library ──────────────────────────────────────────
 add_library(audiocore_framework STATIC
@@ -48,18 +61,25 @@ add_library(audiocore_framework STATIC
     src/framework/core/backend.cpp
     src/framework/core/session.cpp
     src/framework/runtime/registry.cpp
-    # Per-family code is added here as families land:
-    # src/models/moss_tts/loader.cpp
-    # src/models/moss_tts/session.cpp
-    # src/models/ace_step/loader.cpp
-    # src/models/ace_step/session.cpp
+    # The ONE Qwen3 transformer path in audiocore. Used by every family
+    # whose model includes a Qwen3 backbone (MOSS 8B) or Qwen3 LM / TE
+    # (ACE-Step 5Hz LM, ACE-Step Qwen3-Embedding).
+    src/framework/models/qwen3/runner.cpp
+    # Per-family code:
+    src/models/moss_tts/loader.cpp
+    src/models/moss_tts/session.cpp
+    src/models/ace_step/loader.cpp
+    src/models/ace_step/session.cpp
 )
 target_include_directories(audiocore_framework
-    PUBLIC include third_party)
-target_link_libraries(audiocore_framework PUBLIC ggml gguf)
-if(ENGINE_ENABLE_CUDA)
-    target_link_libraries(audiocore_framework PUBLIC ggml-cuda)
-endif()
+    PUBLIC
+        include
+        third_party
+        third_party/llama.cpp/include
+        third_party/llama.cpp/ggml/include
+        third_party/httplib
+        third_party/nlohmann)
+target_link_libraries(audiocore_framework PUBLIC llama)
 
 # ── Binaries ─────────────────────────────────────────────────────────────
 if(ENGINE_BUILD_CLI)
@@ -69,7 +89,8 @@ endif()
 
 if(ENGINE_BUILD_SERVER)
     add_executable(audiocore_server src/server/main.cpp)
-    target_link_libraries(audiocore_server PRIVATE audiocore_framework)
+    # cpp-httplib needs Threads on linux.
+    target_link_libraries(audiocore_server PRIVATE audiocore_framework pthread)
 endif()
 
 if(ENGINE_BUILD_TESTS)
