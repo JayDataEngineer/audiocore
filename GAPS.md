@@ -31,7 +31,7 @@ MOSS-Audio-Tokenizer-v2 / -Nano codec infrastructure.
 | MOSS-VoiceGenerator (1.7B voice design) | ❌ no voice-design mode |
 | MOSS-TTS-Realtime (1.7B streaming) | ❌ no streaming endpoint |
 | MOSS-SoundEffect (8B sound effects) | 🟡 `mode="sfx"` runs the backbone, **silence stub for codec** |
-| MOSS-Audio-Tokenizer-v2 / -Nano | 🚧 blocked on a ggml port of the speech-tokenizer graph |
+| MOSS-Audio-Tokenizer-v2 / -Nano | 📋 reference impl identified — `pwilkin/openmoss` (Apache-2.0) ships the full encoder/decoder/RVQ graphs; pre-built sidecar GGUFs at `smcled/MOSS-TTS-v1.5-GGUF`. Stage 16 port tracked in `docs/CODEC_PORTS.md` §1 |
 
 ### 1.2 Modes (the `mode` field on `TtsRequest`)
 
@@ -51,13 +51,25 @@ into 24/48 kHz PCM) was originally wired through ONNX Runtime. Stage 1
 deleted that surface; the planned replacement is a ggml_cgraph port that
 reads `moss.codec.dec.*` tensors from the same GGUF as the backbone.
 
-Until that port lands, every MOSS-TTS request emits 1 s of silence where
+**Stage 15 update:** the port is no longer ground-up. `pwilkin/openmoss`
+(Apache-2.0) ships a production-quality implementation at
+`src/codec.cpp` (1087 lines) — encoder, decoder, 32-RVQ LFQ quantizer,
+weight-norm reconstruction, flash attention, the works. Pre-built
+sidecar GGUFs that already contain the `moss.codec.*` tensors are
+available at `smcleod/MOSS-TTS-v1.5-GGUF` and `ilintar/moss-tts-gguf`.
+`docs/CODEC_PORTS.md` §1 has the full tensor map, the 4-stage
+ProjectedTransformer spec, the substitution table from openmoss types
+onto audiocore's `Backend` / `TensorStorage` / `WeightLoader`, and the
+file-level port plan.
+
+Until Stage 16 lands, every MOSS-TTS request emits 1 s of silence where
 the codec decode should be. The transformer pipeline upstream of the
 codec is exercised end-to-end — only the final decode is stubbed.
 
-**Dependencies to close:** `moss.codec.dec.*` tensor layout (documented in
-`docs/GGUF_FORMAT.md`), CNN-free causal transformer architecture
-(upstream `openmoss/src/codec.cpp`), ~1.6B parameters of weights.
+**Dependencies to close:** adapt `openmoss/src/codec.cpp` into
+`src/models/moss_tts/codec.cpp` (mechanical — same ggml backend, same
+tensor library). ~1.6B parameters of weights ship pre-built in the
+sidecar GGUF.
 
 ---
 
@@ -75,7 +87,7 @@ multi-codebook codec.
 | Qwen3-TTS 1.7B CustomVoice | 🟡 **no variant detection**; the loader treats every Qwen3-TTS GGUF identically |
 | Qwen3-TTS 1.7B VoiceDesign | 🟡 same — no variant-specific defaults |
 | Qwen3-TTS 0.6B Base / CustomVoice / VoiceDesign | 🟡 same — no size detection |
-| Qwen3-TTS-Tokenizer-12Hz (codec) | 🚧 blocked on a ggml port |
+| Qwen3-TTS-Tokenizer-12Hz (codec) | 📋 reference impl identified — `CrispStrobe/CrispASR` (MIT) ships the codec; pre-built GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`. Stage 17 port tracked in `docs/CODEC_PORTS.md` §2 |
 
 ### 2.2 Modes
 
@@ -89,18 +101,30 @@ multi-codebook codec.
 
 ### 2.3 Codec / speaker encoder
 
-Two ports are blocked:
+Two ports remain; both have identified references after Stage 15:
 
 1. **Qwen3-TTS-Tokenizer-12Hz** — multi-codebook speech encoder/decoder.
-   Turns the 32-codebook matrix into 24 kHz mono PCM. Same situation as
-   MOSS: ggml port pending, silence stub in the meantime.
+   Turns the 16-codebook matrix into 24 kHz mono PCM.
+   **Stage 15 update:** `CrispStrobe/CrispASR` (MIT) ships a
+   production-quality ggml implementation of the codec (WavTokenizer-class:
+   16 codebooks, codebook_size=2048, latent_dim=1024, 8 pre-transformer
+   ConvNeXt+SnakeBeta layers, upsample_rates {8,5,4,3} → 480×). Pre-built
+   GGUFs (`tokenizer-f16.gguf`, `tokenizer-q8_0.gguf`) at
+   `cstr/qwen3-tts-tokenizer-12hz-GGUF` load directly — no converter
+   needed. `docs/CODEC_PORTS.md` §2 has the full architecture, tensor
+   naming, and the file-level port plan. The qwen3-tts.cpp fork at
+   `predict-woo/qwen3-tts.cpp` was **rejected** as a reference because it
+   ships no license file.
 2. **ECAPA-TDNN speaker encoder** — extracts a speaker embedding from a
    short reference clip for Voice Clone mode. Currently no code; the
    `reference_audio` field is parsed but ignored.
+   **Stage 15 bonus:** the same CrispASR repo ports the ECAPA-TDNN
+   encoder alongside its Qwen3-TTS codec (see its `qwen3_tts.h`
+   `set_voice_prompt*` API). Stage 17 brings this in for free.
 
-**Dependencies to close:** Qwen3-TTS-Tokenizer-12Hz architecture (from
-`QwenLM/Qwen3-TTS` Python reference), ECAPA-TDNN architecture + weights,
-per-variant config.json parsing.
+**Dependencies to close:** adapt CrispASR's `src/qwen3_tts.cpp` codec
+section into `src/models/qwen3_tts/codec.cpp`; the ECAPA-TDNN port
+follows from the same upstream.
 
 ---
 
@@ -206,15 +230,22 @@ single session but are listed so the work is plan-able.
 14. **ACE-Step Repainting (Inpainting)** — DiT accepts mask + partial
     latent. Largest of the three DiT-extension gaps.
 
-### Large (new weights or major ports — out of scope for one session)
+### Large (major ports — now scoped, references identified)
 
-15. 🚧 **MOSS-Audio-Tokenizer ggml port** — ~1.6B-param neural codec,
-    port from upstream `openmoss/src/codec.cpp`. Unblocks all MOSS modes
-    end-to-end.
-16. 🚧 **Qwen3-TTS-Tokenizer-12Hz ggml port** — multi-codebook codec
-    from `QwenLM/Qwen3-TTS`. Unblocks all Qwen3-TTS modes end-to-end.
-17. 🚧 **ECAPA-TDNN speaker encoder port** — small model (~22M params)
-    but entirely new architecture in audiocore. Unblocks true Voice Clone.
+15. 📋 **Stage 16 — MOSS-Audio-Tokenizer ggml port** — ~1.6B-param neural
+    codec. Reference: `pwilkin/openmoss/src/codec.cpp` (Apache-2.0, 1087
+    lines, full encoder/decoder/RVQ). Pre-built GGUFs:
+    `smcleod/MOSS-TTS-v1.5-GGUF`, `ilintar/moss-tts-gguf`. Port plan in
+    `docs/CODEC_PORTS.md` §1. Adapt — not reimplement. Unblocks all MOSS
+    modes end-to-end.
+16. 📋 **Stage 17 — Qwen3-TTS-Tokenizer-12Hz ggml port** — multi-codebook
+    (16, not 32) codec. Reference: `CrispStrobe/CrispASR` (MIT).
+    Pre-built GGUFs: `cstr/qwen3-tts-tokenizer-12hz-GGUF`. Port plan in
+    `docs/CODEC_PORTS.md` §2. Unblocks all Qwen3-TTS modes end-to-end.
+17. 📋 **ECAPA-TDNN speaker encoder port** — small model (~22M params).
+    Same upstream as #16: CrispASR's `qwen3_tts.h` exposes the full
+    `set_voice_prompt*` API built on its ECAPA port. Lands alongside
+    Stage 17. Unblocks true Voice Clone.
 18. 🚧 **ACE-Step Stem Extraction / Layering** — separate model family
     (Demucs-class separator + mixer). New family, not an ACE-Step mode.
 19. 🚧 **MP3 output** — link libmp3lame; small but adds a dependency.
@@ -239,23 +270,30 @@ families, after Stages 9–13:
 - ❌ not implemented, streaming infra: **2** (MOSS realtime, Qwen3-TTS
   streaming — the chunked transport scaffold exists; per-family
   incremental decode does not)
-- 🚧 blocked on major port: **3+** (MOSS codec, Qwen3-TTS codec,
-  ECAPA-TDNN speaker encoder)
+- 🚧 blocked on major port: **1** (ACE-Step stem/lego — separate
+  Demucs-class model)
+- 📋 reference impl identified, port scoped: **3** (MOSS codec → Stage 16;
+  Qwen3-TTS codec → Stage 17; ECAPA-TDNN → comes with Stage 17 via the
+  same CrispASR upstream)
 
 Stage 9 closed the entire IaC bucket. Stages 10–12 flipped six
 modes from ❌ to 🟡 (Qwen3-TTS voice_design, MOSS dialogue, MOSS
 voice_design, MOSS/Qwen3-TTS realtime/streaming — the last via the
 transport scaffold). Stage 13 added explicit `mode` parsing to ACE-Step
 so the unimplemented modes fail fast with a GAPS.md pointer instead of
-silently running text-to-music.
+silently running text-to-music. **Stage 15 identified production-quality
+GGML reference implementations (Apache-2.0 + MIT) for both blocked
+codecs, plus pre-built GGUFs that skip the converter step entirely.**
 
 The remaining work is concentrated in two places:
 
-1. **Codec ports (🚧)** — MOSS-Audio-Tokenizer + Qwen3-TTS-Tokenizer-12Hz
-   ggml ports. These unblock 6 of the 9 🟡 modes end-to-end at once.
-   Multi-week port per codec.
+1. **Codec ports (📋 reference identified — Stages 16 & 17)** — adapt
+   `openmoss/src/codec.cpp` and CrispASR's `qwen3_tts.cpp` codec section
+   into audiocore's `Backend`/`TensorStorage` abstractions. These unblock
+   6 of the 9 🟡 modes end-to-end at once. The mechanical work is now
+   scoped in `docs/CODEC_PORTS.md` §1.5 and §2.6.
 2. **DiT conditioning extension** — ACE-Step cover / repaint / completion.
    Graph-level change in `dit_runner.cpp`, no new weights. Medium effort.
 
 Plus, smaller but unblocked items: streaming-endpoint per-family hooks,
-ECAPA-TDNN speaker encoder port (Voice Clone), MP3 output.
+MP3 output.

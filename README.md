@@ -278,12 +278,12 @@ Returns `{"status": "ok"}`.
 |---|---|
 | **Source** | [OpenMOSS-Team/MOSS-TTS](https://huggingface.co/OpenMOSS-Team/MOSS-TTS), [pwilkin/openmoss](https://github.com/pwilkin/openmoss) |
 | **Backbone** | Qwen3-8B (GGUF, via the unified `qwen3::Runner` over llama.cpp) |
-| **Audio codec** | 32-RVQ delay-pattern sampling. Codec-token → PCM decoder is a silence stub pending a ggml port of the speech-tokenizer graph; weights will live in the same GGUF as the backbone. |
+| **Audio codec** | 32-RVQ delay-pattern sampling. Codec-token → PCM decoder is a silence stub pending Stage 16 (ggml port of `openmoss/src/codec.cpp`, Apache-2.0); pre-built sidecar GGUFs with `moss.codec.*` tensors at `smcleod/MOSS-TTS-v1.5-GGUF`. See `docs/CODEC_PORTS.md` §1. |
 | **Sampling** | Delay-pattern autoregressive: top-k, top-p, temperature, repetition penalty (via `audiocore::sampler`) |
 | **Output** | 24 kHz mono PCM |
-| **Weight formats** | Single GGUF (community), or backbone GGUF + `.npy` embedding/lm_head dirs |
-| **Status** | 🚧 Generation works; codec → PCM is a silence stub pending a ggml port |
-| **Reference** | `pwilkin/openmoss` (C++) — parity target for byte-identical audio |
+| **Weight formats** | Single GGUF (community), sidecar pair (`X.gguf` + `X.extras.gguf`, smcleod/MOSS-TTS-v1.5-GGUF), or backbone GGUF + `.npy` embedding/lm_head dirs |
+| **Status** | 🚧 Generation works; codec → PCM is a silence stub pending Stage 16 (reference impl identified) |
+| **Reference** | `pwilkin/openmoss` (C++, Apache-2.0) — parity target for byte-identical audio; pre-built sidecar GGUFs at `smcleod/MOSS-TTS-v1.5-GGUF` |
 
 GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 
@@ -293,12 +293,12 @@ GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 |---|---|
 | **Source** | [QwenLM/Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS) |
 | **Backbone** | Talker (qwen3tts arch) + Code Predictor (qwen3tts_cp), both via the unified `qwen3::Runner` with `load_extras(ExtraKind::Talker/Predictor)` |
-| **Audio codec** | 32-codebook matrix (1 coarse + 31 MTP fine). Codec-token → PCM decoder is a silence stub pending a ggml port. |
+| **Audio codec** | 16-codebook matrix (1 coarse + 15 MTP fine). Codec-token → PCM decoder is a silence stub pending Stage 17 (ggml port of `CrispStrobe/CrispASR`'s Qwen3-TTS codec, MIT); pre-built GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`. See `docs/CODEC_PORTS.md` §2. |
 | **Sampling** | Top-p / temperature via `audiocore::sampler`; MTP predictor uses the same sampler for fine-codebook draws |
 | **Output** | 24 kHz mono PCM |
-| **Weight formats** | Two GGUFs (talker + predictor) produced by `tools/convert_qwen3tts` from the official safetensors |
-| **Status** | 🚧 Talker + predictor load and run; codec → PCM is a silence stub pending a ggml port |
-| **Reference** | `QwenLM/Qwen3-TTS` (Python) — parity target |
+| **Weight formats** | Two GGUFs (talker + predictor) produced by `tools/convert_qwen3tts` from the official safetensors; pre-built codec GGUF from `cstr/qwen3-tts-tokenizer-12hz-GGUF` (no conversion) |
+| **Status** | 🚧 Talker + predictor load and run; codec → PCM is a silence stub pending Stage 17 (reference impl identified) |
+| **Reference** | `QwenLM/Qwen3-TTS` (Python) — parity target. Codec parity: `CrispStrobe/CrispASR` (C++, MIT) |
 
 ### ACE-Step (`ace_step`)
 
@@ -362,7 +362,8 @@ GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 │   └── convert_qwen3tts.cpp          # Qwen3-TTS safetensors → GGUF
 ├── docs/
 │   ├── ARCHITECTURE.md               # Two-seam deep-dive
-│   └── GGUF_FORMAT.md                # Tensor maps for each family
+│   ├── GGUF_FORMAT.md                # Tensor maps for each family
+│   └── CODEC_PORTS.md                # Stage 15: reference impls for the MOSS + Qwen3-TTS codec ports
 ├── examples/
 │   └── server.json                   # Reference server config
 ├── scripts/
