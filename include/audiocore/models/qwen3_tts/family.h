@@ -33,9 +33,16 @@
 
 #include "audiocore/framework/core/backend.h"
 #include "audiocore/framework/core/session.h"
+#include "audiocore/framework/runtime/tasks.h"    // TtsRequest / TtsResponse
 #include "audiocore/models/qwen3/runner.h"
 
 namespace audiocore::qwen3_tts {
+
+// Qwen3-TTS uses the unified audiocore::TtsRequest / TtsResponse directly.
+// These aliases keep existing references in session.cpp / server.cpp
+// working without touching every call site.
+using TtsRequest  = ::audiocore::TtsRequest;
+using TtsResponse = ::audiocore::TtsResponse;
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -53,32 +60,10 @@ struct Qwen3TtsConfig {
 };
 
 // ── Request / Response ──────────────────────────────────────────────────────
-
-struct TtsRequest {
-    // Core
-    std::string text;               // Input text to synthesize
-    std::string language   = "";    // "en", "zh", "ja", etc. Empty = auto
-    float       speed      = 1.0f;
-
-    // Sampling
-    float       temperature = 0.7f;
-    float       top_p      = 0.9f;
-    int         max_new_tokens = 4096;
-
-    // Voice design / emotion instruct (for "voice_design" / "custom_voice")
-    std::string instruct   = "";    // Natural language style instruction
-    std::string speaker_name = "";  // Speaker ID ("Vivian", "Ryan", etc.)
-
-    // Voice cloning (for "base" model)
-    std::string reference_audio;    // Path to reference audio
-    std::string reference_text;     // Reference text for ICL cloning
-    std::string speaker_embedding;  // Pre-computed speaker embedding (base64)
-};
-
-struct TtsResponse {
-    std::vector<float> pcm_mono;
-    int                sampling_rate = 24000;  // 24kHz output
-};
+//
+// Unified across every TTS family — see
+// include/audiocore/framework/runtime/tasks.h. The aliases above bring them
+// into this namespace so session.cpp reads naturally.
 
 // ── Session ─────────────────────────────────────────────────────────────────
 

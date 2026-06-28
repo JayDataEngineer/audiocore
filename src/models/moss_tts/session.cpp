@@ -348,8 +348,8 @@ bool MossSession::run_tts(const void* request, void* response,
     // ======================================================================
     // (5) Autoregressive generation loop
     // ======================================================================
-    const int32_t max_steps = req->max_tokens > 0
-        ? req->max_tokens
+    const int32_t max_steps = req->max_new_tokens > 0
+        ? req->max_new_tokens
         : cfg_.n_vq * 60 * 30;  // default: 60 fps * 30 s
 
     std::vector<float> step_embd(static_cast<size_t>(hs));
