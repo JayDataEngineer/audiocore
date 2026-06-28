@@ -43,3 +43,9 @@ audiocore_test_with_bin(test_convert_acestep convert_acestep)
 # Run manually: ./test_moss_e2e
 add_executable(test_moss_e2e test_moss_e2e.cpp)
 target_link_libraries(test_moss_e2e PRIVATE audiocore_framework)
+
+# End-to-end Kokoro test — downloads ~110MB on first run if weights not cached.
+# Run manually: ./test_kokoro_e2e
+# Set KOKORO_WEIGHTS_DIR env var to a cached directory to skip the download.
+add_executable(test_kokoro_e2e test_kokoro_e2e.cpp)
+target_link_libraries(test_kokoro_e2e PRIVATE audiocore_framework)

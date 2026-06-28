@@ -74,6 +74,10 @@ add_library(audiocore_framework STATIC
     src/models/moss_tts/codec.cpp
     src/models/ace_step/loader.cpp
     src/models/ace_step/session.cpp
+    # Kokoro ONNX TTS (requires espeak-ng AND ONNX Runtime):
+    src/models/kokoro/loader.cpp
+    src/models/kokoro/session.cpp
+    src/models/kokoro/tokenizer.cpp
     # HTTP server factory (routes + WAV encoders). Linked into the
     # audiocore_server binary AND into the e2e HTTP test, so both share the
     # same routing code path.
@@ -100,6 +104,19 @@ if(ONNX_RUNTIME_INCLUDE_DIR AND ONNX_RUNTIME_LIB)
     message(STATUS "ONNX Runtime found: ${ONNX_RUNTIME_LIB}")
 else()
     message(WARNING "ONNX Runtime NOT found — codec.cpp will compile without ONNX decode support")
+endif()
+
+# ── espeak-ng (phonemization for Kokoro TTS) ──────────────────────────────
+find_library(ESPEAK_NG_LIBRARIES espeak-ng
+    PATHS /usr/lib/x86_64-linux-gnu /usr/local/lib)
+find_path(ESPEAK_NG_INCLUDE_DIR espeak-ng/speak_lib.h
+    PATHS /usr/include /usr/local/include)
+if(ESPEAK_NG_LIBRARIES AND ESPEAK_NG_INCLUDE_DIR)
+    target_include_directories(audiocore_framework PUBLIC ${ESPEAK_NG_INCLUDE_DIR})
+    target_link_libraries(audiocore_framework PUBLIC ${ESPEAK_NG_LIBRARIES})
+    message(STATUS "espeak-ng found: ${ESPEAK_NG_LIBRARIES}")
+else()
+    message(WARNING "espeak-ng NOT found — Kokoro TTS family will not compile")
 endif()
 
 # ── Binaries ─────────────────────────────────────────────────────────────
