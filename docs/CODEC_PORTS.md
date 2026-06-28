@@ -343,17 +343,30 @@ once the codec port is in.
 
 ---
 
-## 3. Status snapshot (post-Stage 15)
+## 3. Status snapshot (post-Stage 16)
 
-| Item | Pre-stage | Post-stage-15 |
-|---|---|---|
-| MOSS codec | 🚧 blocked on ground-up port | 📋 reference impl identified (Apache-2.0), pre-built GGUF available, port plan in §1.5 |
-| Qwen3-TTS codec | 🚧 blocked on ground-up port | 📋 reference impl identified (MIT), pre-built GGUF available, port plan in §2.6 |
-| ECAPA-TDNN speaker encoder | 🚧 blocked, new architecture | 📋 same upstream (CrispASR) ports it for free once Stage 17 lands |
-| MOSS pre-built GGUF source | `OpenMOSS-Team/MOSS-TTS-GGUF` only | + `smcleod/MOSS-TTS-v1.5-GGUF`, `ilintar/moss-tts-gguf` |
-| Qwen3-TTS-Tokenizer GGUF | `QwenLM/Qwen3-TTS-Tokenizer` (safetensors, needs converter) | `cstr/qwen3-tts-tokenizer-12hz-GGUF` (ready-to-load GGUF) |
+| Item | Pre-stage | Post-Stage-15 | Post-Stage-16 |
+|---|---|---|---|
+| MOSS codec | 🚧 blocked on ground-up port | 📋 reference impl identified (Apache-2.0), pre-built GGUF available, port plan in §1.5 | ✅ **ported** — `src/models/moss_tts/codec.cpp` adapts openmoss; auto-activates when GGUF carries `moss.codec.*`; silence fallback otherwise |
+| Qwen3-TTS codec | 🚧 blocked on ground-up port | 📋 reference impl identified (MIT), pre-built GGUF available, port plan in §2.6 | 📋 unchanged — Stage 17 |
+| ECAPA-TDNN speaker encoder | 🚧 blocked, new architecture | 📋 same upstream (CrispASR) ports it for free once Stage 17 lands | 📋 unchanged — Stage 17 |
+| MOSS pre-built GGUF source | `OpenMOSS-Team/MOSS-TTS-GGUF` only | + `smcleod/MOSS-TTS-v1.5-GGUF`, `ilintar/moss-tts-gguf` | unchanged |
+| Qwen3-TTS-Tokenizer GGUF | `QwenLM/Qwen3-TTS-Tokenizer` (safetensors, needs converter) | `cstr/qwen3-tts-tokenizer-12hz-GGUF` (ready-to-load GGUF) | unchanged |
 
-The 🟡 codec stub status for MOSS tts / sfx / voice_clone / dialogue /
-voice_design and Qwen3-TTS batch / instruct / voice_design remains until
-Stage 16 / Stage 17 land — the **silence fallback stays in place** as a
-graceful degradation path for GGUFs without the codec tensors.
+The 🟡 codec stub status for MOSS dialogue / voice_design (codec wired but
+mode-specific surface partial) and Qwen3-TTS batch / instruct /
+voice_design (still silence-stubbed pending Stage 17) remains. The
+**silence fallback stays in place** as a graceful degradation path for
+GGUFs without the codec tensors.
+
+### 3.1 Stage 16 verification
+
+- Compile-time: `MossCodecGraphs` builds clean against audiocore's
+  `Backend`/`TensorStorage`/`WeightLoader` abstractions and the same
+  ggml/libllama stack as the Qwen3 backbone.
+- Existing 7 ctest entries still pass (no regressions in the framework).
+- Runtime parity: `tests/test_moss_e2e.cpp` exercises the full pipeline
+  (load → chat template → AR codec-token generation → delay-pattern →
+  codec decode → PCM) when pointed at real codec-bearing weights
+  (`smcleod/MOSS-TTS-v1.5-GGUF` or a self-built sidecar). Intentionally
+  not in ctest per AGENTS.md — requires ~8 GB VRAM and a real GGUF.

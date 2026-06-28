@@ -72,6 +72,7 @@ add_library(audiocore_framework STATIC
     # Per-family code:
     src/models/moss_tts/loader.cpp
     src/models/moss_tts/session.cpp
+    src/models/moss_tts/codec.cpp
     src/models/moss_tts/projection.cpp
     src/models/moss_tts/delay_state.cpp
     src/models/moss_tts/sampler.cpp

@@ -14,6 +14,7 @@
 #include "audiocore/models/moss_tts/family.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include "audiocore/framework/io/gguf_reader.h"
 #include "audiocore/framework/io/weight_loader.h"
@@ -446,6 +447,15 @@ bool MossSession::load(const std::string& model_path,
     backbone_ = qwen3::Runner::load(model_path, rc, error);
     if (!backbone_) return false;
 
+    // (3b) Construct the same ggml Backend the Qwen3 backbone chose, so the
+    //      Stage 16 codec port can submit graphs through the same device.
+    //      Soft-fail: if backend construction fails, the codec just stays
+    //      unbound and decode_codec() falls back to silence (GAPS.md §1.3).
+    backend_ = make_backend(backend_cfg, nullptr);
+    // (Silently tolerating a null backend here is deliberate — every path
+    // other than the codec still runs through libllama, which carries its
+    // own backend selection.)
+
     // (4) Load extension tensors (audio embeds + heads + token_embd).
     //     Try Path A (GGUF-embedded moss.*) first; if none found, try Path B
     //     (npy files from embeddings_dir / lm_heads_dir in extras).
@@ -466,6 +476,24 @@ bool MossSession::load(const std::string& model_path,
         }
         if (!load_npy_extras(it_emb->second, it_lm->second, error))
             return false;
+    }
+
+    // (4b) Bind the codec graphs (Stage 16) if the GGUF carries the
+    //      moss.codec.* tensors. Soft-fail: a GGUF without the codec (the
+    //      common community backbone-only pattern) skips this and the
+    //      decode_codec() path falls back to silence. Detection is by
+    //      checking for the first codebook tensor, which every codec-bearing
+    //      sidecar must have (openmoss codec.cpp resolve_decoder_).
+    if (codec_dec_root_ || ggml_get_tensor(ext_ctx_, "moss.codec.quantizer.q.0.codebook.weight")) {
+        ggml_backend_t be = backend_ ? backend_->raw_ggml_backend() : nullptr;
+        std::string codec_err;
+        if (be && codec_graphs_.bind(ext_ctx_, be, &codec_err)) {
+            cfg_.codec_present = true;
+        } else {
+            // Not fatal — log and continue. decode_codec stays silence-stubbed.
+            std::fprintf(stderr, "moss_tts: codec tensors present but bind failed "
+                                 "(%s); falling back to silence\n", codec_err.c_str());
+        }
     }
 
     // (5) Stash codec-related extras for the future ggml codec path. The

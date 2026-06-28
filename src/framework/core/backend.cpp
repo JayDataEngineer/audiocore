@@ -43,6 +43,7 @@ public:
 
     BackendKind kind() const override { return kind_; }
     ggml_backend_t raw() const { return backend_; }
+    ggml_backend_t raw_ggml_backend() const override { return backend_; }
 
     bool execute(void* graph_handle, void* /*io_bindings*/,
                  std::string* error) override {

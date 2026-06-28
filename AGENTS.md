@@ -87,13 +87,13 @@ removed from the project. The HTTP server is also testable in-process via
 
 | Mode | Status | HTTP endpoint | Notes |
 |------|--------|---------------|-------|
-| TTS (zero-shot) | 🟡 Wired | `POST /v1/audio/speech` | Text → speech, default handler. Codec stub emits 1 s silence. |
-| Sound effects | 🟡 Wired | `POST /v1/audio/speech {"mode":"sfx"}` | Different system prompt + lower temps. Codec stub. |
-| Voice cloning | 🟡 Wired | `POST /v1/audio/speech {"mode":"voice_clone","voice":"path.codes"}` | Requires pre-encoded `.codes` file (int32le: n_frames + n_frames×32 codes). Codec stub. |
-| Dialogue (TTSD) | 🟡 Stage 11 | `POST /v1/audio/speech {"mode":"dialogue"}` | TTSD-style system prompt + dialogue sampling defaults. Single `text` becomes opening turn; true multi-turn pending. |
-| Voice design | 🟡 Stage 11 | `POST /v1/audio/speech {"mode":"voice_design","instruct":"a calm deep female voice"}` | Voice description in `instruct` routes through flagship backbone with voice-design system prompt. Best-effort fallback for the dedicated VoiceGenerator model. |
+| TTS (zero-shot) | ✅ Stage 16 | `POST /v1/audio/speech` | Text → speech, default handler. Codec-token → PCM via `MossCodecGraphs` when GGUF carries `moss.codec.*`; silence fallback otherwise. |
+| Sound effects | ✅ Stage 16 | `POST /v1/audio/speech {"mode":"sfx"}` | Different system prompt + lower temps. Same codec path. |
+| Voice cloning | ✅ Stage 16 | `POST /v1/audio/speech {"mode":"voice_clone","voice":"path.codes"}` | Requires pre-encoded `.codes` file (int32le: n_frames + n_frames×32 codes). Same codec path. |
+| Dialogue (TTSD) | 🟡 Stage 11 | `POST /v1/audio/speech {"mode":"dialogue"}` | TTSD-style system prompt + dialogue sampling defaults. Single `text` becomes opening turn; true multi-turn pending. Codec wired (Stage 16). |
+| Voice design | 🟡 Stage 11 | `POST /v1/audio/speech {"mode":"voice_design","instruct":"a calm deep female voice"}` | Voice description in `instruct` routes through flagship backbone with voice-design system prompt. Best-effort fallback for the dedicated VoiceGenerator model. Codec wired (Stage 16). |
 | Streaming | ❌ Fail-fast | `POST /v1/audio/speech {"mode":"realtime"}` | Returns 500 with pointer at GAPS.md §1.2. Chunked transport scaffold exists at `/v1/audio/speech/stream`. |
-| ggml codec graph | 📋 Stage 16 | — | Silence stub pending Stage 16: adapt `pwilkin/openmoss/src/codec.cpp` (Apache-2.0) into `src/models/moss_tts/codec.cpp`. Pre-built sidecar GGUFs (`moss.codec.*` tensors included) at `smcleod/MOSS-TTS-v1.5-GGUF`. Full plan in `docs/CODEC_PORTS.md` §1. |
+| ggml codec graph | ✅ Stage 16 | — | `src/models/moss_tts/codec.cpp` adapts `pwilkin/openmoss/src/codec.cpp` (Apache-2.0). Auto-binds when GGUF carries `moss.codec.*`; silence fallback otherwise. Pre-built sidecar GGUFs at `smcleod/MOSS-TTS-v1.5-GGUF`. Architecture in `docs/CODEC_PORTS.md` §1. |
 
 **Codec token format** (`.codes` binary): `[n_frames: i32le] [codes: n_frames × 32 × i32le]`.
 

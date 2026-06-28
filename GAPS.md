@@ -31,45 +31,45 @@ MOSS-Audio-Tokenizer-v2 / -Nano codec infrastructure.
 | MOSS-VoiceGenerator (1.7B voice design) | ❌ no voice-design mode |
 | MOSS-TTS-Realtime (1.7B streaming) | ❌ no streaming endpoint |
 | MOSS-SoundEffect (8B sound effects) | 🟡 `mode="sfx"` runs the backbone, **silence stub for codec** |
-| MOSS-Audio-Tokenizer-v2 / -Nano | 📋 reference impl identified — `pwilkin/openmoss` (Apache-2.0) ships the full encoder/decoder/RVQ graphs; pre-built sidecar GGUFs at `smcled/MOSS-TTS-v1.5-GGUF`. Stage 16 port tracked in `docs/CODEC_PORTS.md` §1 |
+| MOSS-Audio-Tokenizer-v2 / -Nano | ✅ Stage 16: ggml port wired (`src/models/moss_tts/codec.cpp`, adapted from `pwilkin/openmoss` Apache-2.0). Activates automatically when the GGUF carries `moss.codec.*` tensors (e.g. the `smcleod/MOSS-TTS-v1.5-GGUF` sidecar); community backbone-only GGUFs still get the silence fallback. |
 
 ### 1.2 Modes (the `mode` field on `TtsRequest`)
 
 | Mode | Status | Notes |
 |---|---|---|
-| `tts` (zero-shot) | 🟡 | Wired; codec stub returns 1 s silence |
-| `sfx` (sound effects) | 🟡 | Wired; different system prompt + sampling defaults; codec stub |
-| `voice_clone` | 🟡 | Wired; reads `voice_path` as pre-encoded `.codes`; codec stub |
-| `dialogue` (TTSD) | 🟡 | Stage 11: TTSD-style system prompt + dialogue sampling defaults. Multi-turn input surface still missing (single `text` field becomes the opening turn); true TTSD weights are a separate 8B variant. |
-| `voice_design` (VoiceGenerator) | 🟡 | Stage 11: routes voice description from `instruct` through the flagship backbone with a voice-design system prompt. Best-effort fallback — the dedicated 1.7B VoiceGenerator model produces better voice fidelity. |
+| `tts` (zero-shot) | ✅ Stage 16 | Wired; codec decode via `MossCodecGraphs` when GGUF carries `moss.codec.*`, silence fallback otherwise |
+| `sfx` (sound effects) | ✅ Stage 16 | Wired; different system prompt + sampling defaults; same codec path |
+| `voice_clone` | ✅ Stage 16 | Wired; reads `voice_path` as pre-encoded `.codes`; same codec path |
+| `dialogue` (TTSD) | 🟡 | Stage 11: TTSD-style system prompt + dialogue sampling defaults. Multi-turn input surface still missing (single `text` field becomes the opening turn); true TTSD weights are a separate 8B variant. Codec wired (Stage 16). |
+| `voice_design` (VoiceGenerator) | 🟡 | Stage 11: routes voice description from `instruct` through the flagship backbone with a voice-design system prompt. Best-effort fallback — the dedicated 1.7B VoiceGenerator model produces better voice fidelity. Codec wired (Stage 16). |
 | `realtime` / streaming | ❌ | Stage 11: fails fast with a pointer at this section. Streaming endpoint scaffold is GAPS.md §4. |
 
 ### 1.3 Codec / tokenizer
 
 The MOSS-Audio-Tokenizer (the codec that turns 32-RVQ code matrices back
 into 24/48 kHz PCM) was originally wired through ONNX Runtime. Stage 1
-deleted that surface; the planned replacement is a ggml_cgraph port that
-reads `moss.codec.dec.*` tensors from the same GGUF as the backbone.
+deleted that surface; Stage 16 landed the ggml_cgraph port that reads
+`moss.codec.dec.*` tensors from the same GGUF as the backbone.
 
-**Stage 15 update:** the port is no longer ground-up. `pwilkin/openmoss`
-(Apache-2.0) ships a production-quality implementation at
-`src/codec.cpp` (1087 lines) — encoder, decoder, 32-RVQ LFQ quantizer,
-weight-norm reconstruction, flash attention, the works. Pre-built
-sidecar GGUFs that already contain the `moss.codec.*` tensors are
-available at `smcleod/MOSS-TTS-v1.5-GGUF` and `ilintar/moss-tts-gguf`.
-`docs/CODEC_PORTS.md` §1 has the full tensor map, the 4-stage
-ProjectedTransformer spec, the substitution table from openmoss types
-onto audiocore's `Backend` / `TensorStorage` / `WeightLoader`, and the
-file-level port plan.
+**Stage 16 (complete):** `src/models/moss_tts/codec.cpp` is an
+adaptation of `pwilkin/openmoss/src/codec.cpp` (Apache-2.0, 1087 lines
+upstream). Audiocore's `MossCodecGraphs` reproduces the openmoss
+architecture verbatim — 4-stage ProjectedTransformer, 32-RVQ LFQ
+quantizer, weight-norm reconstruction, fused QKV, RoPE interleaved-pair,
+flash attention via `ggml_flash_attn_ext`, per-channel LayerScale —
+swapped onto audiocore's `Backend` / `TensorStorage` /
+`WeightLoader` abstractions. The codec binds automatically during
+`MossSession::load()` when the GGUF carries `moss.codec.*` tensors
+(e.g. the `smcleod/MOSS-TTS-v1.5-GGUF` sidecar); community
+backbone-only GGUFs continue to get the 1 s silence fallback
+(documented behavior, not an error). See `docs/CODEC_PORTS.md` §1 for
+the architecture and substitution table.
 
-Until Stage 16 lands, every MOSS-TTS request emits 1 s of silence where
-the codec decode should be. The transformer pipeline upstream of the
-codec is exercised end-to-end — only the final decode is stubbed.
-
-**Dependencies to close:** adapt `openmoss/src/codec.cpp` into
-`src/models/moss_tts/codec.cpp` (mechanical — same ggml backend, same
-tensor library). ~1.6B parameters of weights ship pre-built in the
-sidecar GGUF.
+The transformer pipeline upstream of the codec was already exercised
+end-to-end; with Stage 16, MOSS-TTS requests now produce real audio
+when codec-bearing weights are loaded. Runtime parity is verified by
+`tests/test_moss_e2e.cpp` (requires real weights; intentionally not in
+ctest per AGENTS.md).
 
 ---
 
@@ -232,12 +232,12 @@ single session but are listed so the work is plan-able.
 
 ### Large (major ports — now scoped, references identified)
 
-15. 📋 **Stage 16 — MOSS-Audio-Tokenizer ggml port** — ~1.6B-param neural
-    codec. Reference: `pwilkin/openmoss/src/codec.cpp` (Apache-2.0, 1087
-    lines, full encoder/decoder/RVQ). Pre-built GGUFs:
-    `smcleod/MOSS-TTS-v1.5-GGUF`, `ilintar/moss-tts-gguf`. Port plan in
-    `docs/CODEC_PORTS.md` §1. Adapt — not reimplement. Unblocks all MOSS
-    modes end-to-end.
+15. ✅ **Stage 16 — MOSS-Audio-Tokenizer ggml port** — `src/models/moss_tts/codec.cpp`
+    adapts `pwilkin/openmoss/src/codec.cpp` (Apache-2.0) onto audiocore's
+    `Backend`/`TensorStorage`/`WeightLoader`. Auto-activates when the GGUF
+    carries `moss.codec.*` tensors; silence fallback otherwise. Unblocks
+    MOSS tts / sfx / voice_clone / dialogue / voice_design end-to-end
+    (when fed codec-bearing weights like `smcleod/MOSS-TTS-v1.5-GGUF`).
 16. 📋 **Stage 17 — Qwen3-TTS-Tokenizer-12Hz ggml port** — multi-codebook
     (16, not 32) codec. Reference: `CrispStrobe/CrispASR` (MIT).
     Pre-built GGUFs: `cstr/qwen3-tts-tokenizer-12hz-GGUF`. Port plan in
@@ -257,11 +257,13 @@ single session but are listed so the work is plan-able.
 Of the **5 + 5 + 6 = 16 advertised user-facing modes** across the three
 families, after Stages 9–13:
 
-- ✅ fully wired end-to-end: **1** (ACE-Step Text-to-Music)
-- 🟡 parse + run + emit silence (codec stub): **9** (MOSS tts / sfx /
-  voice_clone / dialogue / voice_design; Qwen3-TTS batch TTS / with
-  style instructions / voice_design; ACE-Step mode field rejects the
-  rest with a clear error)
+- ✅ fully wired end-to-end: **4** (ACE-Step Text-to-Music; MOSS tts / sfx /
+  voice_clone — the last three when fed codec-bearing weights like
+  `smcled/MOSS-TTS-v1.5-GGUF`)
+- 🟡 parse + run, partial elsewhere: **6** (MOSS dialogue / voice_design —
+  codec wired but mode-specific surface partial; Qwen3-TTS batch TTS /
+  with style instructions / voice_design — codec still silence-stubbed
+  pending Stage 17; ACE-Step mode field rejects the rest with a clear error)
 - ❌ not implemented, achievable without new weights: **3** (ACE-Step
   cover / repaint / completion — all need the DiT to accept an extra
   conditioning signal beyond text)
@@ -272,9 +274,9 @@ families, after Stages 9–13:
   incremental decode does not)
 - 🚧 blocked on major port: **1** (ACE-Step stem/lego — separate
   Demucs-class model)
-- 📋 reference impl identified, port scoped: **3** (MOSS codec → Stage 16;
-  Qwen3-TTS codec → Stage 17; ECAPA-TDNN → comes with Stage 17 via the
-  same CrispASR upstream)
+- 📋 reference impl identified, port scoped: **2** (Qwen3-TTS codec →
+  Stage 17; ECAPA-TDNN → comes with Stage 17 via the same CrispASR
+  upstream)
 
 Stage 9 closed the entire IaC bucket. Stages 10–12 flipped six
 modes from ❌ to 🟡 (Qwen3-TTS voice_design, MOSS dialogue, MOSS
