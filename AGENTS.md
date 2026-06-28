@@ -87,11 +87,13 @@ removed from the project. The HTTP server is also testable in-process via
 
 | Mode | Status | HTTP endpoint | Notes |
 |------|--------|---------------|-------|
-| TTS (zero-shot) | Done | `POST /v1/audio/speech` | Text → speech, default handler |
-| Sound effects | Done | `POST /v1/audio/speech {"mode":"sfx"}` | Different system prompt + lower temps |
-| Voice cloning | Done | `POST /v1/audio/speech {"mode":"voice_clone","voice":"path.codes"}` | Requires pre-encoded `.codes` file (int32le: n_frames + n_frames×32 codes) |
-| Streaming | Not yet | — | Requires chunked HTTP response |
-| ggml codec graph | Not yet | — | Codec decoder is a silence stub pending a ggml port of the speech-tokenizer graph; weights will live in the same GGUF as the backbone |
+| TTS (zero-shot) | 🟡 Wired | `POST /v1/audio/speech` | Text → speech, default handler. Codec stub emits 1 s silence. |
+| Sound effects | 🟡 Wired | `POST /v1/audio/speech {"mode":"sfx"}` | Different system prompt + lower temps. Codec stub. |
+| Voice cloning | 🟡 Wired | `POST /v1/audio/speech {"mode":"voice_clone","voice":"path.codes"}` | Requires pre-encoded `.codes` file (int32le: n_frames + n_frames×32 codes). Codec stub. |
+| Dialogue (TTSD) | 🟡 Stage 11 | `POST /v1/audio/speech {"mode":"dialogue"}` | TTSD-style system prompt + dialogue sampling defaults. Single `text` becomes opening turn; true multi-turn pending. |
+| Voice design | 🟡 Stage 11 | `POST /v1/audio/speech {"mode":"voice_design","instruct":"a calm deep female voice"}` | Voice description in `instruct` routes through flagship backbone with voice-design system prompt. Best-effort fallback for the dedicated VoiceGenerator model. |
+| Streaming | ❌ Fail-fast | `POST /v1/audio/speech {"mode":"realtime"}` | Returns 500 with pointer at GAPS.md §1.2. Chunked transport scaffold exists at `/v1/audio/speech/stream`. |
+| ggml codec graph | 🚧 Blocked | — | Codec decoder is a silence stub pending a ggml port of the speech-tokenizer graph; weights will live in the same GGUF as the backbone. |
 
 **Codec token format** (`.codes` binary): `[n_frames: i32le] [codes: n_frames × 32 × i32le]`.
 
@@ -99,9 +101,12 @@ removed from the project. The HTTP server is also testable in-process via
 
 | Mode | Status | HTTP endpoint | Notes |
 |------|--------|---------------|-------|
-| TTS (talker + MTP predictor) | Scaffolded | `POST /v1/audio/speech` | Talker + Code Predictor load and run; codec → PCM decoder is a silence stub pending a ggml port |
-| Voice cloning | Not yet | — | Speaker encoder (ECAPA-TDNN) needs a GGUF port |
-| Streaming | Not yet | — | Requires chunked HTTP response |
+| TTS (talker + MTP predictor) | 🟡 Wired | `POST /v1/audio/speech` | Talker + Code Predictor load and run. Codec stub emits 1 s silence. |
+| TTS with style instructions | 🟡 Stage 10 | `POST /v1/audio/speech {"speaker":"Vivian","instruct":"whispered"}` | Speaker routing injects `<|spk_NAME|>` codec token; `instruct` summed into the text embedding. |
+| Voice design | 🟡 Stage 10 | `POST /v1/audio/speech {"mode":"voice_design","instruct":"young female, energetic"}` | Instruct prefixed with the official VoiceDesign template. Best-effort on Base backbone. |
+| Voice clone | ❌ Fail-fast | — | Returns 500 with pointer at GAPS.md §2.3 (ECAPA-TDNN speaker encoder needs a GGUF port). |
+| Streaming | ❌ Fail-fast | — | Returns 500 with pointer at GAPS.md §2.2. Chunked transport scaffold exists at `/v1/audio/speech/stream`. |
+| Variant detection | ✅ Stage 10 | — | Set `extras["variant"]` = `Base` / `CustomVoice` / `VoiceDesign`, or rely on directory-name substring match. |
 
 Both transformers (talker + predictor) run through the unified `qwen3::Runner`
 — the same class MOSS and ACE-Step use. Weights: official
@@ -111,22 +116,42 @@ Both transformers (talker + predictor) run through the unified `qwen3::Runner`
 
 | Model variant | Status | n_steps default | Notes |
 |---------------|--------|----------------|-------|
-| turbo (v15) | Done | 8 | Shifted-cosine schedule |
-| sft | Done | 50 | Linear schedule |
-| xl-turbo | Auto‑detected | 8 (override with `steps`) | Config read from GGUF KV metadata |
+| turbo (v15) | ✅ Done | 8 | Shifted-cosine schedule |
+| sft | ✅ Done | 50 | Linear schedule |
+| xl-turbo | ✅ Auto‑detected | 8 (override with `steps`) | Config read from GGUF KV metadata |
 
 | Parameter | Status | Field |
 |-----------|--------|-------|
-| caption | Done | `caption` |
-| lyrics | Done | `lyrics` |
-| duration | Done | `duration` |
-| seed | Done | `seed` |
-| guidance_scale | Done | `guidance_scale` (DiT-side CFG) |
-| n_diffusion_steps | Done | `steps` |
-| temperature | Done | `temperature` (LM, 0=argmax) |
-| top_p | Done | `top_p` (LM nucleus, 1.0=off) |
+| caption | ✅ Done | `caption` |
+| lyrics | ✅ Done | `lyrics` |
+| duration | ✅ Done | `duration` |
+| seed | ✅ Done | `seed` |
+| guidance_scale | ✅ Done | `guidance_scale` (DiT-side CFG) |
+| n_diffusion_steps | ✅ Done | `steps` |
+| temperature | ✅ Done | `temperature` (LM, 0=argmax) |
+| top_p | ✅ Done | `top_p` (LM nucleus, 1.0=off) |
+| mode | ✅ Stage 13 | `mode` (`text_to_music` default; `cover`/`repaint`/`stem`/`lego`/`completion` fail fast with a pointer at GAPS.md §3.2) |
 
 Endpoint: `POST /v1/audio/music`
+
+## Models manifest & download
+
+`models/manifest.json` is the canonical record of every family/variant
+audiocore supports, with HuggingFace repo, revision, file list, supported
+modes, and per-variant `min_vram_gb`. Consumers:
+
+- `scripts/fetch_models.sh` — pure bash + curl downloader. Reads the
+  manifest, downloads per-variant, optionally verifies SHA256, invokes
+  `convert_acestep` / `convert_qwen3tts` as requested. Try
+  `scripts/fetch_models.sh --list` for the mode matrix,
+  `scripts/fetch_models.sh --dry-run ace_step` to preview a fetch.
+- `audiocore_cli --list-supported` — same matrix from the binary.
+  Searches for `models/manifest.json` relative to the executable and
+  the CWD; falls back to `FamilyRegistry::list()` if absent.
+
+Adding a new family or variant = add a new entry to the manifest, in
+parallel with the loader.cpp registration. The CLI's `--list-supported`
+picks it up with no extra wiring.
 
 ## Reference implementations
 

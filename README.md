@@ -7,9 +7,12 @@ is the only implementation language.
 
 | Model | Family | Capabilities | Status |
 |---|---|---|---|
-| **[MOSS-TTS](https://github.com/pwilkin/openmoss)** (8B) | `moss_tts` | TTS, dialogue-TTS, voice generation, sound effects | 🚧 Generation works; codec → PCM is a silence stub pending a ggml port |
-| **[Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS)** (Talker + MTP Predictor) | `qwen3_tts` | Multilingual TTS, instructable voice design | 🚧 Talker + predictor wired; codec → PCM is a silence stub pending a ggml port |
-| **[ACE-Step](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF)** (DiT + LM) | `ace_step` | Music generation (text-conditional, lyrics) | 🚧 Scaffolded (inference paths in progress) |
+| **[MOSS-TTS](https://github.com/pwilkin/openmoss)** (8B) | `moss_tts` | TTS, dialogue (TTSD-style), voice design (VoiceGenerator-equivalent), sound effects, voice cloning | 🟡 5 of 6 modes parse + run end-to-end; codec → PCM is a silence stub pending a ggml port |
+| **[Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS)** (Talker + MTP Predictor) | `qwen3_tts` | Multilingual TTS, instructable voice design, 9 default speakers (CustomVoice) | 🟡 Talker + predictor wired; variant detection + speaker routing wired; codec → PCM is a silence stub pending a ggml port |
+| **[ACE-Step](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF)** (DiT + LM) | `ace_step` | Music generation (text-conditional, lyrics) | ✅ Text-to-Music fully wired end-to-end; 5 other modes fail fast with a pointer at GAPS.md |
+
+Run `audiocore_cli --list-supported` for the live mode matrix, or see
+[`GAPS.md`](GAPS.md) for the full per-family audit.
 
 ---
 
@@ -176,6 +179,28 @@ ctest entries.
 
 ---
 
+## Models manifest & download
+
+`models/manifest.json` is the canonical record of every family/variant with
+HuggingFace repo, revision, file list, license, supported modes, and
+`min_vram_gb`. Two consumers:
+
+```bash
+# Print the mode matrix from the manifest
+scripts/fetch_models.sh --list
+
+# Download one variant + run any required converters
+scripts/fetch_models.sh ace_step ace-step-1.5-turbo
+
+# Self-describe from the binary (same matrix)
+audiocore_cli --list-supported
+```
+
+Environment overrides: `AUDIOCORE_MODELS_DIR` (default `./weights/`),
+`AUDIOCORE_BUILD_DIR` (default `./build/bin`), `HF_TOKEN` (for gated repos).
+
+---
+
 ## API
 
 All endpoints serve from the same binary.
@@ -204,6 +229,14 @@ Both `max_tokens` and `max_new_tokens` are accepted as aliases.
 
 Returns `audio/wav` (24 kHz mono, 16-bit PCM).
 
+### `POST /v1/audio/speech/stream` (TTS, chunked)
+
+Same JSON body and same dispatch as `/v1/audio/speech`, but the WAV is
+emitted via chunked transfer encoding in ~64 KiB chunks. Transport-level
+scaffold only — the family still renders the full PCM before the first
+byte ships. True incremental streaming (frames as the autoregressive
+loop produces them) is open; see `GAPS.md` §1.2 / §2.2.
+
 ### `POST /v1/audio/music` (Music generation)
 
 **Model**: `ace_step`
@@ -216,9 +249,14 @@ Returns `audio/wav` (24 kHz mono, 16-bit PCM).
   "duration": 10.0,
   "seed": 42,
   "guidance_scale": 7.5,
-  "steps": 50
+  "steps": 50,
+  "mode": "text_to_music"
 }
 ```
+
+`mode` defaults to `text_to_music`. The five other advertised modes
+(`cover`, `repaint`, `stem`, `lego`, `completion`) fail fast with a
+pointer at `GAPS.md` §3.2 instead of silently running text-to-music.
 
 Returns `audio/wav` (48 kHz stereo, 16-bit PCM).
 
