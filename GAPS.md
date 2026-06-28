@@ -82,10 +82,10 @@ multi-codebook codec.
 | Mode | Status | Notes |
 |---|---|---|
 | Non-Streaming / Batch TTS | 🟡 Wired; codec stub returns silence |
-| TTS with style instructions | 🟡 `instruct` field is tokenized and summed; `speaker_name` is parsed but **not routed to a speaker token** |
-| Voice Clone Mode | ❌ `reference_audio` / `reference_text` / `speaker_embedding` fields exist in `tasks.h` but `session.cpp` never reads them. Full clone needs the ECAPA-TDNN speaker encoder (🚧 blocked on a GGUF port). |
-| Voice Design Mode | ❌ No mode handling; should accept a text description and route through VoiceDesign-variant weights + system prompt |
-| Streaming Mode | ❌ No chunked HTTP endpoint, no Dual-Track incremental decode |
+| TTS with style instructions | 🟡 Stage 10: `instruct` tokenized + summed into text embedding; `speaker_name` resolves to a codec token (9 default speakers) and is injected as a dedicated codec-prefix slot before codec_bos. |
+| Voice Clone Mode | ❌ Stage 10: fails fast with a pointer at §2.3. Full clone needs the ECAPA-TDNN speaker encoder (🚧 blocked on a GGUF port). |
+| Voice Design Mode | 🟡 Stage 10: `instruct` is prefixed with the official "Generate a voice with the following characteristics:" template and routed through the talker. Best-effort on Base; true VoiceDesign fidelity needs the dedicated variant weights (🚧). |
+| Streaming Mode | ❌ Stage 10: fails fast with a pointer at this section. Chunked transport scaffold exists at `/v1/audio/speech/stream` (Stage 12); per-family incremental decode does not. |
 
 ### 2.3 Codec / speaker encoder
 

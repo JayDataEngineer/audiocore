@@ -91,10 +91,10 @@
       "homepage": "https://huggingface.co/QwenLM/Qwen3-TTS",
       "modes": {
         "tts_batch":     { "status": "partial",  "notes": "Talker + MTP predictor wired; codec→PCM is a silence stub" },
-        "tts_instruct":  { "status": "partial",  "notes": "speaker_name parsed but not routed to a speaker token yet" },
-        "voice_clone":   { "status": "not_impl", "notes": "reference_audio fields exist; ECAPA-TDNN speaker encoder needs a GGUF port" },
-        "voice_design":  { "status": "not_impl", "notes": "Planned: route instruct via VoiceDesign-variant weights + system prompt" },
-        "streaming":     { "status": "not_impl", "notes": "Blocked on chunked HTTP endpoint + Dual-Track incremental decode" }
+        "tts_instruct":  { "status": "partial",  "notes": "Stage 10: speaker_name → codec token routing wired; instruct summed into text embedding. Codec stub." },
+        "voice_clone":   { "status": "not_impl", "notes": "Stage 10: fails fast with pointer at GAPS.md §2.3 (ECAPA-TDNN speaker encoder needs a GGUF port)." },
+        "voice_design":  { "status": "partial",  "notes": "Stage 10: instruct prefixed with official VoiceDesign template, routed through any variant. Best-effort on Base; true fidelity needs VoiceDesign-variant weights." },
+        "streaming":     { "status": "not_impl", "notes": "Stage 10: fails fast with pointer at GAPS.md §2.2. Chunked transport scaffold exists at /v1/audio/speech/stream." }
       },
       "variants": {
         "qwen3-tts-1.7b-base": {
