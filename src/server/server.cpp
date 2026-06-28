@@ -14,6 +14,7 @@
 #include "audiocore/models/ace_step/family.h"
 #include "audiocore/models/kokoro/family.h"
 #include "audiocore/models/moss_tts/family.h"
+#include "audiocore/models/zonos2/family.h"
 
 namespace audiocore {
 
@@ -148,6 +149,31 @@ std::shared_ptr<httplib::Server> build_server(
             if (body.contains("trim"))        tr.trim        = body["trim"].get<bool>();
 
             kokoro::TtsResponse tresp;
+            std::string err;
+            if (!slot->session->run_tts(&tr, &tresp, &err)) {
+                fail_with(res, err);
+                return;
+            }
+            res.set_content(pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate),
+                            "audio/wav");
+            return;
+        }
+
+        if (family == "zonos2") {
+            // ── ZONOS2 TTS ────────────────────────────────────────────────
+            zonos2::TtsRequest tr{};
+            tr.text     = body.value("input", "");
+            tr.language = body.value("language", "en");
+            tr.speed    = body.value("speed", 1.0f);
+            tr.temperature = body.value("temperature", 0.7f);
+            tr.top_p      = body.value("top_p", 0.9f);
+            tr.cfg_scale  = body.value("cfg_scale", 2.0f);
+            if (body.contains("speaker_embedding"))
+                tr.speaker_embedding = body["speaker_embedding"].get<std::string>();
+            if (body.contains("max_new_tokens"))
+                tr.max_new_tokens = body["max_new_tokens"].get<int>();
+
+            zonos2::TtsResponse tresp;
             std::string err;
             if (!slot->session->run_tts(&tr, &tresp, &err)) {
                 fail_with(res, err);
