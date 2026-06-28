@@ -37,6 +37,7 @@ audiocore_test(test_registry)
 audiocore_test(test_projection)
 audiocore_test(test_acestep_units)
 audiocore_test(test_server_e2e)
+audiocore_test(test_sampler)
 audiocore_test_with_bin(test_convert_acestep convert_acestep)
 
 # End-to-end MOSS-TTS test — requires ~7.5GB model files + ~7GB ONNX codec.

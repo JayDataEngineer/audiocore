@@ -56,6 +56,8 @@ add_library(audiocore_framework STATIC
     src/framework/io/gguf_reader.cpp
     src/framework/io/gguf_reader_ext.cpp
     src/framework/io/weight_loader.cpp
+    # Unified sampler shared by every family + the qwen3::Runner MTP step.
+    src/framework/sampling/sampler.cpp
     src/framework/core/backend.cpp
     src/framework/core/session.cpp
     src/framework/runtime/registry.cpp

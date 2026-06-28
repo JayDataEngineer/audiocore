@@ -9,6 +9,8 @@
 
 #include "audiocore/models/ace_step/family.h"
 
+#include "audiocore/framework/sampling/sampler.h"
+
 #include "ggml.h"
 
 #include <algorithm>
@@ -18,6 +20,9 @@
 #include <vector>
 
 namespace audiocore::acestep {
+
+using audiocore::sampler::Params;
+using audiocore::sampler::sample_token;
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  FSQ: Finite Scalar Quantization — decode single code → 6D vector
@@ -228,74 +233,16 @@ bool AceStepSession::run_lm(const MusicRequest& req,
 
         const float* code_logits = logits.data() + code_start;
 
-        // Sample within the code vocabulary
-        int32_t chosen = 0;
-        if (req.temperature <= 0.0f) {
-            // Argmax (deterministic)
-            float best_val = -std::numeric_limits<float>::infinity();
-            for (int32_t i = 0; i < code_vocab_size; i++) {
-                if (code_logits[i] > best_val) {
-                    best_val = code_logits[i];
-                    chosen = i;
-                }
-            }
-        } else {
-            // Temperature-scaling + top-p nucleus sampling
-            std::vector<float> scaled(static_cast<size_t>(code_vocab_size));
-            float inv_temp = 1.0f / req.temperature;
-            float max_l = -std::numeric_limits<float>::infinity();
-            for (int32_t i = 0; i < code_vocab_size; i++) {
-                float v = code_logits[i] * inv_temp;
-                scaled[static_cast<size_t>(i)] = v;
-                if (v > max_l) max_l = v;
-            }
-            // Stable softmax
-            float sum_exp = 0.0f;
-            for (int32_t i = 0; i < code_vocab_size; i++) {
-                scaled[static_cast<size_t>(i)] = std::exp(scaled[static_cast<size_t>(i)] - max_l);
-                sum_exp += scaled[static_cast<size_t>(i)];
-            }
-            float inv_sum = 1.0f / (sum_exp + 1e-8f);
-            for (int32_t i = 0; i < code_vocab_size; i++)
-                scaled[static_cast<size_t>(i)] *= inv_sum;
-
-            // Top-p: sort descending, accumulate until cumulative >= top_p
-            if (req.top_p < 1.0f) {
-                std::vector<std::pair<float, int32_t>> sorted;
-                sorted.reserve(static_cast<size_t>(code_vocab_size));
-                for (int32_t i = 0; i < code_vocab_size; i++)
-                    sorted.emplace_back(scaled[static_cast<size_t>(i)], i);
-                std::sort(sorted.begin(), sorted.end(),
-                          [](auto& a, auto& b) { return a.first > b.first; });
-                float top_cum = 0.0f;
-                std::vector<bool> keep(static_cast<size_t>(code_vocab_size), false);
-                for (auto& p : sorted) {
-                    top_cum += p.first;
-                    keep[static_cast<size_t>(p.second)] = true;
-                    if (top_cum >= req.top_p) break;
-                }
-                for (int32_t i = 0; i < code_vocab_size; i++)
-                    if (!keep[static_cast<size_t>(i)])
-                        scaled[static_cast<size_t>(i)] = 0.0f;
-                // Renormalize
-                sum_exp = 0.0f;
-                for (int32_t i = 0; i < code_vocab_size; i++)
-                    sum_exp += scaled[static_cast<size_t>(i)];
-                inv_sum = 1.0f / (sum_exp + 1e-8f);
-                for (int32_t i = 0; i < code_vocab_size; i++)
-                    scaled[static_cast<size_t>(i)] *= inv_sum;
-            }
-
-            // Multinomial sample
-            std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-            float r = dist(rng);
-            float mn_cum = 0.0f;
-            chosen = code_vocab_size - 1;
-            for (int32_t i = 0; i < code_vocab_size; i++) {
-                mn_cum += scaled[static_cast<size_t>(i)];
-                if (r < mn_cum) { chosen = i; break; }
-            }
-        }
+        // Sample within the code vocabulary via the unified audiocore::sampler.
+        // temperature <= 0 selects the greedy argmax path; otherwise temp +
+        // top-p nucleus filtering + multinomial draw.
+        Params sp;
+        sp.temperature = req.temperature;
+        sp.top_p       = req.top_p;
+        sp.do_sample   = req.temperature > 0.0f;
+        const int32_t chosen = sample_token(code_logits, code_vocab_size, sp,
+                                            /*prev_tokens=*/nullptr, /*n_prev=*/0,
+                                            &rng);
 
         music_codes->push_back(chosen);
         prev_token = code_start + chosen;
