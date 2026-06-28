@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include "audiocore/models/ace_step/family.h"
+#include "audiocore/models/kokoro/family.h"
 #include "audiocore/models/moss_tts/family.h"
 
 namespace audiocore {
@@ -134,7 +135,30 @@ std::shared_ptr<httplib::Server> build_server(
         const auto& body = sg->body;
         auto& slot = sg->slot;
 
-        // ── MOSS TTS ───────────────────────────────────────────────────────
+        const std::string family = slot->session->family_name();
+
+        if (family == "kokoro") {
+            // ── Kokoro TTS ─────────────────────────────────────────────────
+            kokoro::TtsRequest tr{};
+            tr.text     = body.value("input", "");
+            tr.voice    = body.value("voice", "af_heart");
+            tr.speed    = body.value("speed", 1.0f);
+            tr.language = body.value("language", "en-us");
+            if (body.contains("is_phonemes")) tr.is_phonemes = body["is_phonemes"].get<bool>();
+            if (body.contains("trim"))        tr.trim        = body["trim"].get<bool>();
+
+            kokoro::TtsResponse tresp;
+            std::string err;
+            if (!slot->session->run_tts(&tr, &tresp, &err)) {
+                fail_with(res, err);
+                return;
+            }
+            res.set_content(pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate),
+                            "audio/wav");
+            return;
+        }
+
+        // ── MOSS TTS (default / fallback) ──────────────────────────────────
         moss::TtsRequest tr{};
         tr.text       = body.value("input", "");
         tr.language   = body.value("language", "en");

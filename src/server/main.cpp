@@ -33,6 +33,7 @@
 #include "audiocore/framework/core/session.h"
 #include "audiocore/framework/runtime/registry.h"
 #include "audiocore/models/ace_step/family.h"
+#include "audiocore/models/kokoro/family.h"
 #include "audiocore/models/moss_tts/family.h"
 #include "audiocore/server/server.h"
 
@@ -52,10 +53,12 @@ using nlohmann::json;
 // per new family.
 extern "C" void audiocore_register_moss_tts();
 extern "C" void audiocore_register_ace_step();
+extern "C" void audiocore_register_kokoro();
 
 void register_all_families() {
     audiocore_register_moss_tts();
     audiocore_register_ace_step();
+    audiocore_register_kokoro();
 }
 
 struct ConfigModel {
