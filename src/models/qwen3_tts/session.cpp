@@ -7,14 +7,12 @@
 //   Code Predictor MTP loop (31 fine codebooks) ─→
 //   [32 × T] code matrix ─→ Speech Tokenizer ─→ PCM audio
 //
-// Supports three modes:
-//   - Base: voice cloning via reference audio → ECAPA speaker embedding
-//   - CustomVoice: speaker ID + optional instruct
-//   - VoiceDesign: natural language instruct → generated voice
+// Both transformers (talker + predictor) run through the unified
+// qwen3::Runner — the same class MOSS and ACE-Step use. There is no longer
+// a separate TalkerRunner or PredictorRunner in audiocore.
 
 #include "audiocore/models/qwen3_tts/family.h"
-#include "audiocore/models/qwen3_tts/talker_runner.h"
-#include "audiocore/models/qwen3_tts/predictor_runner.h"
+#include "audiocore/models/qwen3/runner.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +23,9 @@
 #include <vector>
 
 namespace audiocore::qwen3_tts {
+
+using audiocore::qwen3::Runner;
+using audiocore::qwen3::RunnerConfig;
 
 // ── Codec special tokens (from official Qwen3-TTS config) ────────────────
 static constexpr int32_t CODEC_PAD    = 4196;
@@ -130,7 +131,8 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     // Tokenize main text
     std::vector<int32_t> text_tokens;
     if (!talker_->tokenize(req.text, /*add_special=*/true,
-                           /*parse_special=*/false, &text_tokens, error)) {
+                           /*parse_special=*/false, &text_tokens,
+                           /*needed=*/nullptr, error)) {
         return false;
     }
     if (text_tokens.empty()) {
@@ -144,7 +146,8 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     bool has_instruct = !req.instruct.empty();
     if (has_instruct) {
         if (!talker_->tokenize(req.instruct, /*add_special=*/true,
-                               /*parse_special=*/false, &instruct_tokens, error)) {
+                               /*parse_special=*/false, &instruct_tokens,
+                               /*needed=*/nullptr, error)) {
             return false;
         }
         std::fprintf(stderr, "qwen3_tts: %zu instruct tokens\n", instruct_tokens.size());
@@ -299,6 +302,7 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         if (predictor_->has_mtp()) {
             if (predictor_->predict_one_step(cur_hidden.data(),
                                              pred_input.data(),
+                                             n_fine_books,
                                              fine_codes.data(), error)) {
                 mtp_ok = true;
             }

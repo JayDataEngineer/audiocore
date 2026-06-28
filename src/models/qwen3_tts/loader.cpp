@@ -13,8 +13,7 @@
 //   qwen3_tts_predictor.gguf   (or predictor_path in extras)
 
 #include "audiocore/models/qwen3_tts/family.h"
-#include "audiocore/models/qwen3_tts/talker_runner.h"
-#include "audiocore/models/qwen3_tts/predictor_runner.h"
+#include "audiocore/models/qwen3/runner.h"
 
 #include <cstdio>
 #include <cstring>
@@ -28,6 +27,9 @@
 namespace fs = std::filesystem;
 
 namespace audiocore::qwen3_tts {
+
+using audiocore::qwen3::Runner;
+using audiocore::qwen3::RunnerConfig;
 
 // ── Helpers: discover model files from directory ────────────────────────────
 
@@ -95,34 +97,57 @@ bool Qwen3TtsSession::load(const std::string& model_path,
     std::fprintf(stderr, "qwen3_tts: loading predictor from %s\n", config_.predictor_path.c_str());
 
     // ── 1. Load Talker ─────────────────────────────────────────────────────
-    TalkerConfig talker_cfg;
+    RunnerConfig talker_cfg;
     talker_cfg.n_ctx        = config_.n_ctx_talker;
     talker_cfg.n_gpu_layers = config_.n_gpu_layers;
     talker_cfg.flash_attn   = config_.flash_attn;
 
-    talker_ = TalkerRunner::load(config_.talker_path, talker_cfg, error);
+    talker_ = Runner::load(config_.talker_path, talker_cfg, error);
     if (!talker_) {
         if (error) *error = "talker: " + *error;
         return false;
     }
-    std::fprintf(stderr, "qwen3_tts: talker loaded (hidden=%d, vocab=%d)\n",
-                 talker_->hidden_size(), talker_->vocab_size());
+    // Pull text-embedding + codec embd/head tensors out of the same GGUF.
+    // Non-fatal if absent (Lunavox-style GGUFs); the family falls back to
+    // the plain-token forward path.
+    {
+        std::string talker_extra_err;
+        if (!talker_->load_extras(config_.talker_path,
+                                   Runner::ExtraKind::Talker,
+                                   /*n_fine_books=*/31, &talker_extra_err)) {
+            std::fprintf(stderr,
+                         "qwen3_tts: talker extra-tensor load (optional): %s\n",
+                         talker_extra_err.c_str());
+        }
+    }
+    std::fprintf(stderr, "qwen3_tts: talker loaded (hidden=%d, vocab=%d, text_embd=%s)\n",
+                 talker_->hidden_size(), talker_->vocab_size(),
+                 talker_->has_text_embedding() ? "yes" : "no");
 
     // ── 2. Load Code Predictor ─────────────────────────────────────────────
-    PredictorConfig pred_cfg;
+    RunnerConfig pred_cfg;
     pred_cfg.n_ctx        = config_.n_ctx_predictor;
     pred_cfg.n_gpu_layers = config_.n_gpu_layers;
     pred_cfg.flash_attn   = config_.flash_attn;
-    pred_cfg.n_codebooks  = config_.n_codebooks;
 
-    predictor_ = PredictorRunner::load(config_.predictor_path, pred_cfg, error);
+    predictor_ = Runner::load(config_.predictor_path, pred_cfg, error);
     if (!predictor_) {
         if (error) *error = "predictor: " + *error;
         return false;
     }
-    std::fprintf(stderr, "qwen3_tts: predictor loaded (hidden=%d, vocab=%d, codebooks=%d)\n",
+    {
+        std::string pred_extra_err;
+        if (!predictor_->load_extras(config_.predictor_path,
+                                      Runner::ExtraKind::Predictor,
+                                      /*n_fine_books=*/31, &pred_extra_err)) {
+            std::fprintf(stderr,
+                         "qwen3_tts: predictor extra-tensor load (optional): %s\n",
+                         pred_extra_err.c_str());
+        }
+    }
+    std::fprintf(stderr, "qwen3_tts: predictor loaded (hidden=%d, vocab=%d, mtp=%s)\n",
                  predictor_->hidden_size(), predictor_->vocab_size(),
-                 predictor_->n_codebooks());
+                 predictor_->has_mtp() ? "yes" : "no");
 
     // ── 3. Codec decoder ───────────────────────────────────────────────────
     // The ONNX speech tokenizer has been removed. Codec decode now happens

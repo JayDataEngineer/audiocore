@@ -33,6 +33,7 @@
 
 #include "audiocore/framework/core/backend.h"
 #include "audiocore/framework/core/session.h"
+#include "audiocore/models/qwen3/runner.h"
 
 namespace audiocore::qwen3_tts {
 
@@ -97,8 +98,8 @@ public:
                  std::string* error = nullptr) override;
 
 private:
-    std::unique_ptr<class TalkerRunner>    talker_;
-    std::unique_ptr<class PredictorRunner> predictor_;
+    std::unique_ptr<qwen3::Runner> talker_;     // qwen3tts backbone + dual-embedding extras
+    std::unique_ptr<qwen3::Runner> predictor_;  // qwen3tts_cp + MTP extras
     Qwen3TtsConfig config_;
 
     bool run_inference(const TtsRequest& req, TtsResponse& resp,
