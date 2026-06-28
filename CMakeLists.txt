@@ -79,8 +79,6 @@ add_library(audiocore_framework STATIC
     # Qwen3-TTS (C++ via llama.cpp; codec decode pending ggml port):
     src/models/qwen3_tts/loader.cpp
     src/models/qwen3_tts/session.cpp
-    src/models/qwen3_tts/talker_runner.cpp
-    src/models/qwen3_tts/predictor_runner.cpp
     # HTTP server factory (routes + WAV encoders). Linked into the
     # audiocore_server binary AND into the e2e HTTP test, so both share the
     # same routing code path.
