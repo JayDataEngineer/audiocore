@@ -46,6 +46,32 @@ using TtsResponse = ::audiocore::TtsResponse;
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
+// Which training variant of Qwen3-TTS we loaded. Comes from extras["variant"]
+// or is inferred from the talker path. Drives per-variant defaults:
+//   Base         — plain TTS, no speaker token required
+//   CustomVoice  — speaker_name resolves to one of the 9 default speakers
+//   VoiceDesign  — voice_design mode is supported on this backbone
+// Until config.json parsing lands we can't actually detect the variant from
+// the GGUF itself; extras["variant"] is the source of truth. Unknown =
+// behave like Base (the safest default — every variant accepts plain TTS).
+enum class Qwen3TtsVariant {
+    Unknown = 0,
+    Base,
+    CustomVoice,
+    VoiceDesign,
+};
+
+// Per-request mode, mirroring Qwen3-TTS's five user-facing modes. Comes from
+// the unified TtsRequest.mode field. The default ("tts") works on every
+// variant. "voice_design" is intended for the VoiceDesign variant;
+// "voice_clone" is rejected up-front until the ECAPA-TDNN port lands.
+enum class Qwen3TtsMode {
+    TtsBatch = 0,    // default plain batch TTS (also covers instruct style)
+    VoiceDesign,     // describe a voice → generate with that voice
+    VoiceClone,      // reference_audio → speaker embedding (NOT IMPLEMENTED)
+    Streaming,       // chunked output (NOT IMPLEMENTED)
+};
+
 struct Qwen3TtsConfig {
     std::string talker_path;          // Path to talker GGUF
     std::string predictor_path;       // Path to predictor GGUF
@@ -57,7 +83,26 @@ struct Qwen3TtsConfig {
     float temperature       = 0.7f;
     float top_p             = 0.9f;
     int   max_new_tokens    = 4096;
+    Qwen3TtsVariant variant = Qwen3TtsVariant::Unknown;
+    // Populated from extras["model_size_b"] when known (1.7 or 0.6). Used
+    // only for logging / future size-aware defaults. Zero = unknown.
+    float model_size_b      = 0.0f;
 };
+
+// Parse a mode string ("tts" | "voice_design" | "voice_clone" | "streaming")
+// from TtsRequest.mode into the enum. Unknown / "tts" / "" → TtsBatch.
+Qwen3TtsMode parse_mode(const std::string& s);
+
+// Inline helper for variant display in logs.
+inline const char* variant_name(Qwen3TtsVariant v) {
+    switch (v) {
+        case Qwen3TtsVariant::Base:         return "Base";
+        case Qwen3TtsVariant::CustomVoice:  return "CustomVoice";
+        case Qwen3TtsVariant::VoiceDesign:  return "VoiceDesign";
+        case Qwen3TtsVariant::Unknown:      break;
+    }
+    return "Unknown";
+}
 
 // ── Request / Response ──────────────────────────────────────────────────────
 //
