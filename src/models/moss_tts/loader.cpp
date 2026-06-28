@@ -468,10 +468,10 @@ bool MossSession::load(const std::string& model_path,
             return false;
     }
 
-    // (5) Capture ONNX decoder path from extras.
-    auto it_extras = opts.extras.find("decoder_onnx");
-    if (it_extras != opts.extras.end())
-        decoder_onnx_path_ = it_extras->second;
+    // (5) Stash codec-related extras for the future ggml codec path. The
+    //     old ONNX decoder / encoder paths are no longer honored; codec
+    //     decoding will read moss.codec.dec.* tensors from the GGUF directly.
+    (void)opts;
 
     loaded_ = true;
     return true;

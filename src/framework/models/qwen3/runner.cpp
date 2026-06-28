@@ -150,6 +150,33 @@ bool Runner::forward_tokens(const int32_t* tokens, int32_t n_tokens, int32_t n_p
     return ok;
 }
 
+bool Runner::forward_get_embeddings(const int32_t* tokens, int32_t n_tokens,
+                                     int32_t n_pos, float* hidden,
+                                     std::string* error) {
+    llama_batch b = make_batch(n_tokens, n_pos, /*is_embd=*/false,
+                               nullptr, reinterpret_cast<const llama_token*>(tokens));
+    const int32_t n_embd = hidden_size_;
+    bool ok = (llama_decode(ctx_, b) == 0);
+    if (!ok) {
+        if (error) *error = "llama_decode failed (forward_get_embeddings)";
+    } else {
+        for (int32_t i = 0; i < n_tokens && ok; i++) {
+            const float* row = llama_get_embeddings_ith(ctx_, i);
+            if (!row) {
+                if (error) *error = "forward_get_embeddings: llama_get_embeddings_ith failed";
+                ok = false;
+                break;
+            }
+            std::memcpy(hidden + static_cast<size_t>(i) * n_embd, row,
+                        static_cast<size_t>(n_embd) * sizeof(float));
+        }
+    }
+    b.token = nullptr;
+    b.embd  = nullptr;
+    llama_batch_free(b);
+    return ok;
+}
+
 int32_t Runner::hidden_size() const { return hidden_size_; }
 int32_t Runner::vocab_size()  const { return vocab_size_;  }
 

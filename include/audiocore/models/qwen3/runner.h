@@ -62,6 +62,16 @@ public:
     bool forward_tokens(const int32_t* tokens, int32_t n_tokens, int32_t n_pos,
                         float* logits, std::string* error = nullptr);
 
+    // Token-id input → hidden state embeddings. Used by ACE-Step's text encoder
+    // (TE / Qwen3-Embedding) to produce per-token hidden states that condition
+    // the DiT cross-attention.
+    //   tokens:   (n_tokens,) int32
+    //   n_pos:    position offset
+    //   hidden:   out (n_tokens, hidden_size) row-major float32
+    bool forward_get_embeddings(const int32_t* tokens, int32_t n_tokens,
+                                int32_t n_pos, float* hidden,
+                                std::string* error = nullptr);
+
     // ---- Tokenizer (libllama-native, no vendored SentencePiece) ---------
     // These delegate to libllama's Qwen3 tokenizer. add_special inserts
     // BOS/EOS per the model config; parse_special decodes <|im_start|>-style

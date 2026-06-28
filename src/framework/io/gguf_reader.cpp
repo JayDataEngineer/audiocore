@@ -211,6 +211,15 @@ bool GgufReader::get_kv_bool(const char* key, bool* out) const {
     return true;
 }
 
+bool GgufReader::get_kv_f32(const char* key, float* out) const {
+    if (!ctx_) return false;
+    const int64_t k = gguf_find_key(ctx_, key);
+    if (k < 0) return false;
+    if (gguf_get_kv_type(ctx_, k) != GGUF_TYPE_FLOAT32) return false;
+    *out = gguf_get_val_f32(ctx_, k);
+    return true;
+}
+
 bool GgufReader::get_kv_str(const char* key, std::string* out) const {
     if (!ctx_) return false;
     const int64_t k = gguf_find_key(ctx_, key);

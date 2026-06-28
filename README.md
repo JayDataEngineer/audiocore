@@ -279,7 +279,7 @@ GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 │   └── test_moss_e2e.cpp            #   Full load + run (requires weights)
 ├── tools/
 │   ├── convert_acestep.cpp           # HF → llama.cpp tensor rename
-│   └── convert_safetensors_to_gguf.py  # (scaffold)
+│   └── convert_qwen3tts.cpp          # Qwen3-TTS safetensors → GGUF
 ├── docs/
 │   ├── ARCHITECTURE.md               # Two-seam deep-dive
 │   ├── GGUF_FORMAT.md                # Tensor maps for each family

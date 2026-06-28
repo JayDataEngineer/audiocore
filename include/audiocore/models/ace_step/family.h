@@ -30,21 +30,22 @@
 #include "audiocore/framework/core/session.h"
 #include "audiocore/framework/io/gguf_reader.h"   // complete type — methods take GgufReader&
 #include "audiocore/models/qwen3/runner.h"
+#include "audiocore/models/ace_step/dit_runner.h"
+#include "audiocore/models/ace_step/vae_runner.h"
+
+#include "ggml.h"
 
 struct ggml_context;
 struct ggml_tensor;
 
 namespace audiocore::acestep {
 
-// Parsed from ACE-Step GGUF KV metadata (DiT file). Verified keys from
-// ServeurpersoCom/acestep.cpp's config loader.
+// ── ACE-Step config (parsed from DiT GGUF metadata) ────────────────────────
 struct AceConfig {
-    int32_t in_channels             = 0;   // acestep.in_channels
-    int32_t audio_acoustic_hidden_dim = 0; // acestep.audio_acoustic_hidden_dim
-    int32_t patch_size              = 0;   // acestep.patch_size
-    int32_t sliding_window          = 0;   // acestep.sliding_window
-    std::string config_json;               // acestep.config_json (raw)
+    DitConfig dit;                         // DiT-specific params
+    std::string config_json;               // acestep.config_json (raw, upstream fallback)
     std::string variant;                   // "turbo" | "sft" | "xl-turbo" | …
+    int32_t     encoder_hidden_size = 1024; // Qwen3-Embedding hidden size (0.6B = 1024)
 };
 
 struct MusicRequest {
@@ -54,6 +55,8 @@ struct MusicRequest {
     int32_t     seed         = 0;
     float       guidance_scale = 7.5f;
     int32_t     n_diffusion_steps = 0;  // 0 → variant default (turbo=8, sft=50)
+    float       temperature  = 0.0f;   // LM sampling temp (0=argmax, >0=stochastic)
+    float       top_p        = 1.0f;   // LM nucleus sampling threshold
 };
 
 struct MusicResponse {
@@ -104,6 +107,9 @@ private:
 
     std::unique_ptr<qwen3::Runner> lm_;   // 5Hz music-code LM
     std::unique_ptr<qwen3::Runner> te_;   // Qwen3-Embedding text encoder
+    std::unique_ptr<DiTRunner>     dit_runner_;   // DiT graph builder
+    std::unique_ptr<VAERunner>     vae_runner_;   // VAE decoder
+
     ggml_context*  ext_ctx_   = nullptr;  // DiT (decoder.*) + VAE (vae.decoder.*).
     // Anchored hot tensors. DiT names are unprefixed; VAE names are
     // `vae.`-prefixed at bind time to dodge the `decoder.block.{i}.*`
@@ -115,6 +121,12 @@ private:
     ggml_tensor*   vae_conv_out_  = nullptr;   // vae.decoder.conv2
     AceConfig      cfg_;
     bool           owns_ext_ctx_ = false;
+
+    // ── Cached between run_lm() and run_dit_and_vae() ──────────────────────
+    std::vector<float> te_cond_;       // TE hidden states: [T_text, encoder_hidden]
+    std::vector<float> te_uncond_;     // null-text TE hidden (for CFG)
+    int32_t            te_cond_len_ = 0;   // T_text
+    int32_t            fsq_code_offset_ = 0;  // base offset for audio code tokens in LM vocab
 };
 
 }  // namespace audiocore::acestep

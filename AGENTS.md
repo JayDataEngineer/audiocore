@@ -69,8 +69,48 @@ audiocore_test_with_bin(my_e2e, convert_acestep)  # if it shells out to a binary
 
 The `convert_acestep` tool is the C++ rewrite of the audit-only Python
 script — it rewrites ACE-Step HF tensor names to llama.cpp names in place,
-preserving KV. The HTTP server is also testable in-process via
+preserving KV. `convert_qwen3tts` is a C++ safetensors→GGUF converter for
+Qwen3-TTS (replaces the Python original). All Python tooling has been
+removed from the project. The HTTP server is also testable in-process via
 `audiocore::build_server(slots)`; see `test_server_e2e.cpp`.
+
+## Family feature matrix
+
+### MOSS-TTS (`moss_tts`)
+
+| Mode | Status | HTTP endpoint | Notes |
+|------|--------|---------------|-------|
+| TTS (zero-shot) | Done | `POST /v1/audio/speech` | Text → speech, default handler |
+| Sound effects | Done | `POST /v1/audio/speech {"mode":"sfx"}` | Different system prompt + lower temps |
+| Voice cloning | Done | `POST /v1/audio/speech {"mode":"voice_clone","voice":"path.codes"}` | Requires pre-encoded `.codes` file (int32le: n_frames + n_frames×32 codes) |
+| Streaming | Not yet | — | Requires chunked HTTP response |
+| ggml codec graph | Not yet | — | Currently uses ONNX Runtime for codec decode |
+
+**Codec token format** (`.codes` binary): `[n_frames: i32le] [codes: n_frames × 32 × i32le]`.
+Generate from a WAV by encoding through the MOSS codec encoder ONNX model
+(use `OnnxDecoder::encode()` in `codec.cpp`, which wraps
+`encoder.onnx`).
+
+### ACE-Step (`ace_step`)
+
+| Model variant | Status | n_steps default | Notes |
+|---------------|--------|----------------|-------|
+| turbo (v15) | Done | 8 | Shifted-cosine schedule |
+| sft | Done | 50 | Linear schedule |
+| xl-turbo | Auto‑detected | 8 (override with `steps`) | Config read from GGUF KV metadata |
+
+| Parameter | Status | Field |
+|-----------|--------|-------|
+| caption | Done | `caption` |
+| lyrics | Done | `lyrics` |
+| duration | Done | `duration` |
+| seed | Done | `seed` |
+| guidance_scale | Done | `guidance_scale` (DiT-side CFG) |
+| n_diffusion_steps | Done | `steps` |
+| temperature | Done | `temperature` (LM, 0=argmax) |
+| top_p | Done | `top_p` (LM nucleus, 1.0=off) |
+
+Endpoint: `POST /v1/audio/music`
 
 ## Reference implementations
 

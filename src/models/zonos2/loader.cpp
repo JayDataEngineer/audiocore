@@ -1,249 +1,142 @@
-// loader.cpp — ZONOS2 subprocess lifecycle + family registration.
-//
-// This file implements Zonos2Session::load(), which starts the official
-// ZONOS2 Mini-SGLang server as a child process and waits for it to
-// report healthy. The actual model inference runs entirely in the
-// subprocess; the C++ side just forwards TTS requests over HTTP.
-//
-// Command launched (configurable via LoadOptions::extras):
-//   python3 -m minisgl --model-path <model_path> --port <port> ...
-//
-// Runtime deps for the subprocess (not built here):
-//   - Python 3.10+, torch, transformers, zonos, dac
-
 #include "audiocore/models/zonos2/family.h"
 
-#include <cerrno>
-#include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
-#include <thread>
-#include <vector>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <signal.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#include <httplib.h>
 
 #include "audiocore/framework/runtime/registry.h"
+#include "ggml.h"
+#include "gguf.h"
 
 namespace audiocore::zonos2 {
 
-// ===========================================================================
-// Free-port helper
-// ===========================================================================
+// ── Tensor name helpers ────────────────────────────────────────────────────
+static std::string tn_emb(int i)  { return "multi_embedder.embedders." + std::to_string(i) + ".weight"; }
+static std::string tn_emb_norm()  { return "emb_norm.weight"; }
+static std::string tn_out_norm()  { return "out_norm.weight"; }
+static std::string tn_lda_w()     { return "speaker_lda_projection.weight"; }
+static std::string tn_lda_b()     { return "speaker_lda_projection.bias"; }
+static std::string tn_sp_w()      { return "speaker_projection.weight"; }
+static std::string tn_sp_b()      { return "speaker_projection.bias"; }
+static std::string tn_attn_norm(int l) { return "layers." + std::to_string(l) + ".attention_norm.weight"; }
+static std::string tn_ffn_norm(int l)  { return "layers." + std::to_string(l) + ".ffn_norm.weight"; }
+static std::string tn_wq(int l)   { return "layers." + std::to_string(l) + ".attention.wq.weight"; }
+static std::string tn_wkv(int l)  { return "layers." + std::to_string(l) + ".attention.wkv.weight"; }
+static std::string tn_wo(int l)   { return "layers." + std::to_string(l) + ".attention.wo.weight"; }
+static std::string tn_temp(int l) { return "layers." + std::to_string(l) + ".attention.temp"; }
+static std::string tn_gater(int l){ return "layers." + std::to_string(l) + ".attention.gater.weight"; }
+static std::string tn_win(int l)  { return "layers." + std::to_string(l) + ".feed_forward.w_in.weight"; }
+static std::string tn_wout(int l) { return "layers." + std::to_string(l) + ".feed_forward.w_out.weight"; }
 
-int Zonos2Session::find_free_port() {
-    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return -1;
+static std::string tn_rdw(int l)  { return "layers." + std::to_string(l) + ".feed_forward.router.down_proj.weight"; }
+static std::string tn_rdb(int l)  { return "layers." + std::to_string(l) + ".feed_forward.router.down_proj.bias"; }
+static std::string tn_rmw(int l, int n) { return "layers." + std::to_string(l) + ".feed_forward.router.router_mlp." + std::to_string(n) + ".weight"; }
+static std::string tn_rmb(int l, int n) { return "layers." + std::to_string(l) + ".feed_forward.router.router_mlp." + std::to_string(n) + ".bias"; }
+static std::string tn_rne(int l)  { return "layers." + std::to_string(l) + ".feed_forward.router.rmsnorm_eda.weight"; }
+static std::string tn_rsc(int l)  { return "layers." + std::to_string(l) + ".feed_forward.router.router_states_scale"; }
+static std::string tn_rbi(int l)  { return "layers." + std::to_string(l) + ".feed_forward.router.balancing_biases"; }
+static std::string tn_gup(int l)  { return "layers." + std::to_string(l) + ".feed_forward.experts.gate_up_proj"; }
+static std::string tn_dpr(int l)  { return "layers." + std::to_string(l) + ".feed_forward.experts.down_proj"; }
+static std::string tn_mout()      { return "multi_output.weight"; }
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-    if (::bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(sock);
-        return -1;
-    }
+#define GET_TENSOR(ctx, name, ptr) do { \
+    *(ptr) = ggml_get_tensor(ctx, (name).c_str()); \
+    if (!*(ptr)) { \
+        std::fprintf(stderr, "zonos2: missing tensor: %s\n", (name).c_str()); \
+        return false; \
+    } \
+} while(0)
 
-    socklen_t len = sizeof(addr);
-    if (::getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
-        ::close(sock);
-        return -1;
-    }
-
-    int port = ntohs(addr.sin_port);
-    ::close(sock);
-    return port;
-}
-
-// ===========================================================================
-// Subprocess lifecycle
-// ===========================================================================
-
-bool Zonos2Session::start_subprocess(std::string* error) {
-    // Pick a port.
-    subprocess_port_ = cfg_.port > 0 ? cfg_.port : find_free_port();
-    if (subprocess_port_ <= 0) {
-        if (error) *error = "zonos2: failed to find a free TCP port";
-        return false;
-    }
-
-    pid_t pid = ::fork();
-    if (pid < 0) {
-        if (error) {
-            *error = std::string("zonos2: fork failed: ") + ::strerror(errno);
-        }
-        return false;
-    }
-
-    if (pid == 0) {
-        // ── Child process ──────────────────────────────────────────
-        // Run the Mini-SGLang server.
-        const std::string port_str  = std::to_string(subprocess_port_);
-        const std::string model     = cfg_.model_path;
-        const std::string device    = cfg_.device;
-
-        // Redirect stdout/stderr to stderr (same terminal as parent).
-        // We don't close stdin so the subprocess can read if needed.
-        ::dup2(STDERR_FILENO, STDOUT_FILENO);
-
-        ::execlp(cfg_.python_bin.c_str(),
-                 cfg_.python_bin.c_str(),
-                 "-m", "minisgl",
-                 "--model-path", model.c_str(),
-                 "--port", port_str.c_str(),
-                 "--device", device.c_str(),
-                 nullptr);
-
-        // exec failed — print to stderr and exit.
-        std::fprintf(stderr, "zonos2: exec(%s) failed: %s\n",
-                     cfg_.python_bin.c_str(), ::strerror(errno));
-        ::_exit(127);
-    }
-
-    // ── Parent process ────────────────────────────────────────────
-    subprocess_pid_ = pid;
-    subprocess_url_ = "http://127.0.0.1:" + std::to_string(subprocess_port_);
-    std::fprintf(stderr, "zonos2: started subprocess (PID %d) on %s\n",
-                 pid, subprocess_url_.c_str());
-    return true;
-}
-
-bool Zonos2Session::wait_for_ready(std::string* error) {
-    httplib::Client cli("127.0.0.1", subprocess_port_);
-    cli.set_read_timeout(2);
-    cli.set_connection_timeout(1);
-
-    const int max_attempts = cfg_.ready_timeout_sec * 2;  // every 500 ms
-    for (int i = 0; i < max_attempts; ++i) {
-        // Check if the subprocess is still alive.
-        int status = 0;
-        pid_t r = ::waitpid(subprocess_pid_, &status, WNOHANG);
-        if (r == subprocess_pid_) {
-            // Subprocess exited before becoming ready.
-            if (error) {
-                *error = "zonos2: subprocess died before becoming ready "
-                         "(exit status " + std::to_string(WEXITSTATUS(status)) + ")";
-            }
-            subprocess_pid_ = -1;
-            return false;
-        }
-
-        auto res = cli.Get("/health");
-        if (res && res->status == 200) {
-            std::fprintf(stderr, "zonos2: subprocess ready after ~%d ms\n",
-                         i * 500);
-            return true;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    // Timed out.
-    stop_subprocess();
-    if (error) {
-        *error = "zonos2: subprocess did not become ready within " +
-                 std::to_string(cfg_.ready_timeout_sec) + "s";
-    }
-    return false;
-}
-
-void Zonos2Session::stop_subprocess() {
-    if (!subprocess_running_ || subprocess_pid_ <= 0) return;
-    subprocess_running_ = false;
-
-    std::fprintf(stderr, "zonos2: stopping subprocess (PID %d)...\n",
-                 subprocess_pid_);
-
-    // 1. Send a graceful /shutdown POST so the Python process can release
-    //    GPU memory and flush logs.
-    if (!subprocess_url_.empty()) {
-        httplib::Client cli("127.0.0.1", subprocess_port_);
-        cli.set_read_timeout(2);
-        cli.Post("/shutdown", "", "application/json");
-    }
-
-    // 2. SIGTERM — allow 1 s to exit cleanly.
-    ::kill(subprocess_pid_, SIGTERM);
-    for (int i = 0; i < 5; ++i) {
-        int status = 0;
-        pid_t r = ::waitpid(subprocess_pid_, &status, WNOHANG);
-        if (r == subprocess_pid_) {
-            std::fprintf(stderr, "zonos2: subprocess exited cleanly\n");
-            subprocess_pid_ = -1;
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
-    // 3. SIGKILL — force terminate.
-    std::fprintf(stderr, "zonos2: force-killing subprocess (PID %d)...\n",
-                 subprocess_pid_);
-    ::kill(subprocess_pid_, SIGKILL);
-    ::waitpid(subprocess_pid_, nullptr, 0);
-    subprocess_pid_ = -1;
-}
-
-// ===========================================================================
-// load()
-// ===========================================================================
+// ── Zonos2Session::load ────────────────────────────────────────────────────
 
 bool Zonos2Session::load(const std::string& model_path,
                           const LoadOptions& opts,
                           const BackendConfig& backend_cfg,
                           std::string* error) {
-    cfg_.model_path = model_path;
+    (void)opts;
+    (void)backend_cfg;
 
-    // Parse extras.
-    auto it = opts.extras.find("python_bin");
-    if (it != opts.extras.end()) cfg_.python_bin = it->second;
+    std::fprintf(stderr, "zonos2: loading C++ native model from '%s'\n", model_path.c_str());
 
-    it = opts.extras.find("device");
-    if (it != opts.extras.end()) {
-        cfg_.device = it->second;
-    } else {
-        // Translate BackendConfig to device string.
-        if (backend_cfg.kind == BackendKind::ggml_cpu) {
-            cfg_.device = "cpu";
+    // Let gguf_init_from_file create the ggml context with tensors + data.
+    struct ggml_context* g_ctx = nullptr;
+    struct gguf_init_params ufparams = {false, &g_ctx};
+    struct gguf_context* gguf = gguf_init_from_file(model_path.c_str(), ufparams);
+    if (!gguf) {
+        if (error) *error = "zonos2: failed to open model file";
+        return false;
+    }
+    ctx_ = g_ctx;
+
+    // ── Extract tensors ────────────────────────────────────────────────
+
+    // Config from KV metadata (if available)
+    // Zonos2 uses hardcoded defaults from params.json
+
+    int n_embedders = cfg_.embedderCount;
+    std::string tn;
+    for (int i = 0; i < n_embedders; i++) {
+        tn = tn_emb(i);
+        GET_TENSOR(ctx_, tn, &embedders_[i]);
+    }
+
+    tn = tn_emb_norm(); GET_TENSOR(ctx_, tn, &embNorm_);
+    tn = tn_out_norm(); GET_TENSOR(ctx_, tn, &outNorm_);
+
+    tn = tn_lda_w(); speakerLdaW_ = ggml_get_tensor(ctx_, tn.c_str());
+    tn = tn_lda_b(); speakerLdaB_ = ggml_get_tensor(ctx_, tn.c_str());
+    tn = tn_sp_w();  speakerProjW_ = ggml_get_tensor(ctx_, tn.c_str());
+    tn = tn_sp_b();  speakerProjB_ = ggml_get_tensor(ctx_, tn.c_str());
+
+    for (int l = 0; l < cfg_.nLayers; l++) {
+        tn = tn_attn_norm(l); GET_TENSOR(ctx_, tn, &attnNorm_[l]);
+        tn = tn_ffn_norm(l);  GET_TENSOR(ctx_, tn, &ffnNorm_[l]);
+        tn = tn_wq(l);        GET_TENSOR(ctx_, tn, &wq_[l]);
+        tn = tn_wkv(l);       GET_TENSOR(ctx_, tn, &wkv_[l]);
+        tn = tn_wo(l);        GET_TENSOR(ctx_, tn, &wo_[l]);
+        tn = tn_temp(l);      GET_TENSOR(ctx_, tn, &temp_[l]);
+        tn = tn_gater(l);     GET_TENSOR(ctx_, tn, &gater_[l]);
+
+        bool moe = (cfg_.nExperts > 1 &&
+                    l >= cfg_.moeStartLayer &&
+                    (cfg_.nLayers - l) > cfg_.moeEndLayer);
+        if (moe) {
+            tn = tn_rdw(l);  GET_TENSOR(ctx_, tn, &rdW_[l]);
+            tn = tn_rdb(l);  GET_TENSOR(ctx_, tn, &rdB_[l]);
+            tn = tn_rmw(l, 0); GET_TENSOR(ctx_, tn, &rm0W_[l]);
+            tn = tn_rmb(l, 0); GET_TENSOR(ctx_, tn, &rm0B_[l]);
+            tn = tn_rmw(l, 2); GET_TENSOR(ctx_, tn, &rm2W_[l]);
+            tn = tn_rmb(l, 2); GET_TENSOR(ctx_, tn, &rm2B_[l]);
+            tn = tn_rmw(l, 4); GET_TENSOR(ctx_, tn, &rm4W_[l]);
+            tn = tn_rne(l);  GET_TENSOR(ctx_, tn, &rnE_[l]);
+            tn = tn_rsc(l);  GET_TENSOR(ctx_, tn, &rSc_[l]);
+            tn = tn_rbi(l);  GET_TENSOR(ctx_, tn, &rBi_[l]);
+            tn = tn_gup(l);  GET_TENSOR(ctx_, tn, &gUp_[l]);
+            tn = tn_dpr(l);  GET_TENSOR(ctx_, tn, &dPr_[l]);
         } else {
-            cfg_.device = "cuda:" + std::to_string(backend_cfg.device_id);
+            tn = tn_win(l);  GET_TENSOR(ctx_, tn, &wIn_[l]);
+            tn = tn_wout(l); GET_TENSOR(ctx_, tn, &wOut_[l]);
         }
     }
 
-    it = opts.extras.find("port");
-    if (it != opts.extras.end()) {
-        cfg_.port = std::stoi(it->second);
-    }
+    tn = tn_mout(); GET_TENSOR(ctx_, tn, &multiOutput_);
 
-    it = opts.extras.find("ready_timeout");
-    if (it != opts.extras.end()) {
-        cfg_.ready_timeout_sec = std::stoi(it->second);
-    }
-
-    std::fprintf(stderr, "zonos2: loading model '%s' on %s (port %d)\n",
-                 cfg_.model_path.c_str(), cfg_.device.c_str(),
-                 cfg_.port > 0 ? cfg_.port : 0);
-
-    if (!start_subprocess(error)) return false;
-    if (!wait_for_ready(error)) return false;
-
-    subprocess_running_ = true;
+    gguf_free(gguf);
     loaded_ = true;
-    std::fprintf(stderr, "zonos2: model ready on %s\n",
-                 subprocess_url_.c_str());
+
+    std::fprintf(stderr, "zonos2: model loaded successfully (%d layers)\n", cfg_.nLayers);
     return true;
 }
 
-// ===========================================================================
-// Factory + family registration
-// ===========================================================================
+bool Zonos2Session::run_tts(const void* request, void* response,
+                             std::string* error) {
+    (void)request;
+    (void)response;
+    if (error) *error = "zonos2: C++ native forward pass not yet implemented";
+    return false;
+}
+
+// ── Factory registration ───────────────────────────────────────────────────
 
 namespace {
 std::unique_ptr<Session> make_zonos2_session() {

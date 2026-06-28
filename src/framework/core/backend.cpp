@@ -1,8 +1,7 @@
 // backend.cpp — ggml backend factory.
 //
-// Today only the ggml family (CUDA/CPU/Vulkan/Metal). The Backend abstract
-// base is the seam ONNX Runtime will plug into in Phase 2; the factory
-// here is the only place that knows how to construct each kind.
+// Only the ggml family (CUDA/CPU/Vulkan/Metal). The deprecated ONNX Runtime
+// peer backend has been removed; all weight formats are GGUF.
 
 #include "audiocore/framework/core/backend.h"
 
@@ -33,8 +32,6 @@ public:
                 // Selected by name once those backends are linked in.
                 dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
                 break;
-            case BackendKind::onnxruntime:
-                throw std::runtime_error("ONNX Runtime backend not yet implemented");
         }
         if (!dev) throw std::runtime_error("no matching ggml backend device");
         backend_ = ggml_backend_dev_init(dev, nullptr);

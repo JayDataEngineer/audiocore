@@ -54,6 +54,7 @@ public:
     bool get_kv_i64(const char* key, int64_t* out) const;
     bool get_kv_u32(const char* key, uint32_t* out) const;
     bool get_kv_bool(const char* key, bool* out) const;
+    bool get_kv_f32(const char* key, float* out) const;
     bool get_kv_str(const char* key, std::string* out) const;
 
     // ---- Zero-copy tensor data access -----------------------------------
@@ -84,7 +85,7 @@ private:
     const char*                 mmap_base_ = nullptr;
 };
 
-// Write tensors to a GGUF file. Used by tools/convert_safetensors_to_gguf.py
+// Write tensors to a GGUF file. Used by tools/convert_qwen3tts.cpp
 // (via a small pybind shim) and tools/quantize.
 bool write_gguf_file(const std::string& path,
                      const std::vector<TensorWriteInfo>& tensors,
