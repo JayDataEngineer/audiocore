@@ -53,13 +53,11 @@ using nlohmann::json;
 // per new family.
 extern "C" void audiocore_register_moss_tts();
 extern "C" void audiocore_register_ace_step();
-extern "C" void audiocore_register_zonos2();
 extern "C" void audiocore_register_qwen3_tts();
 
 void register_all_families() {
     audiocore_register_moss_tts();
     audiocore_register_ace_step();
-    audiocore_register_zonos2();
     audiocore_register_qwen3_tts();
 }
 

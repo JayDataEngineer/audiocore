@@ -13,7 +13,6 @@
 
 #include "audiocore/models/ace_step/family.h"
 #include "audiocore/models/moss_tts/family.h"
-#include "audiocore/models/zonos2/family.h"
 #include "audiocore/models/qwen3_tts/family.h"
 
 namespace audiocore {
@@ -137,37 +136,6 @@ std::shared_ptr<httplib::Server> build_server(
         auto& slot = sg->slot;
 
         const std::string family = slot->session->family_name();
-
-        if (family == "zonos2") {
-            // ── ZONOS2 TTS ────────────────────────────────────────────────
-            zonos2::TtsRequest tr{};
-            tr.text     = body.value("input", "");
-            tr.language = body.value("language", "en");
-            tr.temperature = body.value("temperature", 1.15f);
-            tr.topP       = body.value("top_p", 0.0f);
-            tr.topK       = body.value("top_k", 106.0f);
-            tr.minP       = body.value("min_p", 0.18f);
-            tr.repetitionPenalty = body.value("repetition_penalty", 1.2f);
-            tr.seed = body.value("seed", 0);
-            if (body.contains("max_new_tokens"))
-                tr.maxNewTokens = body["max_new_tokens"].get<int>();
-            if (body.contains("speaker_embedding")) {
-                auto& arr = body["speaker_embedding"];
-                tr.speakerEmbedding.resize(arr.size());
-                for (size_t i = 0; i < arr.size(); ++i)
-                    tr.speakerEmbedding[i] = arr[i].get<float>();
-            }
-
-            zonos2::TtsResponse tresp;
-            std::string err;
-            if (!slot->session->run_tts(&tr, &tresp, &err)) {
-                fail_with(res, err);
-                return;
-            }
-            res.set_content(pcm_mono_to_wav(tresp.pcmMono, tresp.samplingRate),
-                            "audio/wav");
-            return;
-        }
 
         if (family == "qwen3_tts") {
             // ── Qwen3-TTS ─────────────────────────────────────────────────

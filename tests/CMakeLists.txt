@@ -45,13 +45,6 @@ audiocore_test_with_bin(test_convert_acestep convert_acestep)
 add_executable(test_moss_e2e test_moss_e2e.cpp)
 target_link_libraries(test_moss_e2e PRIVATE audiocore_framework)
 
-# End-to-end ZONOS2 test — spawns a Python subprocess running the official
-# Mini-SGLang server. Requires Python + torch + zonos deps (not build deps).
-# Run manually: ./test_zonos2_e2e
-# Set ZONOS2_MODEL_PATH / ZONOS2_PYTHON / ZONOS2_DEVICE env vars to configure.
-add_executable(test_zonos2_e2e test_zonos2_e2e.cpp)
-target_link_libraries(test_zonos2_e2e PRIVATE audiocore_framework)
-
 # End-to-end Qwen3-TTS test — loads talker GGUF + predictor GGUF + ONNX codec.
 # Requires ~1.4GB of model files from hf.co/wkwong/Lunavox-Qwen3-TTS-GGUF.
 # Run manually: ./test_qwen3tts_e2e

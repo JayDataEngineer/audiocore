@@ -73,9 +73,6 @@ add_library(audiocore_framework STATIC
     src/models/ace_step/session.cpp
     src/models/ace_step/dit_runner.cpp
     src/models/ace_step/vae_runner.cpp
-    # ZONOS2 native-ggml TTS (transformer load only; forward pass pending):
-    src/models/zonos2/loader.cpp
-    src/models/zonos2/session.cpp
     # Qwen3-TTS (C++ via llama.cpp; codec decode pending ggml port):
     src/models/qwen3_tts/loader.cpp
     src/models/qwen3_tts/session.cpp
