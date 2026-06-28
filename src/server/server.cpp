@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <cstdio>
+#include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -20,13 +22,15 @@ using nlohmann::json;
 // Tiny WAV writer for PCM16 → response body. Keeps the server binary
 // dependency-free; we encode MP3 only when libmp3lame is linked (Phase 2).
 
-std::string pcm_mono_to_wav(const std::vector<float>& pcm, int32_t sr) {
+namespace {
+std::string pcm_to_wav_impl(const std::vector<float>& pcm, int32_t sr,
+                             uint16_t channels) {
     std::ostringstream o;
     auto w16 = [&](uint16_t v) { o.put(v & 0xff); o.put((v >> 8) & 0xff); };
     auto w32 = [&](uint32_t v) {
         for (int i = 0; i < 4; i++) o.put((v >> (i * 8)) & 0xff);
     };
-    const uint16_t channels = 1, bps = 16;
+    const uint16_t bps = 16;
     const uint32_t data_bytes = static_cast<uint32_t>(pcm.size()) * 2;
     const uint32_t byte_rate  = static_cast<uint32_t>(sr) * channels * bps / 8;
     o.write("RIFF", 4);
@@ -42,33 +46,60 @@ std::string pcm_mono_to_wav(const std::vector<float>& pcm, int32_t sr) {
         w16(static_cast<int16_t>(s * 32767.0f));
     }
     return o.str();
+}
+}  // namespace
+
+std::string pcm_mono_to_wav(const std::vector<float>& pcm, int32_t sr) {
+    return pcm_to_wav_impl(pcm, sr, 1);
 }
 
 std::string pcm_stereo_to_wav(const std::vector<float>& pcm, int32_t sr) {
-    std::ostringstream o;
-    auto w16 = [&](uint16_t v) { o.put(v & 0xff); o.put((v >> 8) & 0xff); };
-    auto w32 = [&](uint32_t v) {
-        for (int i = 0; i < 4; i++) o.put((v >> (i * 8)) & 0xff);
-    };
-    const uint16_t channels = 2, bps = 16;
-    const uint32_t data_bytes = static_cast<uint32_t>(pcm.size()) * 2;
-    const uint32_t byte_rate  = static_cast<uint32_t>(sr) * channels * bps / 8;
-    o.write("RIFF", 4);
-    w32(36 + data_bytes);
-    o.write("WAVE", 4);
-    o.write("fmt ", 4);  w32(16);  w16(1);
-    w16(channels);  w32(static_cast<uint32_t>(sr));  w32(byte_rate);
-    w16(channels * bps / 8);  w16(bps);
-    o.write("data", 4);  w32(data_bytes);
-    for (float s : pcm) {
-        if (s >  1.0f) s =  1.0f;
-        if (s < -1.0f) s = -1.0f;
-        w16(static_cast<int16_t>(s * 32767.0f));
-    }
-    return o.str();
+    return pcm_to_wav_impl(pcm, sr, 2);
 }
 
 // ---- HTTP server factory -------------------------------------------------
+
+namespace {
+
+// Parse JSON body, resolve model-id → slot, and lock. Returns nullopt (with
+// `res` set to the appropriate error) on failure, or a locked SlotGuard on
+// success. The lock is held for the lifetime of the SlotGuard.
+struct SlotGuard {
+    json body;
+    std::shared_ptr<ModelSlot> slot;
+    std::unique_lock<std::mutex> lock;
+};
+
+std::optional<SlotGuard> resolve_slot(
+        const httplib::Request& req,
+        const std::unordered_map<std::string, std::shared_ptr<ModelSlot>>& slots,
+        httplib::Response& res) {
+    json body;
+    try { body = json::parse(req.body); }
+    catch (...) {
+        res.status = 400;
+        res.set_content(R"({"error":"invalid json"})", "application/json");
+        return std::nullopt;
+    }
+    const std::string model_id = body.value("model", "");
+    auto it = slots.find(model_id);
+    if (it == slots.end()) {
+        res.status = 404;
+        res.set_content(R"({"error":"unknown model"})", "application/json");
+        return std::nullopt;
+    }
+    auto& slot = it->second;
+    return SlotGuard{std::move(body), slot, std::unique_lock<std::mutex>(slot->mtx)};
+}
+
+// Helper: set res to a 500 JSON error and log the failure.
+void fail_with(httplib::Response& res, const std::string& err) {
+    res.status = 500;
+    json e = {{"error", err}};
+    res.set_content(e.dump(), "application/json");
+}
+
+}  // namespace
 
 std::shared_ptr<httplib::Server> build_server(
         std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots) {
@@ -98,33 +129,12 @@ std::shared_ptr<httplib::Server> build_server(
 
     svr->Post("/v1/audio/speech",
               [slots_ref](const httplib::Request& req, httplib::Response& res) {
-        json body;
-        try { body = json::parse(req.body); }
-        catch (...) {
-            res.status = 400;
-            res.set_content(R"({"error":"invalid json"})", "application/json");
-            return;
-        }
-        const std::string model_id = body.value("model", "");
-        auto it = slots_ref->find(model_id);
-        if (it == slots_ref->end()) {
-            res.status = 404;
-            res.set_content(R"({"error":"unknown model"})", "application/json");
-            return;
-        }
-        auto& slot = it->second;
-        std::lock_guard<std::mutex> g(slot->mtx);
+        auto sg = resolve_slot(req, *slots_ref, res);
+        if (!sg) return;
+        const auto& body = sg->body;
+        auto& slot = sg->slot;
 
-        // The request shape is whatever the loaded family's run_tts expects.
-        // We pass a generic bag of strings; families that don't use a
-        // particular field just ignore it. The mock family in tests reads
-        // "input" directly.
-        //
-        // NOTE: production families (moss_tts, ace_step) down-cast inside
-        // their run_tts to their concrete request struct. We mirror the
-        // fields moss_tts reads here so a generic Session* is sufficient
-        // for the framework path. Any family-specific extras go through the
-        // TtsRequest struct in the family header.
+        // ── MOSS TTS ───────────────────────────────────────────────────────
         moss::TtsRequest tr{};
         tr.text       = body.value("input", "");
         tr.language   = body.value("language", "en");
@@ -133,22 +143,10 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("temperature")) tr.temperature= body["temperature"].get<float>();
         if (body.contains("top_p"))       tr.top_p      = body["top_p"].get<float>();
 
-        // The ONNX decoder path can be overridden per-request.
-        // Pass it via LoadOptions::extras so the session picks it up at load time.
-        // NOTE: the session was already loaded by the time this handler runs;
-        // the per-request handling is stubbed. For true per-request override,
-        // add decoder_onnx to the TtsRequest struct itself. Here we just
-        // accept the field for logging; the actual path comes from load.
-        if (body.contains("decoder_onnx")) {
-            // ignored at runtime unless the session re-reads it
-        }
-
         moss::TtsResponse tresp;
         std::string err;
         if (!slot->session->run_tts(&tr, &tresp, &err)) {
-            res.status = 500;
-            json e = {{"error", err}};
-            res.set_content(e.dump(), "application/json");
+            fail_with(res, err);
             return;
         }
         res.set_content(pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate),
@@ -157,22 +155,10 @@ std::shared_ptr<httplib::Server> build_server(
 
     svr->Post("/v1/audio/music",
               [slots_ref](const httplib::Request& req, httplib::Response& res) {
-        json body;
-        try { body = json::parse(req.body); }
-        catch (...) {
-            res.status = 400;
-            res.set_content(R"({"error":"invalid json"})", "application/json");
-            return;
-        }
-        const std::string model_id = body.value("model", "");
-        auto it = slots_ref->find(model_id);
-        if (it == slots_ref->end()) {
-            res.status = 404;
-            res.set_content(R"({"error":"unknown model"})", "application/json");
-            return;
-        }
-        auto& slot = it->second;
-        std::lock_guard<std::mutex> g(slot->mtx);
+        auto sg = resolve_slot(req, *slots_ref, res);
+        if (!sg) return;
+        const auto& body = sg->body;
+        auto& slot = sg->slot;
 
         acestep::MusicRequest mr;
         mr.caption  = body.value("caption", "");
@@ -185,9 +171,7 @@ std::shared_ptr<httplib::Server> build_server(
         acestep::MusicResponse mresp;
         std::string err;
         if (!slot->session->run_music(&mr, &mresp, &err)) {
-            res.status = 500;
-            json e = {{"error", err}};
-            res.set_content(e.dump(), "application/json");
+            fail_with(res, err);
             return;
         }
         res.set_content(pcm_stereo_to_wav(mresp.pcm_stereo, mresp.sampling_rate),
