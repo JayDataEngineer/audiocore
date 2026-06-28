@@ -15,6 +15,10 @@
 #include <memory>
 #include <string>
 
+// Forward declaration so the header stays ggml-free for abstract users.
+struct ggml_backend;
+using ggml_backend_t = ggml_backend*;
+
 namespace audiocore {
 
 enum class BackendKind {
@@ -46,6 +50,13 @@ public:
     // interface lets us swap backends without rewriting model code.
     virtual bool execute(void* graph_handle, void* io_bindings,
                          std::string* error = nullptr) = 0;
+
+    // Direct ggml backend handle. Returns nullptr for non-ggml backends.
+    // Family code that builds its own ggml_cgraph (e.g. the MOSS codec
+    // port in src/models/moss_tts/codec.cpp) uses this to allocate context
+    // tensors and submit the graph through the same backend as the Qwen3
+    // backbone. The default keeps the abstract interface backend-agnostic.
+    virtual ggml_backend_t raw_ggml_backend() const { return nullptr; }
 };
 
 std::unique_ptr<Backend> make_backend(const BackendConfig& cfg,

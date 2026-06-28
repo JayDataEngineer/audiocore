@@ -7,7 +7,7 @@ is the only implementation language.
 
 | Model | Family | Capabilities | Status |
 |---|---|---|---|
-| **[MOSS-TTS](https://github.com/pwilkin/openmoss)** (8B) | `moss_tts` | TTS, dialogue (TTSD-style), voice design (VoiceGenerator-equivalent), sound effects, voice cloning | 🟡 5 of 6 modes parse + run end-to-end; codec → PCM is a silence stub pending a ggml port |
+| **[MOSS-TTS](https://github.com/pwilkin/openmoss)** (8B) | `moss_tts` | TTS, dialogue (TTSD-style), voice design (VoiceGenerator-equivalent), sound effects, voice cloning | ✅ Stage 16: codec → PCM ported (adapted from `pwilkin/openmoss`, Apache-2.0). 3 of 6 modes wired end-to-end when fed codec-bearing weights (e.g. `smcleed/MOSS-TTS-v1.5-GGUF` sidecar); dialogue/voice_design are best-effort fallbacks for dedicated variants; realtime/streaming fails fast. |
 | **[Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS)** (Talker + MTP Predictor) | `qwen3_tts` | Multilingual TTS, instructable voice design, 9 default speakers (CustomVoice) | 🟡 Talker + predictor wired; variant detection + speaker routing wired; codec → PCM is a silence stub pending a ggml port |
 | **[ACE-Step](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF)** (DiT + LM) | `ace_step` | Music generation (text-conditional, lyrics) | ✅ Text-to-Music fully wired end-to-end; 5 other modes fail fast with a pointer at GAPS.md |
 
@@ -278,11 +278,11 @@ Returns `{"status": "ok"}`.
 |---|---|
 | **Source** | [OpenMOSS-Team/MOSS-TTS](https://huggingface.co/OpenMOSS-Team/MOSS-TTS), [pwilkin/openmoss](https://github.com/pwilkin/openmoss) |
 | **Backbone** | Qwen3-8B (GGUF, via the unified `qwen3::Runner` over llama.cpp) |
-| **Audio codec** | 32-RVQ delay-pattern sampling. Codec-token → PCM decoder is a silence stub pending Stage 16 (ggml port of `openmoss/src/codec.cpp`, Apache-2.0); pre-built sidecar GGUFs with `moss.codec.*` tensors at `smcleod/MOSS-TTS-v1.5-GGUF`. See `docs/CODEC_PORTS.md` §1. |
+| **Audio codec** | 32-RVQ delay-pattern sampling. **Stage 16:** codec-token → PCM decoder is a ggml port of `openmoss/src/codec.cpp` (Apache-2.0) at `src/models/moss_tts/codec.cpp`. Auto-activates when the GGUF carries `moss.codec.*` tensors (e.g. `smcleod/MOSS-TTS-v1.5-GGUF` sidecar); community backbone-only GGUFs fall back to 1 s silence. See `docs/CODEC_PORTS.md` §1. |
 | **Sampling** | Delay-pattern autoregressive: top-k, top-p, temperature, repetition penalty (via `audiocore::sampler`) |
 | **Output** | 24 kHz mono PCM |
 | **Weight formats** | Single GGUF (community), sidecar pair (`X.gguf` + `X.extras.gguf`, smcleod/MOSS-TTS-v1.5-GGUF), or backbone GGUF + `.npy` embedding/lm_head dirs |
-| **Status** | 🚧 Generation works; codec → PCM is a silence stub pending Stage 16 (reference impl identified) |
+| **Status** | ✅ Stage 16: generation + codec decode work end-to-end with codec-bearing weights. Silence fallback otherwise. |
 | **Reference** | `pwilkin/openmoss` (C++, Apache-2.0) — parity target for byte-identical audio; pre-built sidecar GGUFs at `smcleod/MOSS-TTS-v1.5-GGUF` |
 
 GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).

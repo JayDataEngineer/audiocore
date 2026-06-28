@@ -12,9 +12,9 @@
 //      e. Embed the token vector (text_embed + sum audio_embed[i])
 //      f. Forward single embedding through backbone (incremental KV)
 //   5. Apply de-delay pattern to audio channels
-//   6. (TODO) Decode codec tokens -> PCM via a ggml port of
-//      openmoss/src/codec.cpp, reading moss.codec.dec.* tensors from the
-//      same GGUF. The former ONNX decoder has been removed.
+//   6. (Stage 16) Decode codec tokens -> PCM via MossCodecGraphs (ggml port
+//      of openmoss/src/codec.cpp). Falls back to 1 s silence when the GGUF
+//      carries no moss.codec.* tensors.
 //   7. Write PCM into response
 //
 // Everything transformer-shaped goes through qwen3::Runner (libllama). This
@@ -502,22 +502,50 @@ bool MossSession::run_tts(const void* request, void* response,
     }
 
     // ======================================================================
-    // (7) Decode codec -> PCM
+    // (7) Decode codec -> PCM.
     //
-    // The ONNX Runtime codec decoder has been removed from audiocore. A
-    // ggml_cgraph port of openmoss/src/codec.cpp (reading moss.codec.dec.*
-    // tensors from the same GGUF as the backbone) is the planned replacement.
-    // Until that port lands we emit 1 s of silence so the rest of the
-    // pipeline — chat template, tokenization, autoregressive codec-token
-    // generation, delay-pattern state machine — stays exercisable. The codec
-    // tokens themselves are valid (extracted into `segments` above) and will
-    // be passed to the future ggml decoder once it lands.
+    // Stage 16: if MossCodecGraphs is bound (the GGUF carries the
+    // moss.codec.* tensors), route the de-delayed codec tokens through the
+    // ggml port of openmoss/src/codec.cpp. Otherwise fall back to 1 s of
+    // silence — the documented behavior for community backbone-only GGUFs
+    // (see GAPS.md §1.3 and docs/CODEC_PORTS.md §1).
     // ======================================================================
-    std::fprintf(stderr, "moss_tts: codec->PCM decoder not wired "
-                         "(ggml port of openmoss/src/codec.cpp pending); "
-                         "emitting 1s silence\n");
-    (void)loudness_normalize;  // kept for the future ggml codec path
-    (void)segments;            // codec tokens validated above; decode pending
+    if (codec_graphs_.is_present()) {
+        // The delay-pattern state machine already produced per-frame
+        // (n_vq,) codec vectors in `segments`. Flatten to (n_vq, T) row-major
+        // to match the layout MossCodecGraphs::decode expects (one codebook
+        // stream per row, T_audio columns).
+        const int32_t T_audio = static_cast<int32_t>(segments.size());
+        if (T_audio > 0) {
+            std::vector<int32_t> flat(
+                static_cast<size_t>(cfg_.n_vq) * static_cast<size_t>(T_audio));
+            for (int32_t t = 0; t < T_audio; ++t) {
+                const auto& frame = segments[size_t(t)];
+                for (int32_t v = 0; v < cfg_.n_vq; ++v) {
+                    flat[size_t(v) * size_t(T_audio) + size_t(t)] = frame[size_t(v)];
+                }
+            }
+            try {
+                res->pcm_mono = codec_graphs_.decode(flat.data(), cfg_.n_vq, T_audio);
+                res->sampling_rate = cfg_.sampling_rate;
+                (void)loudness_normalize;  // reserved for a future post-process pass
+                return true;
+            } catch (const std::exception& e) {
+                if (error) *error = std::string("moss_tts codec decode failed: ") + e.what();
+                return false;
+            }
+        }
+        // Empty segment list — emit empty PCM, not silence.
+        res->pcm_mono.clear();
+        res->sampling_rate = cfg_.sampling_rate;
+        return true;
+    }
+
+    // Silence fallback — codec tensors not present in this GGUF.
+    std::fprintf(stderr, "moss_tts: codec tensors not bound "
+                         "(no moss.codec.* in GGUF); emitting 1s silence\n");
+    (void)loudness_normalize;
+    (void)segments;
     res->pcm_mono.assign(static_cast<size_t>(cfg_.sampling_rate), 0.0f);
     res->sampling_rate = cfg_.sampling_rate;
     return true;
@@ -526,13 +554,28 @@ bool MossSession::run_tts(const void* request, void* response,
 bool MossSession::decode_codec(const int32_t* codec_tokens, int32_t n_tokens,
                                 std::vector<float>* pcm_out,
                                 std::string* error) {
-    // Silence stub. See run_tts step (7) above: codec tokens are valid but
-    // the ggml port of openmoss/src/codec.cpp is pending. Until it lands we
-    // emit 1 s of silence at the configured sample rate so callers get a
-    // well-shaped response. `error` is intentionally not set — this is a
-    // known gap, not a failure.
-    (void)codec_tokens;
-    (void)n_tokens;
+    // Stage 16: route through the ggml port when codec tensors are bound.
+    // `codec_tokens` here is (n_tokens, n_vq) row-major — flatten into the
+    // (n_vq, T_audio) layout MossCodecGraphs::decode expects.
+    if (codec_graphs_.is_present() && n_tokens > 0) {
+        std::vector<int32_t> flat(static_cast<size_t>(cfg_.n_vq) *
+                                   static_cast<size_t>(n_tokens));
+        for (int32_t v = 0; v < cfg_.n_vq; ++v) {
+            for (int32_t t = 0; t < n_tokens; ++t) {
+                flat[size_t(v) * size_t(n_tokens) + size_t(t)] =
+                    codec_tokens[size_t(t) * size_t(cfg_.n_vq) + size_t(v)];
+            }
+        }
+        try {
+            *pcm_out = codec_graphs_.decode(flat.data(), cfg_.n_vq, n_tokens);
+            return true;
+        } catch (const std::exception& e) {
+            if (error) *error = std::string("codec decode failed: ") + e.what();
+            return false;
+        }
+    }
+
+    // Silence fallback — codec tensors not present in this GGUF.
     (void)error;
     pcm_out->assign(static_cast<size_t>(cfg_.sampling_rate), 0.0f);
     return true;

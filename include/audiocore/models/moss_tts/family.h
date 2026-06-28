@@ -23,6 +23,7 @@
 #include "audiocore/framework/io/gguf_reader.h"   // complete type — methods take GgufReader&
 #include "audiocore/framework/runtime/tasks.h"    // TtsRequest / TtsResponse
 #include "audiocore/models/qwen3/runner.h"
+#include "audiocore/models/moss_tts/codec.h"      // MossCodecGraphs (Stage 16 port)
 
 struct ggml_context;
 struct ggml_tensor;
@@ -121,11 +122,11 @@ private:
     // Decode codec tokens → PCM. Codec tokens: (n_audio_tokens, n_vq).
     // PCM out: mono float32 at config().sampling_rate.
     //
-    // TODO: the codec decoder will be a ggml_cgraph port of
-    // openmoss/src/codec.cpp, reading moss.codec.dec.* tensors from the same
-    // GGUF as the backbone. The ONNX Runtime decoder that used to live in
-    // codec.cpp has been removed; this path returns an error until the
-    // ggml codec port lands.
+    // Stage 16: if MossCodecGraphs is bound (codec_graphs_.is_present()),
+    // this routes the codes through the ggml port of
+    // openmoss/src/codec.cpp. Otherwise it emits 1 s of silence at the
+    // configured sample rate — the documented fallback for GGUFs that
+    // don't carry the moss.codec.* tensors (see GAPS.md §1.3).
     bool decode_codec(const int32_t* codec_tokens, int32_t n_tokens,
                       std::vector<float>* pcm_out,
                       std::string* error);
@@ -142,10 +143,11 @@ private:
     // (parallel to libllama's internal copy) for raw gathers without a
     // forward pass. Bound at load time via the GgufReader.
     ggml_tensor*   token_embd_ = nullptr;         // token_embd.weight
-    // Codec weights — anchored here, populated by bind_extension_tensors()
-    // when the GGUF carries moss.codec.dec.* tensors. Currently unused: the
-    // ggml codec port (see decode_codec) is not yet wired.
-    ggml_tensor*   codec_dec_root_ = nullptr;     // moss.codec.dec.<root>
+    // Codec weights — populated by bind_extension_tensors() when the GGUF
+    // carries moss.codec.dec.* tensors. Used by MossCodecGraphs to build
+    // and run the decode graph on the active backend.
+    ggml_tensor*     codec_dec_root_ = nullptr;    // moss.codec.dec.<root>
+    MossCodecGraphs  codec_graphs_;                // Stage 16 ggml port
     MossConfig     cfg_;
     bool           owns_ext_ctx_ = false;
 };
