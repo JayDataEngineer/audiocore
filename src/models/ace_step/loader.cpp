@@ -181,17 +181,58 @@ bool AceStepSession::load(const std::string& model_path,
 
     // (3) Parse ACE-Step KV from the DiT file. config_json carries the full
     //     upstream config we fall back to for keys we haven't enumerated.
-    dit_r->get_kv_i32("acestep.in_channels",               &cfg_.in_channels);
-    dit_r->get_kv_i32("acestep.audio_acoustic_hidden_dim", &cfg_.audio_acoustic_hidden_dim);
-    dit_r->get_kv_i32("acestep.patch_size",                &cfg_.patch_size);
-    dit_r->get_kv_i32("acestep.sliding_window",            &cfg_.sliding_window);
-    dit_r->get_kv_str("acestep.config_json",               &cfg_.config_json);
-    dit_r->get_kv_str("acestep.variant",                   &cfg_.variant);
+    //     We try multiple KV key formats (standard GGUF arch prefix, flat
+    //     acestep.* keys) for robustness across converter versions.
+    auto kv_i32 = [&](const char* key, int32_t* out) {
+        // Try standard GGUF arch prefix first, then flat key.
+        if (dit_r->get_kv_i32(key, out)) return;
+        // Some converters store under acestep-dit.*, others as acestep.*
+        std::string key_str(key);
+        size_t dot = key_str.find('.', key_str.find('.') + 1);  // second dot
+        if (dot != std::string::npos) {
+            std::string alt = "acestep." + key_str.substr(dot + 1);
+            dit_r->get_kv_i32(alt.c_str(), out);
+        }
+    };
+
+    // Documented KV keys (verified in GGUF_FORMAT.md):
+    dit_r->get_kv_i32("acestep.in_channels",               &cfg_.dit.in_channels);
+    dit_r->get_kv_i32("acestep.audio_acoustic_hidden_dim", &cfg_.dit.out_channels);
+    dit_r->get_kv_i32("acestep.patch_size",                &cfg_.dit.patch_size);
+    dit_r->get_kv_i32("acestep.sliding_window",            &cfg_.dit.sliding_window);
+    dit_r->get_kv_str("acestep.config_json",                &cfg_.config_json);
+    dit_r->get_kv_str("acestep.variant",                    &cfg_.variant);
     if (cfg_.variant.empty() && dit_path.find("turbo") != std::string::npos) {
         cfg_.variant = "turbo";
     } else if (cfg_.variant.empty() && dit_path.find("sft") != std::string::npos) {
         cfg_.variant = "sft";
     }
+
+    // Standard GGUF architecture keys (written by converter if present):
+    kv_i32("acestep-dit.embedding_length",              &cfg_.dit.hidden_size);
+    kv_i32("acestep-dit.feed_forward_length",           &cfg_.dit.intermediate_size);
+    kv_i32("acestep-dit.attention.head_count",          &cfg_.dit.n_heads);
+    kv_i32("acestep-dit.attention.head_count_kv",       &cfg_.dit.n_kv_heads);
+    kv_i32("acestep-dit.attention.key_length",          &cfg_.dit.head_dim);
+    kv_i32("acestep-dit.block_count",                   &cfg_.dit.n_layers);
+    {
+        float fval = cfg_.dit.rope_theta;
+        if (dit_r->get_kv_f32("acestep-dit.rope.freq_base", &fval))
+            cfg_.dit.rope_theta = fval;
+    }
+    {
+        float fval = cfg_.dit.rms_norm_eps;
+        if (dit_r->get_kv_f32("acestep-dit.attention.layer_norm_rms_epsilon", &fval))
+            cfg_.dit.rms_norm_eps = fval;
+    }
+
+    // Fallback: derive any zero-valued DitConfig fields from weight tensor
+    // shapes bound in step (5). This is the most reliable method since the
+    // tensor shapes can't lie — but step (5) hasn't run yet at this point.
+    // We'll do a second pass after bind_dit_and_vae().
+    //
+    // TE hidden size from the TE model (Qwen3-Embedding 0.6B = 1024).
+    if (te_->hidden_size() > 0) cfg_.encoder_hidden_size = te_->hidden_size();
 
     // (4) Verify the two Qwen3 GGUFs are in llama.cpp layout, then spin up
     //     the unified qwen3::Runner for each. Same Runner, same libllama,
@@ -211,6 +252,28 @@ bool AceStepSession::load(const std::string& model_path,
 
     // (5) Bind DiT + VAE weights into ext_ctx_.
     if (!bind_dit_and_vae(*dit_r, *vae_r, error)) return false;
+
+    // (5b) Post-bind: derive any zero-valued DitConfig fields from weight-
+    //      tensor shapes.  The tensor shapes can't lie — they're the ground
+    //      truth for the loaded model.
+    if (cfg_.dit.hidden_size == 0 && dit_proj_in_) {
+        cfg_.dit.hidden_size = dit_proj_in_->ne[0];
+    }
+    if (cfg_.dit.in_channels == 0 && dit_proj_in_) {
+        cfg_.dit.in_channels = dit_proj_in_->ne[1];
+    }
+    if (cfg_.dit.out_channels == 0 && dit_proj_out_) {
+        cfg_.dit.out_channels = dit_proj_out_->ne[1];
+    }
+
+    // (5c) Construct DiTRunner and VAERunner.
+    dit_runner_ = std::make_unique<DiTRunner>(ext_ctx_, cfg_.dit);
+    vae_runner_ = std::make_unique<VAERunner>(ext_ctx_);
+
+    // (5d) Compute FSQ code offset: audio codes are the last 64000 tokens
+    //      in the LM's vocabulary (appended after the Qwen3 BPE tokens).
+    fsq_code_offset_ = lm_->vocab_size() - 64000;
+    if (fsq_code_offset_ < 0) fsq_code_offset_ = 0;
 
     // (6) Stash the readers on the Session so the mmaps outlive load().
     //     loader_ (the base-class WeightLoader slot) holds one; we keep the

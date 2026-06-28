@@ -20,13 +20,6 @@
       "backend":  "ggml_cuda"
     },
     {
-      "id":       "kokoro-tts",
-      "family":   "kokoro",
-      "path":     "/mnt/data/models/audio/kokoro/",
-      "backend":  "onnxruntime",
-      "voice":    "af_heart"
-    },
-    {
       "id":       "zonos2-tts",
       "family":   "zonos2",
       "path":     "Zyphra/ZONOS2",
@@ -35,6 +28,17 @@
         "device": "cuda:0",
         "ready_timeout": "180"
       }
+    },
+    {
+      "id":       "qwen3-tts",
+      "family":   "qwen3_tts",
+      "path":     "/mnt/data/models/audio/qwen3-tts/",
+      "backend":  "ggml_cuda",
+      "extras": {
+        "talker_path":    "qwen3_tts_talker.q5_k.gguf",
+        "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+        "n_gpu_layers":   "99"
+      }
     }
   ],
 
@@ -42,7 +46,6 @@
     "GET  /health",
     "GET  /v1/models",
     "POST /v1/audio/speech   { model: 'moss-tts',        input: 'hello', voice: '', language: 'en' }",
-    "POST /v1/audio/speech   { model: 'kokoro-tts',      input: 'hello', voice: 'af_heart', speed: 1.0, language: 'en-us' }",
     "POST /v1/audio/speech   { model: 'zonos2-tts',      input: 'hello', speed: 1.0, temperature: 0.7, top_p: 0.9, cfg_scale: 2.0 }",
     "POST /v1/audio/music    { model: 'ace-step-turbo',  caption: 'lo-fi piano', lyrics: '', duration: 30, guidance_scale: 7.5, steps: 8 }"
   ]

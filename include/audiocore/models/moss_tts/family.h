@@ -7,7 +7,7 @@
 //   • audio_embed.{i}.weight — projects codec tokens into Qwen3 hidden space
 //   • audio_head.{i}.weight  — projects Qwen3 hidden states back to codec
 //                              logits, one head per RVQ stream
-//   • codec.enc/dec/quantizer.* — wav ↔ codec-token round-trip
+//   • moss.codec.dec.*        — codec-token → PCM decoder (ggml port pending)
 //
 // Verified tensor names come from pwilkin/openmoss/src/model.cpp. See
 // docs/GGUF_FORMAT.md → "MOSS-TTS" section for the canonical list.
@@ -58,6 +58,7 @@ struct TtsRequest {
     std::string text;
     std::string language   = "en";
     std::string voice_path;             // optional ref audio for cloning
+    std::string mode       = "tts";     // "tts" | "sfx" | "voice_clone"
     int32_t     seed       = 0;
     float       temperature= 0.8f;
     float       top_p      = 0.9f;
@@ -125,11 +126,14 @@ private:
                                  std::vector<float>* logits_out,
                                  std::string* error);
 
-    // Decode codec tokens → PCM via moss.codec.dec.* graphs. Codec tokens:
-    // (n_audio_tokens, n_vq). PCM out: mono float32 at config().sampling_rate.
+    // Decode codec tokens → PCM. Codec tokens: (n_audio_tokens, n_vq).
+    // PCM out: mono float32 at config().sampling_rate.
     //
-    // The codec graph is ported from openmoss/src/codec.cpp. Marked TODO
-    // until that port lands.
+    // TODO: the codec decoder will be a ggml_cgraph port of
+    // openmoss/src/codec.cpp, reading moss.codec.dec.* tensors from the same
+    // GGUF as the backbone. The ONNX Runtime decoder that used to live in
+    // codec.cpp has been removed; this path returns an error until the
+    // ggml codec port lands.
     bool decode_codec(const int32_t* codec_tokens, int32_t n_tokens,
                       std::vector<float>* pcm_out,
                       std::string* error);
@@ -146,10 +150,10 @@ private:
     // (parallel to libllama's internal copy) for raw gathers without a
     // forward pass. Bound at load time via the GgufReader.
     ggml_tensor*   token_embd_ = nullptr;         // token_embd.weight
-    // Codec weights — anchored here, wired in codec.cpp.
+    // Codec weights — anchored here, populated by bind_extension_tensors()
+    // when the GGUF carries moss.codec.dec.* tensors. Currently unused: the
+    // ggml codec port (see decode_codec) is not yet wired.
     ggml_tensor*   codec_dec_root_ = nullptr;     // moss.codec.dec.<root>
-    // ONNX decoder path (set from LoadOptions::extras["decoder_onnx"] in load())
-    std::string    decoder_onnx_path_;
     MossConfig     cfg_;
     bool           owns_ext_ctx_ = false;
 };

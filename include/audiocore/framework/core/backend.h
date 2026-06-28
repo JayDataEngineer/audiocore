@@ -1,9 +1,9 @@
 // backend.h — execution backend abstraction.
 //
 // This is the seam between "weight format" and "execution runtime".
-// Today only the ggml backend exists (CUDA/CPU/Vulkan/Metal). Phase 2
-// adds an ONNX Runtime backend that takes the same WeightLoader output
-// and produces inference results through a different code path.
+// Only the ggml backend is supported (CUDA/CPU/Vulkan/Metal). All weight
+// formats are GGUF; the deprecated ONNX Runtime peer backend has been
+// removed.
 //
 // Model code never sees this directly. It works through Session, which
 // owns a Backend instance and exposes task-specific calls (run_tts,
@@ -22,7 +22,6 @@ enum class BackendKind {
     ggml_cpu,
     ggml_vulkan,
     ggml_metal,
-    onnxruntime,   // Phase 2
 };
 
 struct BackendConfig {

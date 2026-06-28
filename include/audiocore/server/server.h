@@ -33,7 +33,7 @@ struct ModelSlot {
 // Routes:
 //   GET  /health
 //   GET  /v1/models
-//   POST /v1/audio/speech          (kokoro / zonos2 / moss_tts)
+//   POST /v1/audio/speech          (zonos2 / qwen3_tts / moss_tts)
 //   POST /v1/audio/music           (ace_step)
 std::shared_ptr<httplib::Server> build_server(
         std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots);

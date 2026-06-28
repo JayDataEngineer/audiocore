@@ -12,9 +12,9 @@
 #include <nlohmann/json.hpp>
 
 #include "audiocore/models/ace_step/family.h"
-#include "audiocore/models/kokoro/family.h"
 #include "audiocore/models/moss_tts/family.h"
 #include "audiocore/models/zonos2/family.h"
+#include "audiocore/models/qwen3_tts/family.h"
 
 namespace audiocore {
 
@@ -138,42 +138,53 @@ std::shared_ptr<httplib::Server> build_server(
 
         const std::string family = slot->session->family_name();
 
-        if (family == "kokoro") {
-            // ── Kokoro TTS ─────────────────────────────────────────────────
-            kokoro::TtsRequest tr{};
-            tr.text     = body.value("input", "");
-            tr.voice    = body.value("voice", "af_heart");
-            tr.speed    = body.value("speed", 1.0f);
-            tr.language = body.value("language", "en-us");
-            if (body.contains("is_phonemes")) tr.is_phonemes = body["is_phonemes"].get<bool>();
-            if (body.contains("trim"))        tr.trim        = body["trim"].get<bool>();
-
-            kokoro::TtsResponse tresp;
-            std::string err;
-            if (!slot->session->run_tts(&tr, &tresp, &err)) {
-                fail_with(res, err);
-                return;
-            }
-            res.set_content(pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate),
-                            "audio/wav");
-            return;
-        }
-
         if (family == "zonos2") {
             // ── ZONOS2 TTS ────────────────────────────────────────────────
             zonos2::TtsRequest tr{};
             tr.text     = body.value("input", "");
             tr.language = body.value("language", "en");
-            tr.speed    = body.value("speed", 1.0f);
-            tr.temperature = body.value("temperature", 0.7f);
-            tr.top_p      = body.value("top_p", 0.9f);
-            tr.cfg_scale  = body.value("cfg_scale", 2.0f);
-            if (body.contains("speaker_embedding"))
-                tr.speaker_embedding = body["speaker_embedding"].get<std::string>();
+            tr.temperature = body.value("temperature", 1.15f);
+            tr.topP       = body.value("top_p", 0.0f);
+            tr.topK       = body.value("top_k", 106.0f);
+            tr.minP       = body.value("min_p", 0.18f);
+            tr.repetitionPenalty = body.value("repetition_penalty", 1.2f);
+            tr.seed = body.value("seed", 0);
+            if (body.contains("max_new_tokens"))
+                tr.maxNewTokens = body["max_new_tokens"].get<int>();
+            if (body.contains("speaker_embedding")) {
+                auto& arr = body["speaker_embedding"];
+                tr.speakerEmbedding.resize(arr.size());
+                for (size_t i = 0; i < arr.size(); ++i)
+                    tr.speakerEmbedding[i] = arr[i].get<float>();
+            }
+
+            zonos2::TtsResponse tresp;
+            std::string err;
+            if (!slot->session->run_tts(&tr, &tresp, &err)) {
+                fail_with(res, err);
+                return;
+            }
+            res.set_content(pcm_mono_to_wav(tresp.pcmMono, tresp.samplingRate),
+                            "audio/wav");
+            return;
+        }
+
+        if (family == "qwen3_tts") {
+            // ── Qwen3-TTS ─────────────────────────────────────────────────
+            qwen3_tts::TtsRequest tr{};
+            tr.text          = body.value("input", "");
+            tr.language      = body.value("language", "");
+            tr.speed         = body.value("speed", 1.0f);
+            tr.temperature   = body.value("temperature", 0.7f);
+            tr.top_p         = body.value("top_p", 0.9f);
+            tr.instruct      = body.value("instruct", "");
+            tr.speaker_name  = body.value("speaker", "");
+            tr.reference_audio = body.value("reference_audio", "");
+            tr.reference_text  = body.value("reference_text", "");
             if (body.contains("max_new_tokens"))
                 tr.max_new_tokens = body["max_new_tokens"].get<int>();
 
-            zonos2::TtsResponse tresp;
+            qwen3_tts::TtsResponse tresp;
             std::string err;
             if (!slot->session->run_tts(&tr, &tresp, &err)) {
                 fail_with(res, err);
@@ -189,9 +200,11 @@ std::shared_ptr<httplib::Server> build_server(
         tr.text       = body.value("input", "");
         tr.language   = body.value("language", "en");
         tr.voice_path = body.value("voice", "");
+        tr.mode       = body.value("mode", "tts");
         if (body.contains("seed"))        tr.seed       = body["seed"].get<int32_t>();
         if (body.contains("temperature")) tr.temperature= body["temperature"].get<float>();
         if (body.contains("top_p"))       tr.top_p      = body["top_p"].get<float>();
+        if (body.contains("max_tokens"))  tr.max_tokens = body["max_tokens"].get<int32_t>();
 
         moss::TtsResponse tresp;
         std::string err;
@@ -217,6 +230,8 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("seed"))           mr.seed              = body["seed"].get<int32_t>();
         if (body.contains("guidance_scale")) mr.guidance_scale    = body["guidance_scale"].get<float>();
         if (body.contains("steps"))          mr.n_diffusion_steps = body["steps"].get<int32_t>();
+        if (body.contains("temperature"))    mr.temperature       = body["temperature"].get<float>();
+        if (body.contains("top_p"))          mr.top_p             = body["top_p"].get<float>();
 
         acestep::MusicResponse mresp;
         std::string err;

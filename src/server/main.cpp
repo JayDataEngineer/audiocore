@@ -33,8 +33,8 @@
 #include "audiocore/framework/core/session.h"
 #include "audiocore/framework/runtime/registry.h"
 #include "audiocore/models/ace_step/family.h"
-#include "audiocore/models/kokoro/family.h"
 #include "audiocore/models/moss_tts/family.h"
+#include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/server/server.h"
 
 namespace {
@@ -53,14 +53,14 @@ using nlohmann::json;
 // per new family.
 extern "C" void audiocore_register_moss_tts();
 extern "C" void audiocore_register_ace_step();
-extern "C" void audiocore_register_kokoro();
 extern "C" void audiocore_register_zonos2();
+extern "C" void audiocore_register_qwen3_tts();
 
 void register_all_families() {
     audiocore_register_moss_tts();
     audiocore_register_ace_step();
-    audiocore_register_kokoro();
     audiocore_register_zonos2();
+    audiocore_register_qwen3_tts();
 }
 
 struct ConfigModel {
@@ -84,7 +84,6 @@ BackendKind parse_backend(const std::string& s) {
     if (s == "ggml_cpu")    return BackendKind::ggml_cpu;
     if (s == "ggml_vulkan") return BackendKind::ggml_vulkan;
     if (s == "ggml_metal")  return BackendKind::ggml_metal;
-    if (s == "onnxruntime") return BackendKind::onnxruntime;
     return BackendKind::ggml_cuda;
 }
 
@@ -118,6 +117,10 @@ bool load_config(const std::string& path, ServerConfig& out) {
             cm.load_options.voice_path = m["voice_path"].get<std::string>();
         if (m.contains("language"))
             cm.load_options.language = m["language"].get<std::string>();
+        if (m.contains("extras") && m["extras"].is_object()) {
+            for (auto& [key, val] : m["extras"].items())
+                cm.load_options.extras[key] = val.get<std::string>();
+        }
         if (cm.id.empty() || cm.family.empty() || cm.path.empty()) {
             std::fprintf(stderr, "model entry missing id/family/path\n");
             return false;

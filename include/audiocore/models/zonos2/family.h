@@ -1,66 +1,85 @@
-// family.h — ZONOS2 subprocess TTS family.
-//
-// ZONOS2 is an 8B-parameter MoE decoder-only transformer (SonicMoE, ~900M
-// active params) with 9-codebook DAC audio output at 44.1 kHz. Because the
-// architecture is too complex to reimplement in C++ via ggml, this family
-// spawns a Python subprocess running the official ZONOS2 Mini-SGLang server
-// and communicates via HTTP. The subprocess is started in load() and killed
-// in ~Zonos2Session().
-//
-// Architecture:
-//   Text → UTF-8 byte tokenization → MoE backbone →
-//   DAC decoder → 44.1 kHz mono PCM
-//
-// Speaker conditioning:
-//   ECAPA-TDNN embedding (128-dim) extracted from reference audio.
-//   Passed per-request via the speaker_embedding field (base64-encoded).
-//
-// Weight sources:
-//   - HuggingFace: Zyphra/ZONOS2  (official, full PyTorch weights)
-//   - GGUF:        cagyirey/ZONOS2-GGUF  (via mistral.rs, not llama.cpp)
-//
-// Runtime dependencies (subprocess):
-//   Python 3.10+, torch, transformers, zonos, dac
-//
-// See https://huggingface.co/Zyphra/ZONOS2
-//     https://github.com/Zyphra/ZONOS2
-
 #ifndef AUDIOCORE_MODELS_ZONOS2_FAMILY_H
 #define AUDIOCORE_MODELS_ZONOS2_FAMILY_H
 
 #include <memory>
 #include <string>
 #include <vector>
+#include <cstdint>
 
 #include "audiocore/framework/core/session.h"
 
+struct ggml_context;
+struct ggml_cgraph;
+struct ggml_tensor;
+
 namespace audiocore::zonos2 {
 
-// Parsed from LoadOptions + extras at load time.
-struct Zonos2Config {
-    std::string model_path;            // HuggingFace model ID or local path
-    std::string python_bin = "python3"; // Python interpreter for subprocess
-    std::string device = "cuda:0";     // device string passed to subprocess
-    int         port = 0;              // 0 = auto-select free port
-    int         ready_timeout_sec = 180; // max wait for subprocess health
+// Architecture constants derived from params.json:
+//   n_layers=28, dim=2048, head_dim=128, n_heads=16 (dim/head_dim),
+//   n_kv_heads=4, intermediate_size=3072 (dim*1.5, rounded to 256),
+//   moe: 16 experts, top_k=1 (layer 26: top_k=2), router_dim=128,
+//   moe from layer 3 to layer 26, layers 0-2 and 27 are dense.
+//   n_codebooks=9, codebook_size=1024, audio_vocab=1026
+//   text_vocab=519 (192 legacy + 256 bytes + 8 rate + 60 quality + 2 bg + 1 acc)
+//   speaker_embedding_dim=2048, speaker_lda_dim=1024
+
+struct Zonos2ModelConfig {
+    int32_t nLayers = 28;
+    int32_t hiddenSize = 2048;
+    int32_t headDim = 128;
+    int32_t nHeads = 16;
+    int32_t nKVHeads = 4;
+    int32_t intermediateSize = 3072;
+    int32_t nCodebooks = 9;
+    int32_t codebookSize = 1024;
+    int32_t audioVocab = 1026;     // codebookSize + 2 (eoa + pad)
+    int32_t textVocab = 519;
+    int32_t nExperts = 16;
+    int32_t nExpertsPerTok = 1;
+    int32_t moeRouterDim = 128;
+    int32_t moeStartLayer = 3;
+    int32_t moeEndLayer = 1;       // last N layers that are dense
+    int32_t eoaId = 1024;
+    int32_t audioPadId = 1025;
+    float   lossSoftcap = 15.0f;
+    bool    speakerEnabled = true;
+    int32_t speakerEmbeddingDim = 2048;
+    int32_t speakerLdaDim = 1024;
+    int32_t speakingRateNumBuckets = 8;
+    int32_t qualityNumBuckets = 60;
+    // derived
+    int32_t kvDim;
+    int32_t qoDim;
+    int32_t audioEmbedCount;
+    int32_t embedderCount;
+
+    Zonos2ModelConfig() {
+        kvDim = nKVHeads * headDim;
+        qoDim = nHeads * headDim;
+        audioEmbedCount = nCodebooks;
+        embedderCount = audioEmbedCount + 1;
+    }
 };
 
-// Request shape for ZONOS2 TTS.
 struct TtsRequest {
-    std::string text;                      // input text (UTF-8)
-    std::string language = "en";           // language for text normalization
-    std::string speaker_embedding;         // optional, base64 128-dim float32
-    float       speed = 1.0f;              // speaking speed multiplier
-    float       temperature = 0.7f;        // sampling temperature
-    float       top_p = 0.9f;              // nucleus sampling threshold
-    float       cfg_scale = 2.0f;          // classifier-free guidance scale
-    int         max_new_tokens = 0;        // 0 = auto (model default)
+    std::string text;
+    std::string language = "en";
+    std::vector<float> speakerEmbedding;
+    float temperature = 1.15f;
+    float topP = 0.0f;
+    float topK = 106.0f;
+    float minP = 0.18f;
+    int32_t maxNewTokens = 1024;
+    float repetitionPenalty = 1.2f;
+    int32_t repetitionWindow = 50;
+    int32_t repetitionCodebooks = 8;
+    int32_t seed = 0;
+    int32_t speakingRateBucket = -1;
 };
 
 struct TtsResponse {
-    std::vector<float> pcm_mono;          // 44.1 kHz mono float32 PCM
-    int32_t            sampling_rate = 44100;
-    std::string        error;
+    std::vector<float> pcmMono;
+    int32_t samplingRate = 44100;
 };
 
 class Zonos2Session : public Session {
@@ -81,33 +100,47 @@ public:
     bool run_tts(const void* request, void* response,
                  std::string* error = nullptr) override;
 
-    const Zonos2Config& config() const { return cfg_; }
+    const Zonos2ModelConfig& config() const { return cfg_; }
 
 private:
-    // Start the Python subprocess on an available port.
-    bool start_subprocess(std::string* error);
+    // ── Model weights (all point into ctx_) ───────────────────────────
+    struct ggml_context* ctx_ = nullptr;
 
-    // Poll GET /health until the subprocess responds.
-    bool wait_for_ready(std::string* error);
+    struct ggml_tensor* embedders_[10]{};
+    struct ggml_tensor* embNorm_ = nullptr;
+    struct ggml_tensor* outNorm_ = nullptr;
 
-    // Kill the subprocess (SIGTERM, then SIGKILL after timeout). Also sends
-    // a graceful /shutdown POST before the signals.
-    void stop_subprocess();
+    struct ggml_tensor* attnNorm_[28]{};
+    struct ggml_tensor* ffnNorm_[28]{};
 
-    // Parse WAV bytes from the subprocess response into PCM float samples.
-    bool parse_wav_response(const std::string& wav_bytes,
-                            std::vector<float>& pcm_out,
-                            int32_t& sampling_rate_out,
-                            std::string* error);
+    struct ggml_tensor* speakerLdaW_ = nullptr;
+    struct ggml_tensor* speakerLdaB_ = nullptr;
+    struct ggml_tensor* speakerProjW_ = nullptr;
+    struct ggml_tensor* speakerProjB_ = nullptr;
 
-    // Find a free TCP port on 127.0.0.1.
-    static int find_free_port();
+    struct ggml_tensor* wq_[28]{};
+    struct ggml_tensor* wkv_[28]{};
+    struct ggml_tensor* wo_[28]{};
+    struct ggml_tensor* temp_[28]{};
+    struct ggml_tensor* gater_[28]{};
+    struct ggml_tensor* wIn_[28]{};
+    struct ggml_tensor* wOut_[28]{};
+    struct ggml_tensor* rdW_[28]{};
+    struct ggml_tensor* rdB_[28]{};
+    struct ggml_tensor* rm0W_[28]{};
+    struct ggml_tensor* rm0B_[28]{};
+    struct ggml_tensor* rm2W_[28]{};
+    struct ggml_tensor* rm2B_[28]{};
+    struct ggml_tensor* rm4W_[28]{};
+    struct ggml_tensor* rnE_[28]{};
+    struct ggml_tensor* rSc_[28]{};
+    struct ggml_tensor* rBi_[28]{};
+    struct ggml_tensor* gUp_[28]{};
+    struct ggml_tensor* dPr_[28]{};
+    struct ggml_tensor* multiOutput_ = nullptr;
 
-    Zonos2Config cfg_;
-    pid_t        subprocess_pid_ = -1;
-    int          subprocess_port_ = 0;
-    std::string  subprocess_url_;
-    bool         subprocess_running_ = false;
+    Zonos2ModelConfig cfg_;
+    bool loaded_ = false;
 };
 
 }  // namespace audiocore::zonos2
