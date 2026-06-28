@@ -179,10 +179,52 @@ not retag every `ggml_get_tensor` call inside it.
 
 ---
 
+## Qwen3-TTS
+
+Qwen3-TTS ships two GGUFs produced by `tools/convert_qwen3tts` from the
+official safetensors at `QwenLM/Qwen3-TTS`:
+
+### `qwen3_tts_talker.gguf` — qwen3tts architecture
+
+The backbone loads natively via libllama. The extra tensors the talker needs
+to do dual-embedding (text + codec) and codec-head projection are pulled out
+of the same GGUF by `qwen3::Runner::load_extras(ExtraKind::Talker)`, going
+through `WeightLoader` like every other family:
+
+| Tensor | Shape | Used by |
+|---|---|---|
+| `text_embd.weight` | `[text_vocab, 2048]` | Text-side input embedding |
+| `text_proj.0.weight` / `text_proj.0.bias` | `[2048, 2048]` / `[2048]` | Text projection MLP layer 0 |
+| `text_proj.1.weight` / `text_proj.1.bias` | `[1024, 2048]` / `[1024]` | Text projection MLP layer 1 (→ hidden_size) |
+| `token_embd.weight` | `[codec_vocab, 1024]` | Codec-side input embedding (aliased as `codec_embedding` by the runner) |
+| `output.weight` | `[codec_vocab, 1024]` | Codec head (coarse codebook 0 logits) |
+
+If none of these are present (Lunavox-style GGUFs that only ship the
+backbone), the talker falls back to plain token-mode forward.
+
+### `qwen3_tts_predictor.gguf` — qwen3tts_cp architecture
+
+The predictor backbone also loads via libllama. The MTP extras — 31 fine
+codebook tables + 31 lm heads + a small→MTP projection — are pulled by
+`qwen3::Runner::load_extras(ExtraKind::Predictor, n_fine_books=31)`:
+
+| Tensor | Shape | Used by |
+|---|---|---|
+| `codec_embd.{i}.weight` (i ∈ [0, 31)) | `[fine_vocab, 1024]` | Per-codebook fine input embedding |
+| `lm_head.{i}.weight` (i ∈ [0, 31)) | `[1024, fine_vocab]` | Per-codebook fine head |
+| `small_to_mtp.weight` / `small_to_mtp.bias` | `[hidden, hidden]` / `[hidden]` | Projects talker hidden state into the MTP conditioner |
+
+`fine_vocab` is inferred from `codec_embd.0.weight`'s element count at load
+time. If none of the MTP tensors are present the predictor falls back to
+stock `forward_tokens` (Lunavox-style predictor without MTP).
+
+---
+
 ## Why no `audiocore.gguf_version`
 
 We don't write our own GGUFs (yet). When we do — quantizer tool, merged
 multi-family bundles — a top-level `audiocore.gguf_version` uint32 will be
 added at that point and validated at load. Today every file we read was
 written by upstream tools (llama.cpp's quantizer, the community ACE-Step
-release), so a version header we never wrote would just refuse valid input.
+release, our own `convert_qwen3tts`), so a version header we never wrote
+would just refuse valid input.

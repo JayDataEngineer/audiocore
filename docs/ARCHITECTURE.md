@@ -18,9 +18,10 @@ struct TensorStorage {
 ```
 
 Every weight reader produces `vector<TensorStorage>`. Model code requests
-tensors by name; the framework materializes them lazily into the active
-backend. Adding a new weight format (ONNX, NPZ, …) means writing one new
-reader — model code is untouched.
+tensors by name via `WeightLoader::find()` + `materialize()`; the framework
+handles format specifics. GGUF is the only weight format audiocore ships
+today, and the only one it will ever ship — `TensorStorage` exists so model
+code never calls `gguf_*` directly, not to enable foreign formats.
 
 ### Seam 2 — `Backend` (execution runtime)
 
@@ -30,10 +31,31 @@ class Backend {
 };
 ```
 
-Today only ggml CUDA/CPU/Vulkan/Metal backends exist. Phase 2 adds ONNX
-Runtime as a sibling backend. The `Session` owns one `Backend` and exposes
-task methods (`run_tts`, `run_music`, …) that build graphs in the backend's
-native shape and submit them.
+ggml CUDA/CPU/Vulkan/Metal backends. The `Session` owns one `Backend` and
+exposes task methods (`run_tts`, `run_music`, …) that build graphs in the
+backend's native shape and submit them. The Qwen3 transformer path
+(`qwen3::Runner`) talks to libllama directly for KV-cache + sampling, with
+graph execution still going through ggml.
+
+### Seam 3 — `audiocore::sampler` (unified token sampling)
+
+```cpp
+struct Params {
+    float temperature        = 1.0f;
+    float top_p              = 1.0f;
+    int   top_k              = 0;
+    float repetition_penalty = 1.0f;
+    bool  do_sample          = true;
+};
+int32_t sample_token(const float* logits, int32_t vocab_size,
+                     const Params& p, …);
+```
+
+Top-k / top-p / temperature / repetition-penalty / argmax in one place, in
+`src/framework/sampling/`. Every family and the `qwen3::Runner` MTP
+predictor sample through it. Before Stage 5 four near-duplicate samplers
+lived in `moss_tts/sampler.cpp`, `qwen3/runner.cpp`, `qwen3_tts/session.cpp`,
+and `ace_step/session.cpp`; all four now delegate here.
 
 ## How the pieces fit
 
@@ -58,14 +80,16 @@ native shape and submit them.
    │ src/models/<family>/    │                          │ src/framework/io/        │
    │   loader.cpp            │ ←── asks tensors by name │   weight_loader.cpp      │
    │   session.cpp           │                          │   gguf_reader.cpp        │
-   │   (model-specific code) │                          │   (safetensors, onnx: P2)│
-   └─────────────────────────┘                          └──────────────────────────┘
+   │   (model-specific code) │                          │   (only gguf_* calls in  │
+   └─────────────────────────┘                          │    the tree live here)   │
+                                                          └──────────────────────────┘
                                                                        │
                                                                        ▼
                                                           ┌──────────────────────────┐
                                                           │ src/framework/core/      │
                                                           │   backend.cpp            │
-                                                          │   (ggml now; ORT: P2)    │
+                                                          │   (ggml CUDA/CPU/Vulkan/ │
+                                                          │    Metal)                │
                                                           └──────────────────────────┘
 ```
 
@@ -76,35 +100,17 @@ native shape and submit them.
 | Framework layout (engine + framework + models + app) | `0xShug0/audio.cpp` | Their organization is correct; reinventing it adds nothing. Clean-room — no code copied. |
 | Server API (`/v1/audio/speech`, `server.json` shape) | `0xShug0/audio.cpp` | OpenAI-compatible is what consumers expect. |
 | CLI shape (`--task --family --model --backend`) | `0xShug0/audio.cpp` | Familiar surface; matches what `audiocpp_cli` already does. |
-| `TensorStorage` struct | `leejet/stable-diffusion.cpp` (MIT) | The seam that lets us add ONNX without touching model code. Vendored with attribution. |
+| `TensorStorage` struct | `leejet/stable-diffusion.cpp` (MIT) | The seam that keeps format specifics out of model code. Vendored with attribution. |
 | `gguf_reader.cpp` + `gguf_reader_ext.h` | `leejet/stable-diffusion.cpp` (MIT) | Proven, small, MIT. ~360 lines total. |
 | Per-family `loader.cpp` + `session.cpp` pattern | `0xShug0/audio.cpp` | Clear separation between "what tensors this model needs" (loader) and "how to run a task" (session). |
 | MOSS-TTS family code | fresh | audio.cpp only has Nano-100M aspirationally; we need 8B Qwen3 backbone. |
+| Qwen3-TTS family code | fresh | Talker + Code Predictor both run through the unified `qwen3::Runner`. |
 | ACE-Step family code | fresh | audio.cpp has none; only `ServeurpersoCom/acestep.cpp` exists as a single-purpose server. |
-| Backend abstraction | fresh (mirrors audio.cpp's `ENGINE_ENABLE_*` CMake flags) | Needs to support ONNX Runtime later, so we can't lock onto ggml. |
-
-## What changes when Phase 2 (ONNX) lands
-
-Three additions, no changes to existing code:
-
-1. `src/framework/io/onnx_reader.cpp` — produces `vector<TensorStorage>` from
-   an `.onnx` file (the ONNX Runtime API exposes weight tensors as initializers;
-   we just enumerate them).
-2. `src/framework/core/backend_onnx.cpp` — implements `Backend::execute()` by
-   building an `Ort::Session` from the graph handle and running it.
-3. `ENGINE_ENABLE_ONNXRUNTIME` CMake flag.
-
-Model code is unchanged because it already speaks in terms of `TensorStorage`
-and `Backend::execute()`. A MOSS-TTS family that today runs on ggml CUDA can
-run on ONNX Runtime tomorrow by changing one line in `server.json`:
-
-```json
-{ "backend": "onnxruntime" }   // was "ggml_cuda"
-```
+| Backend abstraction | fresh (mirrors audio.cpp's `ENGINE_ENABLE_*` CMake flags) | ggml is the only execution engine; the abstraction exists so family code doesn't hardcode `ggml_*` calls. |
 
 ## What changes for each new model family
 
-Adding a new family (e.g. `kokoro_tts`, `spark_tts`, `chatterbox`):
+Adding a new family (e.g. `spark_tts`, `chatterbox`):
 
 1. Create `src/models/<family>/{loader.cpp,session.cpp,…}`.
 2. Document the tensor map in `docs/GGUF_FORMAT.md`.
@@ -119,12 +125,11 @@ level, or moved into a CMake `glob` if we want zero-friction additions).
 
 Two-tier, mirroring audio.cpp:
 
-1. **Unit tests** (`tests/`) — `TensorStorage`, GGUF reader, tokenizer, codec
-   I/O. Pure framework layer, no model weights required.
-2. **Parity tests** (`tests/parity/`) — generate audio for fixed prompts +
-   seeds and compare against the reference C++ implementations:
-   - `pwilkin/openmoss/build/moss-tts-cli` for MOSS
-   - `ServeurpersoCom/acestep.cpp/build/ace-server` for ACE-Step
-
-   These need the actual weights mounted and run in CI nightly, not on every
-   commit.
+1. **Unit tests** (`tests/`, registered via ctest) — `TensorStorage`, GGUF
+   reader round-trip, family registry, audio-head projection parity,
+   unified sampler (argmax / top-k / top-p / temperature / rep penalty /
+   determinism), server HTTP e2e, ACE-Step converter e2e. Pure framework
+   layer, no model weights required.
+2. **Parity tests** (run manually; not in ctest) — `test_moss_e2e` and
+   `test_qwen3tts_e2e` load the real weights and run the full pipeline.
+   These need the actual weights mounted at their configured paths.
