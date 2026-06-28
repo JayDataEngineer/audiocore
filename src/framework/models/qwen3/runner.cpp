@@ -8,7 +8,8 @@
 #include "audiocore/models/qwen3/runner.h"
 
 #include "llama.h"
-#include "gguf.h"
+
+#include "audiocore/framework/io/gguf_reader.h"
 
 #include <algorithm>
 #include <cmath>
@@ -21,63 +22,42 @@
 
 namespace audiocore::qwen3 {
 
+using audiocore::GgufReader;
+using audiocore::TensorStorage;
+
 // ═══════════════════════════════════════════════════════════════════════════
-//  Shared GGUF raw-tensor reader (consolidated from talker_runner.cpp and
-//  predictor_runner.cpp — both shipped near-identical copies).
+//  Extras tensor materialization via WeightLoader.
+//
+//  The talker/predictor extras (text_embd, codec_embd, per-codebook tables,
+//  lm_heads, MTP projection) live in the same GGUF libllama loaded but are
+//  not surfaced by any llama_* API. We pull them out through the same
+//  WeightLoader interface the moss_tts and ace_step families use — opening
+//  the GGUF exactly once per extras pass instead of once per tensor.
 // ═══════════════════════════════════════════════════════════════════════════
 
 namespace {
 
-struct TensorRef {
-    int64_t  tid;       // tensor index in GGUF
-    size_t   size;      // tensor data size in bytes
-    size_t   offset;    // byte offset in file
-    ggml_type type;     // element type
-};
-
-// Find a tensor by name in an open GGUF context.
-TensorRef find_tensor_in_gguf(gguf_context* ctx, const char* name) {
-    const int64_t n = gguf_get_n_tensors(ctx);
-    for (int64_t i = 0; i < n; i++) {
-        if (std::strcmp(gguf_get_tensor_name(ctx, i), name) == 0) {
-            return {i,
-                    gguf_get_tensor_size(ctx, i),
-                    gguf_get_data_offset(ctx) + gguf_get_tensor_offset(ctx, i),
-                    gguf_get_tensor_type(ctx, i)};
-        }
+// Look up `name` in `reader` and materialize it into a freshly-allocated
+// float[] that the caller owns (delete[]). Returns nullptr if the tensor is
+// absent or the read fails. *out_nfloats (if non-null) receives the element
+// count. The on-disk tensor is ASSUMED to be F32 — the Qwen3-TTS converter
+// (tools/convert_qwen3tts.cpp) writes these tensors as F32 by design.
+float* materialize_f32(const GgufReader& reader, const char* name,
+                       size_t* out_nfloats = nullptr) {
+    const TensorStorage* t = reader.find(name);
+    if (!t) return nullptr;
+    const size_t n_floats = static_cast<size_t>(t->nelements());
+    float* buf = new float[n_floats];
+    std::string err;
+    if (!reader.materialize(*t, buf, &err)) {
+        std::fprintf(stderr,
+                     "qwen3::Runner: materialize('%s') failed: %s\n",
+                     name, err.c_str());
+        delete[] buf;
+        return nullptr;
     }
-    return {-1, 0, 0, GGML_TYPE_F32};
-}
-
-// Load a single F32 tensor from a GGUF file by name. Returns nullptr if not
-// found. Caller owns the returned buffer (delete[]).
-float* load_gguf_tensor_f32(const char* path, const char* name,
-                             size_t* out_nfloats = nullptr) {
-    gguf_init_params params = {true, nullptr};
-    gguf_context* ctx = gguf_init_from_file(path, params);
-    if (!ctx) return nullptr;
-
-    TensorRef tr = find_tensor_in_gguf(ctx, name);
-    float* result = nullptr;
-    if (tr.tid >= 0 && tr.size > 0) {
-        const size_t n_floats = tr.size / sizeof(float);
-        if (out_nfloats) *out_nfloats = n_floats;
-        result = new float[n_floats];
-        std::FILE* fp = std::fopen(path, "rb");
-        if (fp) {
-            std::fseek(fp, static_cast<long>(tr.offset), SEEK_SET);
-            if (std::fread(result, 1, tr.size, fp) != tr.size) {
-                delete[] result;
-                result = nullptr;
-            }
-            std::fclose(fp);
-        } else {
-            delete[] result;
-            result = nullptr;
-        }
-    }
-    gguf_free(ctx);
-    return result;
+    if (out_nfloats) *out_nfloats = n_floats;
+    return buf;
 }
 
 // Local RNG + top-p/top-t sampling used by predict_one_step. Consolidated
@@ -473,26 +453,32 @@ bool Runner::load_extras(const std::string& gguf_path, ExtraKind kind,
 
 bool Runner::load_talker_extras(const std::string& gguf_path,
                                  std::string* error) {
-    (void)error;
-    const char* path = gguf_path.c_str();
+    // Open the GGUF once via WeightLoader. The talker extras are typically
+    // 7 tensors — going through GgufReader turns 7 file opens into 1.
+    GgufReader reader;
+    std::string load_err;
+    if (!reader.load(gguf_path, &load_err)) {
+        if (error) *error = "talker extras: " + load_err;
+        return false;
+    }
 
     // text_embd.weight [text_vocab, 2048] — F32
     size_t nf = 0;
-    if (float* te = load_gguf_tensor_f32(path, "text_embd.weight", &nf)) {
+    if (float* te = materialize_f32(reader, "text_embd.weight", &nf)) {
         text_embd_     = te;
         text_embd_dim_ = 2048;
         text_vocab_    = static_cast<int32_t>(nf / 2048);
     }
 
-    text_proj_0_w_ = load_gguf_tensor_f32(path, "text_proj.0.weight");
-    text_proj_0_b_ = load_gguf_tensor_f32(path, "text_proj.0.bias");
-    text_proj_1_w_ = load_gguf_tensor_f32(path, "text_proj.1.weight");
-    text_proj_1_b_ = load_gguf_tensor_f32(path, "text_proj.1.bias");
+    text_proj_0_w_ = materialize_f32(reader, "text_proj.0.weight");
+    text_proj_0_b_ = materialize_f32(reader, "text_proj.0.bias");
+    text_proj_1_w_ = materialize_f32(reader, "text_proj.1.weight");
+    text_proj_1_b_ = materialize_f32(reader, "text_proj.1.bias");
 
     // codec_embedding = token_embd.weight [codec_vocab, 1024]
     if (!codec_embd_) {
         size_t ce_nf = 0;
-        if (float* ce = load_gguf_tensor_f32(path, "token_embd.weight", &ce_nf)) {
+        if (float* ce = materialize_f32(reader, "token_embd.weight", &ce_nf)) {
             codec_embd_     = ce;
             codec_embd_dim_ = 1024;
             codec_vocab_    = static_cast<int32_t>(ce_nf / 1024);
@@ -501,7 +487,7 @@ bool Runner::load_talker_extras(const std::string& gguf_path,
 
     // codec_head = output.weight [codec_vocab, 1024]
     if (!codec_head_) {
-        codec_head_ = load_gguf_tensor_f32(path, "output.weight");
+        codec_head_ = materialize_f32(reader, "output.weight");
     }
 
     has_text_embd_ = (text_embd_ != nullptr && text_proj_0_w_ != nullptr);
@@ -510,10 +496,18 @@ bool Runner::load_talker_extras(const std::string& gguf_path,
 
 bool Runner::load_predictor_extras(const std::string& gguf_path,
                                     int n_fine_books, std::string* error) {
-    (void)error;
-    const char* path = gguf_path.c_str();
     n_fine_books_ = n_fine_books;
     n_codebooks_  = n_fine_books + 1;   // coarse + fine
+
+    // Open the GGUF once via WeightLoader. The predictor extras for a
+    // 31-codebook MTP model are ~65 tensors — the former code re-opened
+    // the GGUF for every single one.
+    GgufReader reader;
+    std::string load_err;
+    if (!reader.load(gguf_path, &load_err)) {
+        if (error) *error = "predictor extras: " + load_err;
+        return false;
+    }
 
     // Detect MTP tensors — if none, this is a Lunavox-style predictor that
     // only uses the libllama-loaded weights via forward_tokens.
@@ -521,8 +515,7 @@ bool Runner::load_predictor_extras(const std::string& gguf_path,
     for (int i = 0; i < n_fine_books_; i++) {
         char name[256];
         std::snprintf(name, sizeof(name), "codec_embd.%d.weight", i);
-        float* t = load_gguf_tensor_f32(path, name);
-        if (t) { found++; delete[] t; }
+        if (reader.find(name)) ++found;
     }
     if (found == 0) return true;   // Lunavox-style GGUF; no MTP
 
@@ -530,38 +523,26 @@ bool Runner::load_predictor_extras(const std::string& gguf_path,
     fine_embd_ = new float*[static_cast<size_t>(n_fine_books_)]();
     fine_head_ = new float*[static_cast<size_t>(n_fine_books_)]();
 
+    // Infer fine_vocab_ from codec_embd.0.weight's element count. Tensor
+    // shape is [fine_vocab, 1024] so nelements / 1024 == fine_vocab.
+    if (const TensorStorage* t0 = reader.find("codec_embd.0.weight")) {
+        fine_vocab_ = static_cast<int32_t>(t0->nelements() / 1024);
+    }
+
     for (int i = 0; i < n_fine_books_; i++) {
         char name[256];
 
         // codec_embd.{i}.weight [fine_vocab, 1024]
         std::snprintf(name, sizeof(name), "codec_embd.%d.weight", i);
-        fine_embd_[i] = load_gguf_tensor_f32(path, name);
+        fine_embd_[i] = materialize_f32(reader, name);
 
         // lm_head.{i}.weight [1024, fine_vocab]
         std::snprintf(name, sizeof(name), "lm_head.%d.weight", i);
-        fine_head_[i] = load_gguf_tensor_f32(path, name);
+        fine_head_[i] = materialize_f32(reader, name);
     }
 
-    // Infer fine_vocab_ from the on-disk tensor size.
-    {
-        gguf_init_params params = {true, nullptr};
-        gguf_context* ctx = gguf_init_from_file(path, params);
-        if (ctx) {
-            const int64_t n = gguf_get_n_tensors(ctx);
-            for (int64_t i = 0; i < n; i++) {
-                const char* tn = gguf_get_tensor_name(ctx, i);
-                if (tn && std::strcmp(tn, "codec_embd.0.weight") == 0) {
-                    const size_t sz = gguf_get_tensor_size(ctx, i);
-                    fine_vocab_ = static_cast<int32_t>(sz / (sizeof(float) * 1024));
-                    break;
-                }
-            }
-            gguf_free(ctx);
-        }
-    }
-
-    small_to_mtp_w_ = load_gguf_tensor_f32(path, "small_to_mtp.weight");
-    small_to_mtp_b_ = load_gguf_tensor_f32(path, "small_to_mtp.bias");
+    small_to_mtp_w_ = materialize_f32(reader, "small_to_mtp.weight");
+    small_to_mtp_b_ = materialize_f32(reader, "small_to_mtp.bias");
 
     // Pre-allocate workspace for predict_one_step.
     scratch_embd_.resize(static_cast<size_t>(8192) *
