@@ -151,15 +151,15 @@ families.
 
 | Capability | Status | Notes |
 |---|---|---|
-| OpenAI-compatible HTTP API | ✅ `/v1/audio/speech`, `/v1/audio/music`, `/v1/models`, `/health` |
-| Chunked / streaming HTTP for TTS | ❌ No `text/event-stream` or chunked transfer endpoint |
+| OpenAI-compatible HTTP API | ✅ `/v1/audio/speech`, `/v1/audio/speech/stream`, `/v1/audio/music`, `/v1/models`, `/health` |
+| Chunked / streaming HTTP for TTS | 🟡 Stage 12: `/v1/audio/speech/stream` emits the WAV in ~64 KiB chunks. Transport-level only — the family still renders the full PCM before streaming starts. True incremental streaming (frames as the AR loop produces them) needs per-family hooks (GAPS.md §1.2 / §2.2). |
+| Models manifest (`models/manifest.json`) | ✅ Stage 9: central record with HF repo/revision/modes for every family/variant |
+| Fetch tool (`scripts/fetch_models.sh`) | ✅ Stage 9: pure bash + curl downloader; reads the manifest, optional sha256 verify, invokes converters |
 | Unified `TtsRequest` (Stage 6) | ✅ Single struct, single server branch |
 | Unified `qwen3::Runner` (Stage 2) | ✅ One backbone path for 4 transformers |
 | Unified `audiocore::sampler` (Stage 5) | ✅ One sampler for all families + MTP |
 | `WeightLoader` everywhere (Stage 4) | ✅ No `gguf_*` calls outside `src/framework/io/` |
-| Models manifest (`models/manifest.json`) | ❌ No central record of download locations |
-| Fetch tool (`tools/fetch_models.*`) | ❌ No downloader; users mount weights manually |
-| `--list-supported` self-describe flag | ❌ No way to ask the binary what it can do |
+| `--list-supported` self-describe flag | ✅ Stage 9: `audiocore_cli --list-supported` reads the manifest and prints the matrix; `--list-families` prints the registered set |
 | WAV output | ✅ 16-bit PCM mono (TTS) and stereo (music) at family-native rates |
 | MP3 output | ❌ No encoder linked |
 
@@ -172,30 +172,27 @@ single session but are listed so the work is plan-able.
 
 ### Smallest (config / parsing / IaC — no model changes)
 
-1. **`models/manifest.json`** — machine-readable record of every
-   family/variant with HF repo, revision, file list, sha256, license.
-2. **`tools/fetch_models.cpp`** — reads manifest, downloads with sha256
-   verification. C++ to stay Python-free.
-3. **`audiocore_cli --list-supported`** — prints the matrix above from
-   the manifest so the binary self-describes.
-4. **Qwen3-TTS variant detection** — parse `config.json` next to the
-   talker GGUF; set per-variant defaults (e.g. CustomVoice populates
-   `speaker_name` from the 9-name list).
-5. **Qwen3-TTS `speaker_name` → token routing** — the `spk_map` already
-   exists in `session.cpp`; just wire `req.speaker_name` through it.
-6. **MOSS `mode="dialogue"`** — accept multi-message input (already have
-   `apply_chat_template` for a message list); different system prompt.
-7. **MOSS `mode="voice_design"`** — accept a description in `instruct`;
-   different system prompt. Not the true VoiceGenerator model but uses
-   the flagship backbone for the same task.
-8. **Qwen3-TTS `mode="voice_design"`** — same idea: route via `instruct`
-   + VoiceDesign system prompt. True VoiceDesign needs the separate
-   variant weights (🚧).
-9. **ACE-Step `mode` field** — add `mode` to `MusicRequest`; reject
-   non-text-to-music modes with a clear error pointing at GAPS.md.
-10. **HTTP streaming endpoint scaffold** — `POST /v1/audio/speech/stream`
-    that emits chunked WAV frames as codec tokens are produced. Even
-    with the codec stubbed the streaming plumbing can be proven out.
+1. ✅ Stage 9 — **`models/manifest.json`** — machine-readable record of every
+   family/variant with HF repo, revision, file list, license, supported modes.
+2. ✅ Stage 9 — **`scripts/fetch_models.sh`** — pure bash + curl downloader,
+   reads the manifest, optional sha256 verify, invokes converters.
+3. ✅ Stage 9 — **`audiocore_cli --list-supported`** — prints the mode matrix;
+   `--list-families` prints the registered set.
+4. ✅ Stage 10 — **Qwen3-TTS variant detection** — `extras["variant"]` or
+   directory-name substring match.
+5. ✅ Stage 10 — **Qwen3-TTS `speaker_name` → token routing** — the 9 default
+   speakers resolve to codec tokens, injected as a dedicated codec-prefix slot.
+6. ✅ Stage 11 — **MOSS `mode="dialogue"`** — TTSD-style system prompt + dialogue
+   sampling defaults. Multi-message input still pending.
+7. ✅ Stage 11 — **MOSS `mode="voice_design"`** — voice description in `instruct`
+   routes through the flagship backbone with a voice-design system prompt.
+8. ✅ Stage 10 — **Qwen3-TTS `mode="voice_design"`** — same idea, on the
+   Qwen3-TTS backbone. True VoiceDesign needs the separate variant weights (🚧).
+9. ⏳ Stage 13 — **ACE-Step `mode` field** — add `mode` to `MusicRequest`;
+   reject non-text-to-music modes with a clear error pointing at GAPS.md.
+10. ✅ Stage 12 — **HTTP streaming endpoint scaffold** — `POST /v1/audio/speech/stream`
+    emits the WAV in ~64 KiB chunks. Transport-level only; per-family
+    incremental streaming is still open.
 
 ### Medium (real feature work — graph changes, no new weights)
 
