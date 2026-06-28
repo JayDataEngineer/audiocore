@@ -68,8 +68,16 @@ add_library(audiocore_framework STATIC
     # Per-family code:
     src/models/moss_tts/loader.cpp
     src/models/moss_tts/session.cpp
+    src/models/moss_tts/projection.cpp
+    src/models/moss_tts/delay_state.cpp
+    src/models/moss_tts/sampler.cpp
+    src/models/moss_tts/codec.cpp
     src/models/ace_step/loader.cpp
     src/models/ace_step/session.cpp
+    # HTTP server factory (routes + WAV encoders). Linked into the
+    # audiocore_server binary AND into the e2e HTTP test, so both share the
+    # same routing code path.
+    src/server/server.cpp
 )
 target_include_directories(audiocore_framework
     PUBLIC
@@ -80,6 +88,19 @@ target_include_directories(audiocore_framework
         third_party/httplib
         third_party/nlohmann)
 target_link_libraries(audiocore_framework PUBLIC llama)
+
+# ── ONNX Runtime (audio codec decode) ──────────────────────────────────────
+find_path(ONNX_RUNTIME_INCLUDE_DIR onnxruntime_c_api.h
+    PATHS /usr/include/onnxruntime /usr/local/include/onnxruntime)
+find_library(ONNX_RUNTIME_LIB onnxruntime
+    PATHS /usr/lib/x86_64-linux-gnu /usr/local/lib)
+if(ONNX_RUNTIME_INCLUDE_DIR AND ONNX_RUNTIME_LIB)
+    target_include_directories(audiocore_framework PUBLIC ${ONNX_RUNTIME_INCLUDE_DIR})
+    target_link_libraries(audiocore_framework PUBLIC ${ONNX_RUNTIME_LIB})
+    message(STATUS "ONNX Runtime found: ${ONNX_RUNTIME_LIB}")
+else()
+    message(WARNING "ONNX Runtime NOT found — codec.cpp will compile without ONNX decode support")
+endif()
 
 # ── Binaries ─────────────────────────────────────────────────────────────
 if(ENGINE_BUILD_CLI)
@@ -92,6 +113,12 @@ if(ENGINE_BUILD_SERVER)
     # cpp-httplib needs Threads on linux.
     target_link_libraries(audiocore_server PRIVATE audiocore_framework pthread)
 endif()
+
+# ACE-Step HF → llama.cpp tensor-name converter. Builds unconditionally so the
+# release pipeline can run it without flipping CMake flags. See
+# tools/convert_acestep.cpp for why we need this.
+add_executable(convert_acestep tools/convert_acestep.cpp)
+target_link_libraries(convert_acestep PRIVATE audiocore_framework)
 
 if(ENGINE_BUILD_TESTS)
     enable_testing()

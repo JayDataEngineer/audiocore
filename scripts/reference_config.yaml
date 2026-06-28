@@ -1,0 +1,25 @@
+# Reference pipeline config — absolute paths
+backbone_gguf: /home/user/Documents/programs/audiocore/weights/MOSS-TTS-GGUF/MOSS_TTS_Q4_K_M.gguf
+embedding_dir: /home/user/Documents/programs/audiocore/weights/MOSS-TTS-GGUF/embeddings
+lm_head_dir: /home/user/Documents/programs/audiocore/weights/MOSS-TTS-GGUF/lm_heads
+tokenizer_dir: /home/user/Documents/programs/audiocore/weights/MOSS-TTS-GGUF/tokenizer
+
+audio_backend: onnx
+audio_encoder_onnx: /home/user/Documents/programs/audiocore/weights/MOSS-Audio-Tokenizer-ONNX/encoder.onnx
+audio_decoder_onnx: /home/user/Documents/programs/audiocore/weights/MOSS-Audio-Tokenizer-ONNX/decoder.onnx
+
+heads_backend: numpy
+n_ctx: 4096
+n_batch: 512
+n_threads: 8
+n_gpu_layers: -1
+max_new_tokens: 3072
+use_gpu_audio: false
+
+text_temperature: 1.5
+text_top_p: 1.0
+text_top_k: 50
+audio_temperature: 1.7
+audio_top_p: 0.8
+audio_top_k: 25
+audio_repetition_penalty: 1.0

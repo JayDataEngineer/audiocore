@@ -14,3 +14,19 @@ compile_commands.json
 *.safetensors
 *.onnx
 .DS_Store
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Model weights directory (downloaded, not source)
+weights/
+
+# Secrets
+config/secrets.env
+
+# Swap files
+*.swp
+*.swo
+*~

@@ -1,15 +1,15 @@
 // loader.cpp — MOSS-TTS weight loading + family registration.
 //
-// One GGUF file in → backbone (Qwen3-8B, delegated to libllama via
-// qwen3::Runner) + extension tensors (moss.*, bound into our own
-// ggml_context). The community MOSS GGUF ("moss-tts-q8_0.gguf") ships both
-// in one file with all moss.* keys in the KV+tensor sections, so a single
-// GgufReader pass is enough.
+// Two loading paths:
+//   Path A (GGUF-embedded):  moss.* tensors live inside the same GGUF as the
+//                             Qwen3 backbone. The full_community.gguf from
+//                             pwilkin/openmoss works this way.
+//   Path B (npy-separate):    The GGUF has only the backbone; audio embeddings
+//                             and heads come from .npy files in embeddings/ and
+//                             lm_heads/ subdirectories. This is what the
+//                             OpenMOSS-Team/MOSS-TTS-GGUF repo ships.
 //
-// DRY note: there is exactly ONE place in audiocore that loads Qwen3
-// tensors (qwen3::Runner::load, which calls libllama). This file does not
-// touch token_embd / blk.* / output.* at all — libllama owns them. We only
-// bind the moss.* extensions that libllama doesn't know about.
+// In both paths the Qwen3 backbone is always loaded via llama.cpp (qwen3::Runner).
 
 #include "audiocore/models/moss_tts/family.h"
 
@@ -19,21 +19,303 @@
 #include "audiocore/framework/io/weight_loader.h"
 #include "audiocore/framework/runtime/registry.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace audiocore::moss {
 
+// ===========================================================================
+// .npy header parser (minimal — float16 only)
+// ===========================================================================
+// Parses enough of the NPY format to get shape + data-offset.
+// Returns data_offset (after header), or 0 on error.
+static int64_t parse_npy_header(const std::string& path,
+                                 int64_t& n_rows, int64_t& n_cols,
+                                 std::string* error) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        if (error) *error = "cannot open " + path;
+        return 0;
+    }
+    const int64_t file_size = static_cast<int64_t>(f.tellg());
+    f.seekg(0);
+
+    // Read magic + version
+    char magic[8];
+    f.read(magic, 8);
+    if (std::memcmp(magic, "\x93NUMPY", 6) != 0) {
+        if (error) *error = path + ": not a .npy file";
+        return 0;
+    }
+    const int ver_major = magic[6];
+    const int ver_minor = magic[7];
+
+    // Read header length
+    int64_t header_len = 0;
+    if (ver_major == 1) {
+        uint16_t hlen = 0;
+        f.read(reinterpret_cast<char*>(&hlen), 2);
+        header_len = hlen;
+    } else if (ver_major == 2 || ver_major == 3) {
+        uint32_t hlen = 0;
+        f.read(reinterpret_cast<char*>(&hlen), 4);
+        header_len = hlen;
+    } else {
+        if (error) *error = path + ": unsupported NPY version " +
+                             std::to_string(ver_major) + "." +
+                             std::to_string(ver_minor);
+        return 0;
+    }
+
+    // Read header dict as string
+    std::string header(static_cast<size_t>(header_len), '\0');
+    f.read(header.data(), header_len);
+    if (!f) {
+        if (error) *error = path + ": truncated header";
+        return 0;
+    }
+
+    const int64_t data_offset = static_cast<int64_t>(f.tellg());
+
+    // Minimal shape parser: find "shape": (...)
+    auto shape_pos = header.find("shape");
+    if (shape_pos == std::string::npos) {
+        if (error) *error = path + ": no shape in npy header";
+        return 0;
+    }
+    auto paren_open = header.find('(', shape_pos);
+    auto paren_close = header.find(')', paren_open);
+    if (paren_open == std::string::npos || paren_close == std::string::npos) {
+        if (error) *error = path + ": malformed shape in npy header";
+        return 0;
+    }
+
+    std::string shape_str = header.substr(paren_open + 1,
+                                           paren_close - paren_open - 1);
+    // strip spaces
+    shape_str.erase(std::remove_if(shape_str.begin(), shape_str.end(),
+                                    [](char c) { return std::isspace(c); }),
+                    shape_str.end());
+
+    std::vector<int64_t> dims;
+    size_t start = 0;
+    while (start < shape_str.size()) {
+        auto comma = shape_str.find(',', start);
+        std::string tok;
+        if (comma == std::string::npos) {
+            tok = shape_str.substr(start);
+            start = shape_str.size();
+        } else {
+            tok = shape_str.substr(start, comma - start);
+            start = comma + 1;
+        }
+        if (tok.empty() && dims.size() >= 1) break;  // trailing comma
+        if (!tok.empty()) {
+            dims.push_back(std::stoll(tok));
+        }
+    }
+
+    if (dims.empty()) {
+        if (error) *error = path + ": empty shape in npy header";
+        return 0;
+    }
+
+    // Verify the dtype is float16 (<f2 or |f2)
+    auto descr_key = header.find("descr");
+    bool is_f16 = false;
+    if (descr_key != std::string::npos) {
+        // Find the colon after "descr", then the first quote after the colon.
+        auto colon = header.find(':', descr_key);
+        auto q1 = header.find('\'', colon);
+        auto q2 = header.find('\'', q1 + 1);
+        if (q1 != std::string::npos && q2 != std::string::npos) {
+            std::string descr = header.substr(q1 + 1, q2 - q1 - 1);
+            is_f16 = (descr == "<f2" || descr == "|f2");
+        }
+    }
+    if (!is_f16) {
+        if (error) *error = path + ": expected float16 npy, got non-f16 descr";
+        return 0;
+    }
+
+    if (dims.size() == 1) {
+        n_rows = dims[0];
+        n_cols = 1;
+    } else if (dims.size() == 2) {
+        n_rows = dims[0];
+        n_cols = dims[1];
+    } else {
+        if (error) *error = path + ": unexpected ndim=" + std::to_string(dims.size());
+        return 0;
+    }
+
+    // Verify the data fits.
+    const int64_t expected_bytes = n_rows * n_cols * 2;  // float16 = 2 bytes
+    if (data_offset + expected_bytes > file_size) {
+        if (error) *error = path + ": file truncated (expected " +
+                             std::to_string(expected_bytes) + " data bytes)";
+        return 0;
+    }
+    return data_offset;
+}
+
+// Load a .npy file into a ggml float16 tensor. Returns the tensor and keeps
+// the raw data alive in `buf` (owned by the caller).
+static ggml_tensor* load_npy_tensor(const std::string& path,
+                                     ggml_context* ctx,
+                                     std::vector<uint8_t>* buf,
+                                     int32_t n_rows, int32_t n_cols,
+                                     int64_t data_offset,
+                                     std::string* error) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        if (error) *error = "cannot open " + path + " for reading";
+        return nullptr;
+    }
+
+    // Read the raw float16 data
+    const size_t n_bytes = static_cast<size_t>(n_rows * n_cols) * 2;
+    buf->resize(n_bytes);
+    f.seekg(data_offset);
+    f.read(reinterpret_cast<char*>(buf->data()),
+           static_cast<std::streamsize>(n_bytes));
+    if (!f) {
+        if (error) *error = path + ": short read (" +
+                             std::to_string(f.gcount()) + " vs " +
+                             std::to_string(n_bytes) + ")";
+        buf->clear();
+        return nullptr;
+    }
+
+    // Create ggml tensor view. ne[0] = cols (innermost), ne[1] = rows.
+    int64_t ne[2] = {n_cols, n_rows};
+    ggml_tensor* t = ggml_new_tensor(ctx, GGML_TYPE_F16, 2, ne);
+    if (!t) {
+        if (error) *error = path + ": ggml_new_tensor failed";
+        buf->clear();
+        return nullptr;
+    }
+    t->data = buf->data();
+    ggml_set_name(t, path.c_str());
+    return t;
+}
+
+// ===========================================================================
+// Path B: load from .npy files
+// ===========================================================================
+bool MossSession::load_npy_extras(const std::string& emb_dir,
+                                   const std::string& lm_dir,
+                                   std::string* error) {
+    const int32_t n_vq = cfg_.n_vq;
+    const int32_t hs = static_cast<int32_t>(backbone_->hidden_size());
+
+    // We'll create ggml tensors in the ext_ctx_. Estimate overhead.
+    // 1 embed_tokens + 32 emb_ext + 32 lm_head = 65 tensors.
+    const size_t n_tensors = 1 + static_cast<size_t>(n_vq) * 2;
+    const size_t overhead = ggml_tensor_overhead() * (n_tensors + 8);
+    if (!ext_ctx_) {
+        struct ggml_init_params gip = {
+            /*.mem_size   =*/ overhead,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,   // data lives in npy_buffers_
+        };
+        ext_ctx_ = ggml_init(gip);
+        if (!ext_ctx_) {
+            if (error) *error = "ggml_init failed for npy tensor context";
+            return false;
+        }
+        owns_ext_ctx_ = true;
+    }
+
+    // (1) embed_tokens.npy
+    std::string et_path = emb_dir + "/embed_tokens.npy";
+    int64_t et_rows = 0, et_cols = 0;
+    int64_t et_off = parse_npy_header(et_path, et_rows, et_cols, error);
+    if (!et_off) return false;
+    if (et_cols != hs) {
+        if (error) *error = "embed_tokens.npy: cols=" + std::to_string(et_cols) +
+                             " but hidden_size=" + std::to_string(hs);
+        return false;
+    }
+    npy_buffers_.emplace_back();
+    token_embd_ = load_npy_tensor(et_path, ext_ctx_, &npy_buffers_.back(),
+                                   static_cast<int32_t>(et_rows),
+                                   static_cast<int32_t>(et_cols),
+                                   et_off, error);
+    if (!token_embd_) return false;
+    ggml_set_name(token_embd_, "token_embd.weight");
+
+    // (2) emb_ext_*.npy (audio embedding tables)
+    for (int i = 0; i < n_vq; ++i) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "%s/emb_ext_%02d.npy",
+                      emb_dir.c_str(), i);
+        std::string epath(buf);
+        int64_t erows = 0, ecols = 0;
+        int64_t eoff = parse_npy_header(epath, erows, ecols, error);
+        if (!eoff) return false;
+        if (ecols != hs) {
+            if (error) *error = epath + ": cols=" + std::to_string(ecols) +
+                                 " but hidden_size=" + std::to_string(hs);
+            return false;
+        }
+        npy_buffers_.emplace_back();
+        auto* t = load_npy_tensor(epath, ext_ctx_, &npy_buffers_.back(),
+                                   static_cast<int32_t>(erows),
+                                   static_cast<int32_t>(ecols),
+                                   eoff, error);
+        if (!t) return false;
+        audio_embed_[i] = t;
+    }
+
+    // (3) lm_head_audio_*.npy
+    for (int i = 0; i < n_vq; ++i) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "%s/lm_head_audio_%02d.npy",
+                      lm_dir.c_str(), i);
+        std::string hpath(buf);
+        int64_t hrows = 0, hcols = 0;
+        int64_t hoff = parse_npy_header(hpath, hrows, hcols, error);
+        if (!hoff) return false;
+        if (hcols != hs) {
+            if (error) *error = hpath + ": cols=" + std::to_string(hcols) +
+                                 " but hidden_size=" + std::to_string(hs);
+            return false;
+        }
+        npy_buffers_.emplace_back();
+        auto* t = load_npy_tensor(hpath, ext_ctx_, &npy_buffers_.back(),
+                                   static_cast<int32_t>(hrows),
+                                   static_cast<int32_t>(hcols),
+                                   hoff, error);
+        if (!t) return false;
+        audio_head_[i] = t;
+    }
+
+    return true;
+}
+
+// ===========================================================================
+// Path A: bind moss.* tensors from GGUF
+// ===========================================================================
 bool MossSession::bind_extension_tensors(const GgufReader& r,
                                          std::string* err) {
-    // First pass: count moss.* tensors and compute their total byte footprint.
-    // We allocate one ggml_context that holds ONLY the tensor structs (the
-    // weight bytes themselves stay in the GgufReader's mmap — zero-copy).
+    // First pass: count the tensors we'll bind. We bind everything prefixed
+    // `moss.` (codec, audio heads/embeds) PLUS the Qwen3 `token_embd.weight`
+    // (so we can do raw embedding gathers without a forward pass — libllama
+    // has its own copy internally for inference; ours is read-only).
+    auto wants = [](const std::string& n) {
+        return n.rfind("moss.", 0) == 0 || n == "token_embd.weight";
+    };
     size_t max_n_tensors = 0;
     for (const TensorStorage& t : r.tensors()) {
-        if (t.name.rfind("moss.", 0) == 0) ++max_n_tensors;
+        if (wants(t.name)) ++max_n_tensors;
     }
     if (max_n_tensors == 0) {
         if (err) *err = "no moss.* tensors found in GGUF — wrong file?";
@@ -53,13 +335,9 @@ bool MossSession::bind_extension_tensors(const GgufReader& r,
     owns_ext_ctx_ = true;
 
     // Second pass: create ggml_tensor views into the mmap'd GGUF data.
-    // The view structs live in ext_ctx_; their ->data pointers alias the
-    // mmap'd weight bytes via tensor_data_ptr().
     for (const TensorStorage& t : r.tensors()) {
-        if (t.name.rfind("moss.", 0) != 0) continue;
+        if (!wants(t.name)) continue;
 
-        // ggml ne[] is row-major (ne[0] innermost); TensorStorage ne[] is
-        // already in that order. ggml_new_tensor copies ne[0..n_dims-1].
         ggml_tensor* gt = ggml_new_tensor(ext_ctx_, t.type, t.n_dims, t.ne);
         if (!gt) {
             if (err) *err = "ggml_new_tensor failed for " + t.name;
@@ -67,23 +345,14 @@ bool MossSession::bind_extension_tensors(const GgufReader& r,
         }
         ggml_set_name(gt, t.name.c_str());
 
-        // Point the tensor's data pointer into the GgufReader mmap. Stays
-        // valid because loader_ (owned by Session base) keeps the
-        // GgufReader — and its mmap — alive for the lifetime of MossSession.
         const void* data_ptr = r.tensor_data_ptr(t);
         if (!data_ptr) {
-            if (err) *err = "tensor_data_ptr(" + t.name + ") returned null "
-                            "(GgufReader has no mmap — Path 2 unsupported)";
+            if (err) *err = "tensor_data_ptr(" + t.name + ") returned null";
             return false;
         }
         gt->data = const_cast<void*>(data_ptr);
 
-        // Bind well-known tensors to slots on MossSession for fast access.
-        // The codec tensors stay addressable by name via ggml_get_tensor()
-        // for codec.cpp — we don't anchor every one here.
-        //
-        // Parse "{prefix}{digits}.weight" exactly — won't match ".bias" or
-        // any other suffix, won't fall through to atoi on non-digits.
+        // Bind well-known tensors to slots for fast access.
         constexpr static const char kEmbedPrefix[]  = "moss.audio_embed.";
         constexpr static const char kHeadPrefix[]   = "moss.audio_head.";
         constexpr static const char kWeightSuffix[] = ".weight";
@@ -112,7 +381,9 @@ bool MossSession::bind_extension_tensors(const GgufReader& r,
             audio_head_[idx] = gt;
         } else if (t.name == "moss.codec.dec.0.weight" ||
                    t.name == "moss.codec.decoder.0.weight") {
-            codec_dec_root_ = gt;   // anchor; full codec wiring in codec.cpp
+            codec_dec_root_ = gt;
+        } else if (t.name == "token_embd.weight") {
+            token_embd_ = gt;
         }
     }
 
@@ -130,12 +401,14 @@ bool MossSession::bind_extension_tensors(const GgufReader& r,
     return true;
 }
 
+// ===========================================================================
+// Main load()
+// ===========================================================================
 bool MossSession::load(const std::string& model_path,
                        const LoadOptions& opts,
                        const BackendConfig& backend_cfg,
                        std::string* error) {
-    // (1) Open the GGUF via the format-neutral factory. Dispatches by file
-    //     magic; returns a GgufReader for .gguf paths.
+    // (1) Open the GGUF via the format-neutral factory.
     loader_ = make_weight_loader(model_path, error);
     if (!loader_) return false;
     auto* gguf = dynamic_cast<GgufReader*>(loader_.get());
@@ -144,17 +417,15 @@ bool MossSession::load(const std::string& model_path,
         return false;
     }
 
-    // (2) Parse MOSS KV metadata. Required keys first; missing → fail loudly.
-    if (!gguf->get_kv_i32("moss.n_vq",             &cfg_.n_vq)             ||
-        !gguf->get_kv_i32("moss.audio_vocab_size", &cfg_.audio_vocab_size) ||
-        !gguf->get_kv_i32("moss.sampling_rate",    &cfg_.sampling_rate)) {
-        if (error) *error = "missing required moss.* KV metadata";
-        return false;
-    }
-    // Optional keys — defaults baked into MossConfig struct.
+    // (2) Parse MOSS KV metadata. All optional — defaults baked into MossConfig
+    //     headers (see family.h). Community GGUFs omit these; only the upstream
+    //     full_community.gguf from pwilkin/openmoss carries them.
     int32_t tmp = 0;
-    if (gguf->get_kv_i32("moss.audio_pad_code",  &tmp)) cfg_.audio_pad_code  = tmp;
-    if (gguf->get_kv_i32("moss.downsample_rate", &tmp)) cfg_.downsample_rate = tmp;
+    if (gguf->get_kv_i32("moss.n_vq",             &tmp)) cfg_.n_vq             = tmp;
+    if (gguf->get_kv_i32("moss.audio_vocab_size", &tmp)) cfg_.audio_vocab_size = tmp;
+    if (gguf->get_kv_i32("moss.sampling_rate",    &tmp)) cfg_.sampling_rate    = tmp;
+    if (gguf->get_kv_i32("moss.audio_pad_code",   &tmp)) cfg_.audio_pad_code   = tmp;
+    if (gguf->get_kv_i32("moss.downsample_rate",  &tmp)) cfg_.downsample_rate  = tmp;
     if (gguf->get_kv_i32("moss.token.audio_start",      &tmp)) cfg_.tok_audio_start = tmp;
     if (gguf->get_kv_i32("moss.token.audio_end",        &tmp)) cfg_.tok_audio_end   = tmp;
     if (gguf->get_kv_i32("moss.token.user_slot",        &tmp)) cfg_.tok_user_slot   = tmp;
@@ -164,13 +435,9 @@ bool MossSession::load(const std::string& model_path,
     if (gguf->get_kv_i32("moss.token.im_end",           &tmp)) cfg_.tok_im_end      = tmp;
     if (gguf->get_kv_i32("moss.token.pad",              &tmp)) cfg_.tok_pad         = tmp;
     if (gguf->get_kv_i32("moss.codec.present",          &tmp)) cfg_.codec_present   = (tmp != 0);
+    if (gguf->get_kv_i32("moss.n_quantized_embd",       &tmp)) cfg_.n_quantized_embd = tmp;
 
-    // (3) Bind moss.* extension tensors into our ggml_context.
-    if (!bind_extension_tensors(*gguf, error)) return false;
-
-    // (4) Spin up the Qwen3 backbone via the unified runner. libllama reads
-    //     its own tensors (token_embd.*, blk.*, output.*) from the same file
-    //     — we just hand it the path. There is no other Qwen3 path in audiocore.
+    // (3) Spin up the Qwen3 backbone via the unified runner.
     qwen3::RunnerConfig rc;
     rc.n_ctx        = 8192;
     rc.n_threads    = backend_cfg.n_threads;
@@ -179,16 +446,40 @@ bool MossSession::load(const std::string& model_path,
     backbone_ = qwen3::Runner::load(model_path, rc, error);
     if (!backbone_) return false;
 
+    // (4) Load extension tensors (audio embeds + heads + token_embd).
+    //     Try Path A (GGUF-embedded moss.*) first; if none found, try Path B
+    //     (npy files from embeddings_dir / lm_heads_dir in extras).
+    bool has_moss_tensors = false;
+    for (const auto& t : gguf->tensors()) {
+        if (t.name.rfind("moss.", 0) == 0) { has_moss_tensors = true; break; }
+    }
+
+    if (has_moss_tensors) {
+        if (!bind_extension_tensors(*gguf, error)) return false;
+    } else {
+        auto it_emb = opts.extras.find("embeddings_dir");
+        auto it_lm  = opts.extras.find("lm_heads_dir");
+        if (it_emb == opts.extras.end() || it_lm == opts.extras.end()) {
+            if (error) *error = "GGUF has no moss.* tensors — pass embeddings_dir"
+                                " and lm_heads_dir in LoadOptions::extras";
+            return false;
+        }
+        if (!load_npy_extras(it_emb->second, it_lm->second, error))
+            return false;
+    }
+
+    // (5) Capture ONNX decoder path from extras.
+    auto it_extras = opts.extras.find("decoder_onnx");
+    if (it_extras != opts.extras.end())
+        decoder_onnx_path_ = it_extras->second;
+
     loaded_ = true;
-    (void)opts;   // voice_path / language used at run_tts time
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Factory registered with FamilyRegistry at static-init time. The server's
-// FamilyRegistry::create("moss_tts") call returns a fresh MossSession.
-// ---------------------------------------------------------------------------
-
+// ===========================================================================
+// Factory
+// ===========================================================================
 namespace {
 std::unique_ptr<Session> make_moss_session() {
     return std::unique_ptr<Session>(new MossSession());
@@ -197,11 +488,6 @@ std::unique_ptr<Session> make_moss_session() {
 
 AUDIOCORE_REGISTER_FAMILY(moss_tts, make_moss_session)
 
-// Explicit registration anchor called from main(). Defeats the linker
-// stripping this TU out of static archives — without it, the registrar above
-// gets dropped and FamilyRegistry::list() comes back empty at runtime.
-// (Static initializers in archive members are only retained if at least one
-// symbol from the same TU is reachable from a live link unit.)
 extern "C" void audiocore_register_moss_tts() {
     static bool done = false;
     if (!done) {

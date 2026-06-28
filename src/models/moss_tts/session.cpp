@@ -1,21 +1,28 @@
-// session.cpp — MOSS-TTS run_tts flow.
+// session.cpp — MOSS-TTS full embedding-based generation pipeline.
 //
-// Pipeline (see src/models/moss_tts/README.md for the spec):
-//   1. Tokenize text → Qwen3 text token IDs (chat-templated).
-//   2. Forward through Qwen3-8B backbone via the unified qwen3::Runner.
-//   3. Project hidden states → n_vq logit streams via audio_head.{i}.weight.
-//   4. Sample one codec token per stream, autoregressively.
-//   5. Decode codec tokens → PCM via moss.codec.dec.* graphs.
-//   6. Write PCM into the response.
+// Pipeline:
+//   1. Tokenize text via Qwen3 chat template + append <|audio_start|>
+//   2. Build summed text+audio embeddings for the prompt
+//   3. Prefill: forward embeddings through Qwen3 backbone
+//   4. Autoregressive loop:
+//      a. Get last hidden state from backbone
+//      b. Project through audio_head.{i}.weight -> per-stream codec logits
+//      c. Get text logits from backbone output
+//      d. delay_step -> sample next (1+N_VQ) token vector
+//      e. Embed the token vector (text_embed + sum audio_embed[i])
+//      f. Forward single embedding through backbone (incremental KV)
+//   5. Apply de-delay pattern to audio channels
+//   6. Decode codec tokens -> PCM via ONNX Runtime
+//   7. Write PCM into response
 //
 // Everything transformer-shaped goes through qwen3::Runner (libllama). This
 // file is everything that ISN'T the transformer: the audio-head projection,
-// the sampler, and the codec decode.
-//
-// TODO markers name the upstream file each stub needs to be ported from.
-// Reference: https://github.com/pwilkin/openmoss
+// the sampler, the delay state machine, and the codec decode.
 
 #include "audiocore/models/moss_tts/family.h"
+#include "audiocore/models/moss_tts/projection.h"
+#include "audiocore/models/moss_tts/delay_state.h"
+#include "audiocore/models/moss_tts/codec.h"
 
 #include <algorithm>
 #include <cmath>
@@ -29,181 +36,80 @@ namespace audiocore::moss {
 
 namespace {
 
-// Tiny deterministic argmax sampler — used as the default. The real MOSS
-// sampler (top-p / temperature / top-k) lives in openmoss/src/sampler.cpp;
-// we port it when we wire the temperature/top_p fields in TtsRequest.
-int32_t argmax(const float* logits, int32_t n) {
-    int32_t best = 0;
-    float   bestv = logits[0];
-    for (int32_t i = 1; i < n; ++i) {
-        if (logits[i] > bestv) { bestv = logits[i]; best = i; }
-    }
-    return best;
+// Loudness normalization: target -20 dBFS with +/- 3 dB gain range.
+// Matches upstream pipeline.py loudness_normalize().
+void loudness_normalize(std::vector<float>& wav) {
+    if (wav.empty()) return;
+    double sum_sq = 0.0;
+    for (float s : wav) sum_sq += static_cast<double>(s) * s;
+    double rms = std::sqrt(sum_sq / wav.size() + 1e-9);
+    double current_dbfs = 20.0 * std::log10(rms);
+    double gain = std::clamp(-20.0 - current_dbfs, -3.0, 3.0);
+    float factor = static_cast<float>(std::pow(10.0, gain / 20.0));
+    for (float& s : wav) s *= factor;
 }
 
-}  // namespace
+}  // anonymous namespace
 
-bool MossSession::build_input_embeddings(const int32_t* text_tokens,
-                                         int32_t n_text,
-                                         const int32_t* audio_tokens,
-                                         int32_t n_audio,
-                                         std::vector<float>* embd_out,
-                                         std::string* error) {
-    // (n_text + n_audio) rows × hidden_size cols, row-major float32.
+// ---------------------------------------------------------------------------
+// embed_one_step -- sum text_embed + audio_embed[stream] for one token vector
+// ---------------------------------------------------------------------------
+bool MossSession::embed_one_step(const int32_t* tokens,
+                                  std::vector<float>* embd_out,
+                                  std::string* error) {
+    // tokens[0] = text token, tokens[1..N_VQ] = audio codec tokens.
     const int32_t hs = backbone_->hidden_size();
-    embd_out->assign(static_cast<size_t>(n_text + n_audio) * hs, 0.0f);
+    (void)error;
+    embd_out->assign(static_cast<size_t>(hs), 0.0f);
 
-    // Text-token rows: delegate to libllama. The runner exposes the model's
-    // embedding matrix through forward_tokens with a single token; for an
-    // n-token batch we read embeddings_ith per row.
-    if (n_text > 0) {
-        // TODO(port from openmoss/src/model.cpp:embed_text_tokens):
-        //   The cleanest libllama-side path is a single forward_tokens call
-        //   on the text batch, then walk llama_get_embeddings_ith for each
-        //   row. The runner already does this internally; expose a helper.
-        // For now we mirror the runner's forward_tokens path:
-        std::vector<float> embd_buf(static_cast<size_t>(n_text) * hs);
-        // NOTE: forward_tokens returns logits, not embeddings. We need a
-        // sibling forward_text_embeddings() on the runner that exposes
-        // llama_get_embeddings_ith after a token-id forward pass.
-        if (error) *error = "build_input_embeddings: text-token embedding "
-                            "lookup not yet exposed on qwen3::Runner "
-                            "(TODO: add Runner::embed_tokens)";
-        return false;
+    // Text token embedding
+    int32_t text_tok = tokens[0];
+    if (text_tok >= 0 && token_embd_) {
+        float* row = embd_out->data();
+        const size_t row_bytes = static_cast<size_t>(hs) *
+            (token_embd_->type == GGML_TYPE_F32 ? sizeof(float)
+                                                 : sizeof(ggml_fp16_t));
+        if (static_cast<size_t>(text_tok) * row_bytes + row_bytes <= ggml_nbytes(token_embd_)) {
+            const char* src = static_cast<const char*>(token_embd_->data)
+                              + static_cast<size_t>(text_tok) * row_bytes;
+            if (token_embd_->type == GGML_TYPE_F32) {
+                std::memcpy(row, src, row_bytes);
+            } else if (token_embd_->type == GGML_TYPE_F16) {
+                const ggml_fp16_t* s = reinterpret_cast<const ggml_fp16_t*>(src);
+                for (int j = 0; j < hs; ++j)
+                    row[j] = ggml_fp16_to_fp32(s[j]);
+            }
+        }
     }
 
-    // Audio-token rows: sum over streams of (one_hot(token) @ audio_embed[i]).
-    // Each codec time-step has n_vq streams; their embeddings sum into one
-    // hidden_size vector that goes into the Qwen3 context at that position.
-    //
-    // Reference path supports F32 and F16 only — quantized weights (Q8_0 etc.)
-    // need a dequantize step (or the ggml_cgraph production path). Refuse
-    // cleanly so callers see the limitation, not garbage floats.
-    auto dtype_supported = [](ggml_tensor* W) {
-        return W->type == GGML_TYPE_F32 || W->type == GGML_TYPE_F16;
-    };
-    if (n_audio > 0) {
-        for (int32_t pos = 0; pos < n_audio; ++pos) {
-            const int32_t vq_base = pos * cfg_.n_vq;
-            float* row = embd_out->data() + (n_text + pos) * hs;
-            for (int s = 0; s < cfg_.n_vq; ++s) {
-                const int32_t code = audio_tokens[vq_base + s];
-                if (code < 0) continue;   // pad slot
-                ggml_tensor* W = audio_embed_[s];
-                if (!dtype_supported(W)) {
-                    if (error) *error = "audio_embed weights are quantized; "
-                        "reference path supports F32/F16 only "
-                        "(TODO: ggml_cgraph production path with native dequant)";
-                    return false;
-                }
-                // W shape: (hidden_size, audio_vocab_size+1), row-major.
-                // Row `code` is the embedding for codebook value `code`.
-                if (W->ne[0] != hs) {
-                    if (error) *error = "audio_embed dim mismatch";
-                    return false;
-                }
-                const float* wrow_f32 = nullptr;
-                std::vector<float>    f32_buf;   // only used for F16 dequant
-                const size_t row_off = static_cast<size_t>(code) * hs;
-                if (W->type == GGML_TYPE_F32) {
-                    wrow_f32 = static_cast<const float*>(W->data) + row_off;
-                } else {   // F16
-                    f32_buf.resize(hs);
-                    const ggml_fp16_t* wrow_f16 =
-                        static_cast<const ggml_fp16_t*>(W->data) + row_off;
-                    for (int j = 0; j < hs; ++j)
-                        f32_buf[j] = ggml_fp16_to_fp32(wrow_f16[j]);
-                    wrow_f32 = f32_buf.data();
-                }
-                for (int j = 0; j < hs; ++j) row[j] += wrow_f32[j];
-            }
+    // Sum audio embeddings for each stream
+    for (int s = 0; s < cfg_.n_vq; ++s) {
+        int32_t code = tokens[1 + s];
+        if (code < 0) continue;
+        ggml_tensor* W = audio_embed_[s];
+        if (!W) continue;
+        if (W->ne[0] != hs) continue;
+        float* row = embd_out->data();
+        const size_t row_off = static_cast<size_t>(code) * hs;
+        if (row_off + static_cast<size_t>(hs) > ggml_nbytes(W) /
+            (W->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t)))
+            continue;
+        if (W->type == GGML_TYPE_F32) {
+            const float* wrow = static_cast<const float*>(W->data) + row_off;
+            for (int j = 0; j < hs; ++j)
+                row[j] += wrow[j];
+        } else if (W->type == GGML_TYPE_F16) {
+            const ggml_fp16_t* wrow = static_cast<const ggml_fp16_t*>(W->data) + row_off;
+            for (int j = 0; j < hs; ++j)
+                row[j] += ggml_fp16_to_fp32(wrow[j]);
         }
     }
     return true;
 }
 
-bool MossSession::project_to_audio_logits(const float* hidden,
-                                          int32_t n_tokens,
-                                          std::vector<float>* logits_out,
-                                          std::string* error) {
-    // For each token row, multiply by each audio_head.{i}.weight to get
-    // n_vq logit streams. Output: (n_tokens, n_vq, audio_vocab_size+1).
-    const int32_t hs    = backbone_->hidden_size();
-    const int32_t vocab = cfg_.audio_vocab_size + 1;   // +1 for pad
-    logits_out->assign(static_cast<size_t>(n_tokens) * cfg_.n_vq * vocab, 0.0f);
-
-    // Reference C++ path: O(n_tokens × n_vq × hs × vocab). Slow but correct;
-    // the production path builds one ggml_cgraph per stream (TODO below).
-    // Supports F32 and F16 weights only — quantized weights (Q8_0 etc.) need
-    // the production path which dequantizes inside the cgraph.
-    for (int32_t t = 0; t < n_tokens; ++t) {
-        const float* hrow = hidden + static_cast<size_t>(t) * hs;
-        for (int s = 0; s < cfg_.n_vq; ++s) {
-            ggml_tensor* H = audio_head_[s];
-            if (H->ne[0] != hs || H->ne[1] != vocab) {
-                if (error) *error = "audio_head dim mismatch";
-                return false;
-            }
-            if (H->type != GGML_TYPE_F32 && H->type != GGML_TYPE_F16) {
-                if (error) *error = "audio_head weights are quantized; "
-                    "reference path supports F32/F16 only "
-                    "(TODO: ggml_cgraph production path with native dequant)";
-                return false;
-            }
-            float* lrow = logits_out->data() +
-                          (static_cast<size_t>(t) * cfg_.n_vq + s) * vocab;
-            // W is (vocab, hs) row-major; lrow[v] = dot(W[v,*], hrow[*]).
-            if (H->type == GGML_TYPE_F32) {
-                const float* W = static_cast<const float*>(H->data);
-                for (int v = 0; v < vocab; ++v) {
-                    const float* wrow = W + static_cast<size_t>(v) * hs;
-                    float acc = 0.0f;
-                    for (int j = 0; j < hs; ++j) acc += wrow[j] * hrow[j];
-                    lrow[v] = acc;
-                }
-            } else {   // F16
-                const ggml_fp16_t* W =
-                    static_cast<const ggml_fp16_t*>(H->data);
-                for (int v = 0; v < vocab; ++v) {
-                    const ggml_fp16_t* wrow = W + static_cast<size_t>(v) * hs;
-                    float acc = 0.0f;
-                    for (int j = 0; j < hs; ++j)
-                        acc += ggml_fp16_to_fp32(wrow[j]) * hrow[j];
-                    lrow[v] = acc;
-                }
-            }
-        }
-    }
-    // TODO(perf): replace the inner two loops with a single ggml_cgraph that
-    // ggml_cuda backend executes as a batched matmul. Anchor: build the graph
-    // once at load(), reuse per forward. Reference: openmoss/src/model.cpp
-    // builds exactly this graph in build_audio_head_graph().
-    return true;
-}
-
-bool MossSession::decode_codec(const int32_t* codec_tokens,
-                               int32_t n_tokens,
-                               std::vector<float>* pcm_out,
-                               std::string* error) {
-    // The codec converts (n_tokens, n_vq) codebook indices into mono PCM at
-    // cfg_.sampling_rate. Implementation ported from openmoss/src/codec.cpp:
-    //
-    //   1. For each stream s and each time-step t: look up
-    //      moss.codec.quantizer.q.{s}.codebook.weight row codec_tokens[t,s]
-    //      → continuous vector. Sum across streams.
-    //   2. Feed the resulting (1, downsample_rate * n_tokens) signal through
-    //      moss.codec.dec.<layer>.* (Snake-activated conv stack) to upsample
-    //      to sampling_rate Hz.
-    //
-    // That's ~600 lines of ggml graph building. Until the port lands, refuse
-    // with a clear error so callers see a clean signal instead of silence.
-    (void)codec_tokens; (void)n_tokens; (void)pcm_out;
-    if (error) *error = "MOSS codec decode not yet ported "
-                        "(TODO: port openmoss/src/codec.cpp into "
-                        "src/models/moss_tts/codec.cpp)";
-    return false;
-}
-
+// ---------------------------------------------------------------------------
+// run_tts
+// ---------------------------------------------------------------------------
 bool MossSession::run_tts(const void* request, void* response,
                           std::string* error) {
     if (!loaded_) {
@@ -218,43 +124,229 @@ bool MossSession::run_tts(const void* request, void* response,
     }
     res->sampling_rate = cfg_.sampling_rate;
 
-    // (1) Tokenize. TODO: SentencePiece wrapper around the Qwen3 tokenizer
-    //     vocab embedded in the GGUF (libllama exposes llama_token_get_piece
-    //     and the chat template as metadata). For now: fail cleanly.
-    std::vector<int32_t> text_tokens;   // placeholder until tokenizer lands
     if (req->text.empty()) {
         if (error) *error = "empty text";
         return false;
     }
-    // TODO(tokenizer): port openmoss/src/tokenizer.cpp. Until then we can't
-    // turn req->text into Qwen3 IDs, so we can't proceed.
-    if (error) *error = "tokenizer not yet wired "
-                        "(TODO: vendor sentencepiece + Qwen3 chat template)";
-    (void)text_tokens;
-    return false;
 
-    // (2)–(5): see pipeline comment at top of file. These run once (1)/(2)
-    // above land — the orchestration code is mechanical on top of the helpers
-    // already defined (build_input_embeddings, project_to_audio_logits,
-    // decode_codec). Sketch:
-    //
-    //   std::vector<int32_t> codec_tokens;
-    //   for (step = 0; step < max_steps; ++step) {
-    //       build_input_embeddings(text_tokens, n_text,
-    //                              codec_tokens.data(), codec_tokens.size()/n_vq,
-    //                              &embd_buf, error);
-    //       backbone_->forward_embeddings(embd_buf, n_rows, n_pos, &hidden, error);
-    //       project_to_audio_logits(hidden, n_rows, &logits, error);
-    //       for (s = 0; s < n_vq; ++s)
-    //           codec_tokens.push_back(argmax(logits_row(s)));
-    //       if (all streams emitted tok_audio_end) break;
-    //   }
-    //   decode_codec(codec_tokens, codec_tokens.size()/n_vq, &res->pcm_mono, error);
+    const int32_t hs = backbone_->hidden_size();
+    const int32_t text_vocab = backbone_->vocab_size();
+    const int32_t audio_vocab = cfg_.audio_vocab_size + 1;  // +1 for pad code
+
+    // ======================================================================
+    // (1) Tokenize prompt
+    // ======================================================================
+    std::string templated;
+    if (!backbone_->apply_chat_template(
+            {{"system", "You are a helpful voice assistant."},
+             {"user",   req->text}},
+            /*add_assistant_prompt=*/true,
+            &templated, error)) {
+        return false;
+    }
+
+    // Get the string form of <|audio_start|>
+    std::string audio_start_str;
+    if (!backbone_->token_to_piece(AUDIO_START_TOKEN_ID, &audio_start_str, error))
+        return false;
+    templated += audio_start_str;
+
+    std::vector<int32_t> text_tokens;
+    if (!backbone_->tokenize(templated, /*add_special=*/false,
+                             /*parse_special=*/true, &text_tokens,
+                             nullptr, error)) {
+        return false;
+    }
+    if (text_tokens.empty()) {
+        if (error) *error = "tokenize returned zero tokens";
+        return false;
+    }
+    const int32_t S = static_cast<int32_t>(text_tokens.size());
+
+    // ======================================================================
+    // (2) Build prompt embedding
+    // ======================================================================
+    // Zero-shot TTS: prompt has text tokens only — no reference audio, so no
+    // audio embedding contributions to add. (In few-shot mode, reference audio
+    // tokens would be summed via embed_one_step per position.)
+    std::vector<float> prompt_embeds(static_cast<size_t>(S) * hs, 0.0f);
+
+    for (int32_t i = 0; i < S; ++i) {
+        float* row = prompt_embeds.data() + static_cast<size_t>(i) * hs;
+
+        // Gather text token embedding
+        int32_t tok = text_tokens[i];
+        if (tok >= 0 && token_embd_) {
+            const size_t row_bytes = static_cast<size_t>(hs) *
+                (token_embd_->type == GGML_TYPE_F32 ? sizeof(float)
+                                                     : sizeof(ggml_fp16_t));
+            if (static_cast<size_t>(tok) * row_bytes + row_bytes <= ggml_nbytes(token_embd_)) {
+                const char* src = static_cast<const char*>(token_embd_->data)
+                                  + static_cast<size_t>(tok) * row_bytes;
+                if (token_embd_->type == GGML_TYPE_F32) {
+                    std::memcpy(row, src, row_bytes);
+                } else if (token_embd_->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t* s = reinterpret_cast<const ggml_fp16_t*>(src);
+                    for (int j = 0; j < hs; ++j)
+                        row[j] = ggml_fp16_to_fp32(s[j]);
+                }
+            }
+        }
+        // No audio embedding added for zero-shot prompt positions.
+        // (audio_embed tables have 1024 entries 0-1023; AUDIO_PAD_CODE=1024
+        //  is outside the valid range and would be a buffer over-read.)
+    }
+
+    // ======================================================================
+    // (3) Prefill through backbone
+    // ======================================================================
+    std::vector<float> hidden_buf(static_cast<size_t>(S) * hs);
+    if (!backbone_->forward_embeddings(prompt_embeds.data(), S, 0,
+                                        hidden_buf.data(), error)) {
+        return false;
+    }
+
+    // ======================================================================
+    // (4) Build multi-channel prompt for delay state
+    // ======================================================================
+    std::vector<std::vector<int32_t>> prompt_ids(
+        S, std::vector<int32_t>(1 + N_VQ, AUDIO_PAD_CODE));
+    for (int32_t i = 0; i < S; ++i)
+        prompt_ids[i][0] = text_tokens[i];
+
+    DelayState state = init_delay_state(prompt_ids);
+
+    SamplingConfig samp_cfg;
+    samp_cfg.text_temperature = 1.5f;
+    samp_cfg.text_top_p = 1.0f;
+    samp_cfg.text_top_k = 50;
+    samp_cfg.audio_temperature = req->temperature > 0.0f
+        ? req->temperature : 1.7f;
+    samp_cfg.audio_top_p = req->top_p > 0.0f
+        ? req->top_p : 0.8f;
+    samp_cfg.audio_top_k = 25;
+    samp_cfg.audio_repetition_penalty = 1.0f;
+
+    // ======================================================================
+    // (5) Autoregressive generation loop
+    // ======================================================================
+    const int32_t max_steps = req->max_tokens > 0
+        ? req->max_tokens
+        : cfg_.n_vq * 60 * 30;  // default: 60 fps * 30 s
+
+    std::vector<float> step_embd(static_cast<size_t>(hs));
+    std::vector<float> step_hidden(static_cast<size_t>(hs));
+    std::vector<float> audio_logits_buf(
+        static_cast<size_t>(cfg_.n_vq) * audio_vocab);
+
+    int32_t pos = S;
+    bool generated = false;
+
+    for (int32_t step = 0; step < max_steps; ++step) {
+        // (a) Get last hidden state
+        const float* last_hidden = (step == 0)
+            ? (hidden_buf.data() + static_cast<size_t>(S - 1) * hs)
+            : step_hidden.data();
+
+        // (b) Get text logits from backbone (from the just-decoded position)
+        const float* text_logits = backbone_->get_logits_ith(
+            (step == 0) ? (S - 1) : 0);
+        if (!text_logits) {
+            if (error) *error = "get_logits_ith returned null";
+            return false;
+        }
+
+        // (c) Project last hidden through audio_head
+        ProjectionRefs refs;
+        refs.n_tokens    = 1;
+        refs.hidden_size = hs;
+        refs.n_vq        = cfg_.n_vq;
+        refs.vocab       = audio_vocab;
+        refs.hidden      = last_hidden;
+        refs.heads       = audio_head_;
+
+        bool proj_ok = project_logits_cgraph(refs, audio_logits_buf.data(), error);
+        if (!proj_ok) {
+            std::string ref_err;
+            proj_ok = project_logits_reference(refs, audio_logits_buf.data(), &ref_err);
+            if (!proj_ok) {
+                if (error) *error = "audio head projection failed: " + ref_err;
+                return false;
+            }
+        }
+
+        // (d) Delay step -> sample next tokens
+        std::vector<int32_t> next_ids = delay_step(
+            state, text_logits, text_vocab,
+            audio_logits_buf.data(), audio_vocab,
+            samp_cfg);
+
+        // (e) Embed the sampled token vector
+        embed_one_step(next_ids.data(), &step_embd, error);
+
+        // (f) Forward single embedding (incremental KV)
+        if (!backbone_->forward_embeddings(step_embd.data(), 1, pos,
+                                            step_hidden.data(), error)) {
+            return false;
+        }
+        pos++;
+        generated = true;
+
+        // (g) Termination check
+        if (state.is_stopping) break;
+    }
+
+    if (!generated) {
+        if (error) *error = "zero generation steps";
+        return false;
+    }
+
+    // ======================================================================
+    // (6) Extract audio from generation output
+    // ======================================================================
+    // Build audio channel view from the delay state's audio buffer
+    // (everything that was appended during the loop)
+    auto audio_channels = state.audio_buf;  // copy
+
+    // De-delay + extract non-padding segments
+    auto segments = extract_audio_segments(audio_channels);
+
+    if (segments.empty()) {
+        if (error) *error = "no audio tokens generated";
+        return false;
+    }
+
+    // Replace any remaining AUDIO_PAD_CODE (1024) with 0 — the codec embedding
+    // table has 1024 entries (0-1023) and pad 1024 is out of range.
+    for (auto& frame : segments) {
+        for (auto& code : frame) {
+            if (code >= cfg_.audio_vocab_size) code = 0;
+        }
+    }
+
+    // ======================================================================
+    // (7) Decode codec -> PCM via ONNX
+    // ======================================================================
+    if (decoder_onnx_path_.empty()) {
+        if (error) *error = "decoder_onnx path not configured";
+        return false;
+    }
+
+    OnnxDecoder decoder;
+    if (!decoder.load(decoder_onnx_path_, /*use_gpu=*/false, error))
+        return false;
+
+    if (!decoder.decode(segments, &res->pcm_mono, error))
+        return false;
+
+    loudness_normalize(res->pcm_mono);
+
+    return true;
 }
 
-// Family destructor: free the moss.* ggml_context that loader.cpp allocated.
-// (Defined in this TU so ggml.h stays out of family.h — which only forward-
-// declares ggml_context.)
+// ---------------------------------------------------------------------------
+// Destructor
+// ---------------------------------------------------------------------------
 MossSession::~MossSession() {
     if (owns_ext_ctx_ && ext_ctx_) {
         ggml_free(ext_ctx_);
