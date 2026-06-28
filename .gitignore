@@ -20,6 +20,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Test output files (generated, not source)
+*.wav
+
 # Model weights directory (downloaded, not source)
 weights/
 
