@@ -15,6 +15,8 @@
 #include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/models/qwen3/runner.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -92,9 +94,53 @@ bool Qwen3TtsSession::load(const std::string& model_path,
         if (it != opts.extras.end())
             config_.flash_attn = it->second == "1" || it->second == "true";
     }
+    {
+        auto it = opts.extras.find("model_size_b");
+        if (it != opts.extras.end()) {
+            try { config_.model_size_b = std::stof(it->second); }
+            catch (...) { /* leave at 0 = unknown */ }
+        }
+    }
+
+    // Variant detection. extras["variant"] wins. Otherwise we look at the
+    // directory name for a hint ("1.7b-customvoice", "voicedesign", …).
+    // Without config.json parsing this is best-effort; the safe fallback is
+    // Unknown, which behaves like Base (plain TTS works on every variant).
+    {
+        auto it = opts.extras.find("variant");
+        if (it != opts.extras.end()) {
+            const std::string& v = it->second;
+            if (v == "base" || v == "Base")              config_.variant = Qwen3TtsVariant::Base;
+            else if (v == "customvoice" || v == "CustomVoice")
+                                                     config_.variant = Qwen3TtsVariant::CustomVoice;
+            else if (v == "voicedesign" || v == "VoiceDesign")
+                                                     config_.variant = Qwen3TtsVariant::VoiceDesign;
+            else                                config_.variant = Qwen3TtsVariant::Unknown;
+        }
+    }
+    if (config_.variant == Qwen3TtsVariant::Unknown) {
+        // Infer from directory name. Lowercase substring match — the
+        // manifest's variant keys ("qwen3-tts-1.7b-customvoice") are the
+        // canonical shape; community paths may differ.
+        std::string hay = dir;
+        std::transform(hay.begin(), hay.end(), hay.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        if (hay.find("voicedesign") != std::string::npos)
+            config_.variant = Qwen3TtsVariant::VoiceDesign;
+        else if (hay.find("customvoice") != std::string::npos)
+            config_.variant = Qwen3TtsVariant::CustomVoice;
+        else if (hay.find("qwen3-tts") != std::string::npos ||
+                 hay.find("qwen3_tts") != std::string::npos)
+            config_.variant = Qwen3TtsVariant::Base;
+    }
 
     std::fprintf(stderr, "qwen3_tts: loading talker from %s\n", config_.talker_path.c_str());
     std::fprintf(stderr, "qwen3_tts: loading predictor from %s\n", config_.predictor_path.c_str());
+    std::fprintf(stderr, "qwen3_tts: variant=%s%s\n",
+                 variant_name(config_.variant),
+                 config_.model_size_b > 0
+                     ? (" (" + std::to_string(config_.model_size_b) + "B)").c_str()
+                     : " (size unknown)");
 
     // ── 1. Load Talker ─────────────────────────────────────────────────────
     RunnerConfig talker_cfg;

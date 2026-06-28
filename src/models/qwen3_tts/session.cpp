@@ -16,6 +16,7 @@
 #include "audiocore/framework/sampling/sampler.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -65,6 +66,28 @@ static int32_t language_to_token(const std::string& lang) {
     return -1;
 }
 
+// Parse a mode string from the unified TtsRequest.mode field into the
+// Qwen3-TTS-specific enum. Unknown / empty / "tts" → plain batch TTS, the
+// safe default that works on every variant.
+Qwen3TtsMode parse_mode(const std::string& s) {
+    std::string m;
+    m.reserve(s.size());
+    for (char c : s) m.push_back(static_cast<char>(std::tolower(c)));
+    if (m == "voice_design" || m == "voicedesign") return Qwen3TtsMode::VoiceDesign;
+    if (m == "voice_clone"  || m == "voiceclone")  return Qwen3TtsMode::VoiceClone;
+    if (m == "streaming")                        return Qwen3TtsMode::Streaming;
+    return Qwen3TtsMode::TtsBatch;
+}
+
+// Voice Design mode system prompt. The official VoiceDesign variant trains
+// the model to accept a natural-language voice description in the instruct
+// slot, prefixed with a "Generate a voice with the following characteristics"
+// template. We use the same template on the Base / CustomVoice backbones as
+// a best-effort fallback — output will be intelligible but less polished
+// than the dedicated VoiceDesign weights.
+static const char* kVoiceDesignInstructPrefix =
+    "Generate a voice with the following characteristics: ";
+
 // ── Sampling ────────────────────────────────────────────────────────────
 // qwen3_tts uses the unified audiocore::sampler. A small lambda below at
 // each call site builds a Params struct from the request fields and hands
@@ -84,6 +107,42 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         return false;
     }
 
+    // ── Mode routing ──────────────────────────────────────────────────────
+    //
+    // qwen3_tts understands four modes from the unified TtsRequest.mode
+    // field. voice_clone + streaming are NOT implemented and fail fast with
+    // a pointer at GAPS.md so callers know it's a known gap, not a bug.
+    const Qwen3TtsMode mode = parse_mode(req.mode);
+    if (mode == Qwen3TtsMode::VoiceClone) {
+        if (error) *error =
+            "qwen3_tts voice_clone requires the ECAPA-TDNN speaker encoder "
+            "(not yet ported to ggml). See GAPS.md §2.3 for the port plan.";
+        return false;
+    }
+    if (mode == Qwen3TtsMode::Streaming) {
+        if (error) *error =
+            "qwen3_tts streaming requires chunked HTTP + Dual-Track "
+            "incremental decode (not implemented). See GAPS.md §2.2.";
+        return false;
+    }
+
+    // Voice Design mode: the instruct field carries the voice description.
+    // We prefix it with the VoiceDesign template so the model knows to
+    // synthesize the voice before speaking. If instruct is empty we still
+    // proceed (the dedicated VoiceDesign variant will produce a generic
+    // voice; the Base variant will just do plain TTS).
+    std::string effective_instruct = req.instruct;
+    if (mode == Qwen3TtsMode::VoiceDesign) {
+        if (effective_instruct.empty()) {
+            std::fprintf(stderr,
+                "qwen3_tts: voice_design mode with empty instruct — "
+                "no voice description provided; proceeding with defaults\n");
+        } else {
+            effective_instruct = std::string(kVoiceDesignInstructPrefix)
+                                 + effective_instruct;
+        }
+    }
+
     const int32_t codec_vocab = talker_->codec_vocab();
     const int32_t n_embd = talker_->n_embd();
     std::mt19937 rng(42);
@@ -93,7 +152,8 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     // ═══════════════════════════════════════════════════════════════════
 
     // Determine total prefill length:
-    // [instruct tokens (if any)] + [text tokens] + [codec_bos]
+    // [instruct tokens (if any)] + [text tokens] + [speaker token (if any)]
+    //                                + [codec_bos]
     // Each text token is summed with codec_pad. codec_bos gets zero text.
 
     // Tokenize main text
@@ -107,13 +167,35 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         if (error) *error = "empty input after tokenization";
         return false;
     }
-    std::fprintf(stderr, "qwen3_tts: %zu text tokens\n", text_tokens.size());
+    std::fprintf(stderr, "qwen3_tts: %zu text tokens (mode=%d, variant=%s)\n",
+                 text_tokens.size(),
+                 static_cast<int>(mode),
+                 variant_name(config_.variant));
+
+    // Resolve speaker_name → codec token. The CustomVoice variant defines
+    // nine default speakers; the Base variant ignores the field. Unknown
+    // names warn and skip — same behavior as before this stage but no
+    // longer silent.
+    int32_t speaker_token = -1;
+    if (!req.speaker_name.empty()) {
+        speaker_token = speaker_to_token(req.speaker_name);
+        if (speaker_token < 0) {
+            std::fprintf(stderr,
+                "qwen3_tts: unknown speaker '%s' — ignoring (known: vivian, "
+                "ryan, sarah, alex, emma, james, olivia, liam, sophia)\n",
+                req.speaker_name.c_str());
+        } else {
+            std::fprintf(stderr,
+                "qwen3_tts: speaker '%s' → codec token %d\n",
+                req.speaker_name.c_str(), speaker_token);
+        }
+    }
 
     // Tokenize instruct (optional)
     std::vector<int32_t> instruct_tokens;
-    bool has_instruct = !req.instruct.empty();
+    bool has_instruct = !effective_instruct.empty();
     if (has_instruct) {
-        if (!talker_->tokenize(req.instruct, /*add_special=*/true,
+        if (!talker_->tokenize(effective_instruct, /*add_special=*/true,
                                /*parse_special=*/false, &instruct_tokens,
                                /*needed=*/nullptr, error)) {
             return false;
@@ -123,7 +205,7 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
 
     // Build text embedding sequence: [instruct...] + [text...]
     std::string full_text;
-    if (has_instruct) full_text = req.instruct;
+    if (has_instruct) full_text = effective_instruct;
     full_text += req.text;
 
     std::vector<float> text_embd;
@@ -138,13 +220,14 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         n_text_tokens = (int32_t)text_tokens.size();
     }
 
-    // Build codec prefix sequence
-    // [codec_pad × n_text_tokens, codec_bos]
-    // For official model with instruct: codec_pad has (instruct + text) positions.
-    // For official model: also add think/nothink + language tokens.
-    int32_t prefix_len = n_text_tokens + 1;
+    // Build codec prefix sequence.
+    //   [codec_pad × n_text_tokens] + [speaker_token?] + [codec_bos]
+    // The optional speaker_token slot only appears when the request names
+    // a known default speaker (CustomVoice variant) — that injects the
+    // "<|spk_NAME|>" codec token Qwen3-TTS uses to switch voice profile.
+    const bool has_speaker = (speaker_token >= 0);
+    const int32_t prefix_len = n_text_tokens + (has_speaker ? 1 : 0) + 1;
 
-    // Build codec prefix embeddings
     std::vector<float> codec_prefix((size_t)prefix_len * n_embd, 0.0f);
 
     if (talker_->codec_embedding()) {
@@ -154,9 +237,25 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
             std::memcpy(&codec_prefix[(size_t)i * n_embd], pad_row,
                         (size_t)n_embd * sizeof(float));
         }
-        // codec_bos for the final position
+        int32_t cursor = n_text_tokens;
+        // Optional speaker slot (CustomVoice variant): one codec token row.
+        if (has_speaker) {
+            if (speaker_token < talker_->codec_vocab()) {
+                const float* spk_row =
+                    talker_->codec_embedding() + (size_t)speaker_token * n_embd;
+                std::memcpy(&codec_prefix[(size_t)cursor * n_embd], spk_row,
+                            (size_t)n_embd * sizeof(float));
+            } else {
+                std::fprintf(stderr,
+                    "qwen3_tts: speaker token %d out of codec vocab range %d; "
+                    "skipping speaker slot\n",
+                    speaker_token, talker_->codec_vocab());
+            }
+            cursor += 1;
+        }
+        // codec_bos for the final position.
         const float* bos_row = talker_->codec_embedding() + (size_t)CODEC_BOS * n_embd;
-        std::memcpy(&codec_prefix[(size_t)n_text_tokens * n_embd], bos_row,
+        std::memcpy(&codec_prefix[(size_t)cursor * n_embd], bos_row,
                     (size_t)n_embd * sizeof(float));
     } else {
         std::fprintf(stderr, "qwen3_tts: no codec embedding table!\n");
