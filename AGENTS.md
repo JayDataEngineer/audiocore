@@ -93,7 +93,7 @@ removed from the project. The HTTP server is also testable in-process via
 | Dialogue (TTSD) | 🟡 Stage 11 | `POST /v1/audio/speech {"mode":"dialogue"}` | TTSD-style system prompt + dialogue sampling defaults. Single `text` becomes opening turn; true multi-turn pending. |
 | Voice design | 🟡 Stage 11 | `POST /v1/audio/speech {"mode":"voice_design","instruct":"a calm deep female voice"}` | Voice description in `instruct` routes through flagship backbone with voice-design system prompt. Best-effort fallback for the dedicated VoiceGenerator model. |
 | Streaming | ❌ Fail-fast | `POST /v1/audio/speech {"mode":"realtime"}` | Returns 500 with pointer at GAPS.md §1.2. Chunked transport scaffold exists at `/v1/audio/speech/stream`. |
-| ggml codec graph | 🚧 Blocked | — | Codec decoder is a silence stub pending a ggml port of the speech-tokenizer graph; weights will live in the same GGUF as the backbone. |
+| ggml codec graph | 📋 Stage 16 | — | Silence stub pending Stage 16: adapt `pwilkin/openmoss/src/codec.cpp` (Apache-2.0) into `src/models/moss_tts/codec.cpp`. Pre-built sidecar GGUFs (`moss.codec.*` tensors included) at `smcleod/MOSS-TTS-v1.5-GGUF`. Full plan in `docs/CODEC_PORTS.md` §1. |
 
 **Codec token format** (`.codes` binary): `[n_frames: i32le] [codes: n_frames × 32 × i32le]`.
 
@@ -104,9 +104,10 @@ removed from the project. The HTTP server is also testable in-process via
 | TTS (talker + MTP predictor) | 🟡 Wired | `POST /v1/audio/speech` | Talker + Code Predictor load and run. Codec stub emits 1 s silence. |
 | TTS with style instructions | 🟡 Stage 10 | `POST /v1/audio/speech {"speaker":"Vivian","instruct":"whispered"}` | Speaker routing injects `<|spk_NAME|>` codec token; `instruct` summed into the text embedding. |
 | Voice design | 🟡 Stage 10 | `POST /v1/audio/speech {"mode":"voice_design","instruct":"young female, energetic"}` | Instruct prefixed with the official VoiceDesign template. Best-effort on Base backbone. |
-| Voice clone | ❌ Fail-fast | — | Returns 500 with pointer at GAPS.md §2.3 (ECAPA-TDNN speaker encoder needs a GGUF port). |
+| Voice clone | ❌ Fail-fast | — | Returns 500 with pointer at GAPS.md §2.3. **Stage 15:** the ECAPA-TDNN speaker encoder is also ported by `CrispStrobe/CrispASR` (MIT) — lands with Stage 17. |
 | Streaming | ❌ Fail-fast | — | Returns 500 with pointer at GAPS.md §2.2. Chunked transport scaffold exists at `/v1/audio/speech/stream`. |
 | Variant detection | ✅ Stage 10 | — | Set `extras["variant"]` = `Base` / `CustomVoice` / `VoiceDesign`, or rely on directory-name substring match. |
+| ggml codec graph | 📋 Stage 17 | — | Silence stub pending Stage 17: adapt `CrispStrobe/CrispASR`'s Qwen3-TTS codec (MIT) into `src/models/qwen3_tts/codec.cpp`. Pre-built GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`. Full plan in `docs/CODEC_PORTS.md` §2. |
 
 Both transformers (talker + predictor) run through the unified `qwen3::Runner`
 — the same class MOSS and ACE-Step use. Weights: official
@@ -159,6 +160,15 @@ When adding a family, cross-check against the existing reference C++ for
 that model. The reference is the parity target — byte-identical audio
 output (modulo quantization noise).
 
-- MOSS-TTS: `pwilkin/openmoss`
+- MOSS-TTS: `pwilkin/openmoss` (Apache-2.0)
+- MOSS-Audio-Tokenizer codec: `pwilkin/openmoss/src/codec.cpp` — full
+  encoder/decoder/RVQ graphs in pure ggml. Pre-built sidecar GGUFs at
+  `smcleod/MOSS-TTS-v1.5-GGUF` and `ilintar/moss-tts-gguf`. Port plan
+  in `docs/CODEC_PORTS.md` §1.
 - Qwen3-TTS: `QwenLM/Qwen3-TTS` (official Python reference)
+- Qwen3-TTS-Tokenizer-12Hz codec: `CrispStrobe/CrispASR` (MIT) — full
+  codec + ECAPA-TDNN speaker encoder in pure ggml. Pre-built GGUFs at
+  `cstr/qwen3-tts-tokenizer-12hz-GGUF`. Port plan in `docs/CODEC_PORTS.md` §2.
+  Do **not** use `predict-woo/qwen3-tts.cpp` as a reference — it has no
+  license file.
 - ACE-Step: `ServeurpersoCom/acestep.cpp`
