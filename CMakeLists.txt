@@ -61,6 +61,10 @@ add_library(audiocore_framework STATIC
     src/framework/core/backend.cpp
     src/framework/core/session.cpp
     src/framework/runtime/registry.cpp
+    # Manifest reader — powers `audiocore_cli --list-supported` and the
+    # server's future server.json validator. Reads models/manifest.json,
+    # the same file scripts/fetch_models.sh consumes.
+    src/framework/runtime/manifest.cpp
     # The ONE Qwen3 transformer path in audiocore. Used by every family
     # whose model includes a Qwen3 backbone (MOSS 8B) or Qwen3 LM / TE
     # (ACE-Step 5Hz LM, ACE-Step Qwen3-Embedding).

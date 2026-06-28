@@ -1,0 +1,450 @@
+{
+  "manifest_version": 1,
+  "project": "audiocore",
+  "homepage": "https://github.com/OpenMOSS-Team/audiocore",
+  "description": "Canonical record of every GGUF family/variant audiocore supports, with download locations. Fetch with scripts/fetch_models.sh. Self-describe via audiocore_cli --list-supported.",
+  "status_legend": {
+    "wired":     "parses, runs the model, returns non-silent audio end-to-end",
+    "partial":   "request parses, model runs, but a stage is a stub or missing",
+    "not_impl":  "no code path; the request is rejected or silently ignored",
+    "blocked":   "requires new model weights or a major port; see GAPS.md"
+  },
+  "families": {
+    "moss_tts": {
+      "display": "MOSS-TTS",
+      "vendor": "OpenMOSS-Team",
+      "license": "Apache-2.0",
+      "homepage": "https://github.com/pwilkin/openmoss",
+      "modes": {
+        "tts":          { "status": "partial",  "notes": "Backbone runs; codec→PCM is a silence stub pending a ggml port" },
+        "sfx":          { "status": "partial",  "notes": "Different system prompt + sampling defaults; codec stub" },
+        "voice_clone":  { "status": "partial",  "notes": "Reads voice_path as pre-encoded .codes; codec stub" },
+        "dialogue":     { "status": "not_impl", "notes": "Planned: multi-turn TTSD handling; see GAPS.md §1.2" },
+        "voice_design": { "status": "not_impl", "notes": "Planned: VoiceGenerator-equivalent mode on the flagship backbone" },
+        "realtime":     { "status": "not_impl", "notes": "Blocked on chunked HTTP endpoint; see GAPS.md §1.2" }
+      },
+      "variants": {
+        "moss-tts-q4-k-m": {
+          "display": "MOSS-TTS 8B (Q4_K_M)",
+          "params_b": 8,
+          "min_vram_gb": 8,
+          "files": [
+            {
+              "name": "backbone_gguf",
+              "filename": "MOSS_TTS_Q4_K_M.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS-GGUF",
+                "revision": "main",
+                "filename": "MOSS_TTS_Q4_K_M.gguf"
+              }
+            }
+          ],
+          "extras": {
+            "moss_tts_q8_0_alt_repo": {
+              "provider": "huggingface",
+              "repo": "SecondSelf/MOSS-TTS-GGUF",
+              "revision": "main",
+              "filename": "moss-tts-q8_0.gguf"
+            }
+          },
+          "server_config": {
+            "family": "moss_tts",
+            "path": "${MODELS_DIR}/moss_tts/MOSS_TTS_Q4_K_M.gguf"
+          }
+        },
+        "moss-audio-tokenizer-onnx": {
+          "display": "MOSS-Audio-Tokenizer (ONNX, codec encoder/decoder)",
+          "params_b": 1.6,
+          "min_vram_gb": 2,
+          "files": [
+            {
+              "name": "codec_decoder_onnx",
+              "filename": "decoder.onnx",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX",
+                "revision": "main",
+                "filename": "decoder.onnx"
+              }
+            },
+            {
+              "name": "codec_encoder_onnx",
+              "filename": "encoder.onnx",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX",
+                "revision": "main",
+                "filename": "encoder.onnx"
+              }
+            }
+          ],
+          "status_note": "Reference ONNX weights for the future ggml codec port (see GAPS.md §1.3). audiocore does not load ONNX directly — Stage 1 removed that surface — but these files document the upstream layout for the port."
+        }
+      }
+    },
+
+    "qwen3_tts": {
+      "display": "Qwen3-TTS",
+      "vendor": "Alibaba QwenLM",
+      "license": "Apache-2.0",
+      "homepage": "https://huggingface.co/QwenLM/Qwen3-TTS",
+      "modes": {
+        "tts_batch":     { "status": "partial",  "notes": "Talker + MTP predictor wired; codec→PCM is a silence stub" },
+        "tts_instruct":  { "status": "partial",  "notes": "speaker_name parsed but not routed to a speaker token yet" },
+        "voice_clone":   { "status": "not_impl", "notes": "reference_audio fields exist; ECAPA-TDNN speaker encoder needs a GGUF port" },
+        "voice_design":  { "status": "not_impl", "notes": "Planned: route instruct via VoiceDesign-variant weights + system prompt" },
+        "streaming":     { "status": "not_impl", "notes": "Blocked on chunked HTTP endpoint + Dual-Track incremental decode" }
+      },
+      "variants": {
+        "qwen3-tts-1.7b-base": {
+          "display": "Qwen3-TTS 1.7B Base",
+          "params_b": 1.7,
+          "min_vram_gb": 4,
+          "files": [
+            {
+              "name": "talker_safetensors",
+              "filename": "qwen3_tts_talker.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "QwenLM/Qwen3-TTS",
+                "revision": "main",
+                "subpath": "talker",
+                "convert_with": "convert_qwen3tts"
+              }
+            },
+            {
+              "name": "predictor_safetensors",
+              "filename": "qwen3_tts_predictor.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "QwenLM/Qwen3-TTS",
+                "revision": "main",
+                "subpath": "code_predictor",
+                "convert_with": "convert_qwen3tts"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "qwen3_tts",
+            "path": "${MODELS_DIR}/qwen3_tts/1.7b-base/",
+            "extras": {
+              "talker_path":    "qwen3_tts_talker.q5_k.gguf",
+              "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+              "n_gpu_layers":   "99"
+            }
+          }
+        },
+        "qwen3-tts-1.7b-customvoice": {
+          "display": "Qwen3-TTS 1.7B CustomVoice",
+          "params_b": 1.7,
+          "min_vram_gb": 4,
+          "files": [
+            {
+              "name": "talker_safetensors",
+              "filename": "qwen3_tts_talker.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "QwenLM/Qwen3-TTS-For-CustomVoice",
+                "revision": "main",
+                "subpath": "talker",
+                "convert_with": "convert_qwen3tts"
+              }
+            },
+            {
+              "name": "predictor_safetensors",
+              "filename": "qwen3_tts_predictor.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "QwenLM/Qwen3-TTS-For-CustomVoice",
+                "revision": "main",
+                "subpath": "code_predictor",
+                "convert_with": "convert_qwen3tts"
+              }
+            }
+          ],
+          "default_speakers": ["Cherry","Ethan","Serena","Chelsie","Dallas","Aria","Quinn","Leo","Bella"],
+          "server_config": {
+            "family": "qwen3_tts",
+            "path": "${MODELS_DIR}/qwen3_tts/1.7b-customvoice/",
+            "extras": {
+              "talker_path":    "qwen3_tts_talker.q5_k.gguf",
+              "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+              "n_gpu_layers":   "99"
+            }
+          }
+        },
+        "qwen3-tts-1.7b-voicedesign": {
+          "display": "Qwen3-TTS 1.7B VoiceDesign",
+          "params_b": 1.7,
+          "min_vram_gb": 4,
+          "files": [
+            {
+              "name": "talker_safetensors",
+              "filename": "qwen3_tts_talker.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "QwenLM/Qwen3-TTS-For-VoiceDesign",
+                "revision": "main",
+                "subpath": "talker",
+                "convert_with": "convert_qwen3tts"
+              }
+            },
+            {
+              "name": "predictor_safetensors",
+              "filename": "qwen3_tts_predictor.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "QwenLM/Qwen3-TTS-For-VoiceDesign",
+                "revision": "main",
+                "subpath": "code_predictor",
+                "convert_with": "convert_qwen3tts"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "qwen3_tts",
+            "path": "${MODELS_DIR}/qwen3_tts/1.7b-voicedesign/",
+            "extras": {
+              "talker_path":    "qwen3_tts_talker.q5_k.gguf",
+              "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+              "n_gpu_layers":   "99"
+            }
+          }
+        },
+        "qwen3-tts-0.6b-base": {
+          "display": "Qwen3-TTS 0.6B Base",
+          "params_b": 0.6,
+          "min_vram_gb": 2,
+          "files": [
+            {
+              "name": "talker_safetensors",
+              "filename": "qwen3_tts_talker.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "QwenLM/Qwen3-TTS-0.6B",
+                "revision": "main",
+                "subpath": "talker",
+                "convert_with": "convert_qwen3tts"
+              }
+            },
+            {
+              "name": "predictor_safetensors",
+              "filename": "qwen3_tts_predictor.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "QwenLM/Qwen3-TTS-0.6B",
+                "revision": "main",
+                "subpath": "code_predictor",
+                "convert_with": "convert_qwen3tts"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "qwen3_tts",
+            "path": "${MODELS_DIR}/qwen3_tts/0.6b-base/",
+            "extras": {
+              "talker_path":    "qwen3_tts_talker.q5_k.gguf",
+              "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+              "n_gpu_layers":   "99"
+            }
+          }
+        },
+        "qwen3-tts-tokenizer-12hz": {
+          "display": "Qwen3-TTS-Tokenizer-12Hz (codec, future ggml port)",
+          "params_b": 1.0,
+          "min_vram_gb": 2,
+          "files": [
+            {
+              "name": "codec_safetensors",
+              "filename": "tokenizer.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "QwenLM/Qwen3-TTS-Tokenizer",
+                "revision": "main",
+                "convert_with": "convert_qwen3tts"
+              }
+            }
+          ],
+          "status_note": "Reference weights for the future ggml codec port (see GAPS.md §2.3)."
+        }
+      }
+    },
+
+    "ace_step": {
+      "display": "ACE-Step",
+      "vendor": "StepFun",
+      "license": "Apache-2.0",
+      "homepage": "https://huggingface.co/ACE-Step/ACE-Step",
+      "modes": {
+        "text_to_music": { "status": "wired",    "notes": "Full pipeline: LM → DiT → VAE → 48 kHz stereo PCM" },
+        "cover":         { "status": "not_impl", "notes": "Planned: DiT accepts a target-voice conditioning signal" },
+        "repaint":       { "status": "not_impl", "notes": "Planned: mask + partial-latent DiT conditioning" },
+        "stem":          { "status": "blocked",  "notes": "Separate model (Demucs-class); not part of ACE-Step proper" },
+        "lego":          { "status": "blocked",  "notes": "Separate stem-assembler; not part of ACE-Step proper" },
+        "completion":    { "status": "not_impl", "notes": "Planned: partial-song conditioning + extension graph" }
+      },
+      "variants": {
+        "ace-step-1.5-turbo": {
+          "display": "ACE-Step 1.5 Turbo (1.7B LM, 8-step default)",
+          "params_b": 3.5,
+          "min_vram_gb": 12,
+          "files": [
+            {
+              "name": "dit",
+              "filename": "acestep-5Hz-lm-1.7B-turbo-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-5Hz-lm-1.7B-turbo-Q8_0.gguf"
+              }
+            },
+            {
+              "name": "lm",
+              "filename": "acestep-5Hz-lm-1.7B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-5Hz-lm-1.7B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "te",
+              "filename": "Qwen3-Embedding-0.6B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "Qwen3-Embedding-0.6B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "vae",
+              "filename": "vae-BF16.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "vae-BF16.gguf"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "ace_step",
+            "path": "${MODELS_DIR}/ace_step/1.5-turbo/"
+          }
+        },
+        "ace-step-1.5-sft": {
+          "display": "ACE-Step 1.5 SFT (1.7B LM, 50-step default)",
+          "params_b": 3.5,
+          "min_vram_gb": 12,
+          "files": [
+            {
+              "name": "dit",
+              "filename": "acestep-5Hz-lm-1.7B-sft-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-5Hz-lm-1.7B-sft-Q8_0.gguf"
+              }
+            },
+            {
+              "name": "lm",
+              "filename": "acestep-5Hz-lm-1.7B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-5Hz-lm-1.7B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "te",
+              "filename": "Qwen3-Embedding-0.6B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "Qwen3-Embedding-0.6B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "vae",
+              "filename": "vae-BF16.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "vae-BF16.gguf"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "ace_step",
+            "path": "${MODELS_DIR}/ace_step/1.5-sft/"
+          }
+        },
+        "ace-step-xl-turbo": {
+          "display": "ACE-Step XL Turbo (4B LM, 8-step default)",
+          "params_b": 4,
+          "min_vram_gb": 16,
+          "files": [
+            {
+              "name": "dit",
+              "filename": "acestep-5Hz-lm-4B-turbo-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-5Hz-lm-4B-turbo-Q8_0.gguf"
+              }
+            },
+            {
+              "name": "lm",
+              "filename": "acestep-5Hz-lm-4B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-5Hz-lm-4B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "te",
+              "filename": "Qwen3-Embedding-1.7B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "Qwen3-Embedding-1.7B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "vae",
+              "filename": "vae-BF16.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "vae-BF16.gguf"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "ace_step",
+            "path": "${MODELS_DIR}/ace_step/xl-turbo/"
+          }
+        }
+      }
+    }
+  }
+}
