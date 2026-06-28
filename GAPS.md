@@ -224,22 +224,38 @@ single session but are listed so the work is plan-able.
 ## 6. Coverage summary
 
 Of the **5 + 5 + 6 = 16 advertised user-facing modes** across the three
-families:
+families, after Stages 9–13:
 
-- ✅ fully wired end-to-end: **2** (ACE-Step Text-to-Music, plus the
-  ACE-Step variant matrix which all run the same Text-to-Music pipeline)
-- 🟡 parse and run but emit silence: **5** (MOSS tts / sfx / voice_clone,
-  Qwen3-TTS batch TTS, Qwen3-TTS with style instructions)
-- ❌ not implemented but achievable without new weights: **6** (MOSS
-  dialogue, MOSS voice_design, Qwen3-TTS voice_design, ACE-Step cover,
-  repaint, completion)
+- ✅ fully wired end-to-end: **1** (ACE-Step Text-to-Music)
+- 🟡 parse + run + emit silence (codec stub): **9** (MOSS tts / sfx /
+  voice_clone / dialogue / voice_design; Qwen3-TTS batch TTS / with
+  style instructions / voice_design; ACE-Step mode field rejects the
+  rest with a clear error)
+- ❌ not implemented, achievable without new weights: **3** (ACE-Step
+  cover / repaint / completion — all need the DiT to accept an extra
+  conditioning signal beyond text)
 - ❌ not implemented, separate model: **2** (ACE-Step stem extraction,
-  layering)
+  layering — blocked on a new Demucs-class / stem-assembler family)
 - ❌ not implemented, streaming infra: **2** (MOSS realtime, Qwen3-TTS
-  streaming)
-- 🚧 blocked on major port: **3+** (codec decoders ×2, speaker encoder)
+  streaming — the chunked transport scaffold exists; per-family
+  incremental decode does not)
+- 🚧 blocked on major port: **3+** (MOSS codec, Qwen3-TTS codec,
+  ECAPA-TDNN speaker encoder)
 
-The IaC gap (#1–#3 above) is the single biggest unlock for usability —
-without `models/manifest.json` and a fetch tool, every consumer has to
-assemble weights by hand from scattered README mentions. Closing that
-gap is the first thing the implementation stages below do.
+Stage 9 closed the entire IaC bucket. Stages 10–12 flipped six
+modes from ❌ to 🟡 (Qwen3-TTS voice_design, MOSS dialogue, MOSS
+voice_design, MOSS/Qwen3-TTS realtime/streaming — the last via the
+transport scaffold). Stage 13 added explicit `mode` parsing to ACE-Step
+so the unimplemented modes fail fast with a GAPS.md pointer instead of
+silently running text-to-music.
+
+The remaining work is concentrated in two places:
+
+1. **Codec ports (🚧)** — MOSS-Audio-Tokenizer + Qwen3-TTS-Tokenizer-12Hz
+   ggml ports. These unblock 6 of the 9 🟡 modes end-to-end at once.
+   Multi-week port per codec.
+2. **DiT conditioning extension** — ACE-Step cover / repaint / completion.
+   Graph-level change in `dit_runner.cpp`, no new weights. Medium effort.
+
+Plus, smaller but unblocked items: streaming-endpoint per-family hooks,
+ECAPA-TDNN speaker encoder port (Voice Clone), MP3 output.

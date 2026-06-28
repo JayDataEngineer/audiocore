@@ -14,6 +14,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <random>
@@ -479,6 +480,43 @@ bool AceStepSession::run_music(const void* request, void* response,
         if (error) *error = "null request/response";
         return false;
     }
+
+    // ── Mode gating ───────────────────────────────────────────────────────
+    //
+    // Only text_to_music runs today. The other five advertised modes need
+    // either a graph change (cover / repaint / completion — DiT must accept
+    // an extra conditioning signal) or a separate model entirely (stem /
+    // lego — Demucs-class separator or a DAW-style mixer). Fail fast with
+    // a pointer at GAPS.md so consumers know it's a known gap.
+    //
+    // Lowercase-compare so "Text-to-Music" / "TEXT_TO_MUSIC" also work.
+    auto lower = [](std::string s) {
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    const std::string mode = lower(req->mode);
+    const std::string default_mode = lower(MusicRequest{}.mode);
+    if (mode != default_mode && mode != "text-to-music" && mode != "text_to_music" && !mode.empty()) {
+        static const char* kHelp =
+            "See GAPS.md §3.2 for the per-mode roadmap. ";
+        if (mode == "stem" || mode == "lego") {
+            if (error) *error = std::string(
+                "ace_step mode='") + req->mode + "' is a separate model family "
+                "(Demucs-class separator / stem-assembler), not an ACE-Step "
+                "DiT mode. " + kHelp;
+        } else if (mode == "cover" || mode == "repaint" || mode == "completion") {
+            if (error) *error = std::string(
+                "ace_step mode='") + req->mode + "' needs the DiT to accept "
+                "an additional conditioning signal beyond text — a graph-"
+                "level change that isn't implemented yet. " + kHelp;
+        } else {
+            if (error) *error = std::string(
+                "ace_step: unknown mode '") + req->mode +
+                "'. Supported: 'text_to_music' (default). " + kHelp;
+        }
+        return false;
+    }
+
     res->sampling_rate = 48000;
     res->channels      = 2;
 

@@ -179,6 +179,7 @@ std::shared_ptr<httplib::Server> build_server(
         mr.caption  = body.value("caption", "");
         mr.lyrics   = body.value("lyrics", "");
         mr.duration = body.value("duration", 30.0f);
+        mr.mode     = body.value("mode", "text_to_music");
         if (body.contains("seed"))           mr.seed              = body["seed"].get<int32_t>();
         if (body.contains("guidance_scale")) mr.guidance_scale    = body["guidance_scale"].get<float>();
         if (body.contains("steps"))          mr.n_diffusion_steps = body["steps"].get<int32_t>();
