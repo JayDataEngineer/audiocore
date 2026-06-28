@@ -49,3 +49,10 @@ target_link_libraries(test_moss_e2e PRIVATE audiocore_framework)
 # Set KOKORO_WEIGHTS_DIR env var to a cached directory to skip the download.
 add_executable(test_kokoro_e2e test_kokoro_e2e.cpp)
 target_link_libraries(test_kokoro_e2e PRIVATE audiocore_framework)
+
+# End-to-end ZONOS2 test — spawns a Python subprocess running the official
+# Mini-SGLang server. Requires Python + torch + zonos deps (not build deps).
+# Run manually: ./test_zonos2_e2e
+# Set ZONOS2_MODEL_PATH / ZONOS2_PYTHON / ZONOS2_DEVICE env vars to configure.
+add_executable(test_zonos2_e2e test_zonos2_e2e.cpp)
+target_link_libraries(test_zonos2_e2e PRIVATE audiocore_framework)

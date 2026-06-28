@@ -78,6 +78,9 @@ add_library(audiocore_framework STATIC
     src/models/kokoro/loader.cpp
     src/models/kokoro/session.cpp
     src/models/kokoro/tokenizer.cpp
+    # ZONOS2 subprocess-based TTS (spawns Python Mini-SGLang server):
+    src/models/zonos2/loader.cpp
+    src/models/zonos2/session.cpp
     # HTTP server factory (routes + WAV encoders). Linked into the
     # audiocore_server binary AND into the e2e HTTP test, so both share the
     # same routing code path.

@@ -54,11 +54,13 @@ using nlohmann::json;
 extern "C" void audiocore_register_moss_tts();
 extern "C" void audiocore_register_ace_step();
 extern "C" void audiocore_register_kokoro();
+extern "C" void audiocore_register_zonos2();
 
 void register_all_families() {
     audiocore_register_moss_tts();
     audiocore_register_ace_step();
     audiocore_register_kokoro();
+    audiocore_register_zonos2();
 }
 
 struct ConfigModel {
