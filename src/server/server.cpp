@@ -195,6 +195,70 @@ std::shared_ptr<httplib::Server> build_server(
                         "audio/wav");
     });
 
+    // ── POST /v1/audio/speech/stream ────────────────────────────────────────
+    //
+    // Chunked-transfer variant of /v1/audio/speech. Accepts the same JSON
+    // body, runs the same TtsRequest through the same family, then emits
+    // the resulting WAV in chunks rather than as a single buffered body.
+    //
+    // This is a transport-level scaffold: the family still generates the
+    // entire PCM before we start streaming. True incremental streaming
+    // (audio frames emitted as the autoregressive loop produces them)
+    // requires per-family hooks into run_tts and is tracked in GAPS.md §1.2
+    // / §2.2. Until then, this endpoint proves the chunked plumbing works
+    // and lets a client observe progress incrementally instead of waiting
+    // for the full render before the first byte.
+    svr->Post("/v1/audio/speech/stream",
+              [slots_ref](const httplib::Request& req, httplib::Response& res) {
+        auto sg = resolve_slot(req, *slots_ref, res);
+        if (!sg) return;
+        const auto& body = sg->body;
+        auto& slot = sg->slot;
+
+        // Same field set as /v1/audio/speech.
+        TtsRequest tr;
+        tr.text            = body.value("input", "");
+        tr.language        = body.value("language", "");
+        tr.voice_path      = body.value("voice", "");
+        tr.mode            = body.value("mode", "tts");
+        tr.speed           = body.value("speed", 1.0f);
+        tr.instruct        = body.value("instruct", "");
+        tr.speaker_name    = body.value("speaker", "");
+        tr.reference_audio = body.value("reference_audio", "");
+        tr.reference_text  = body.value("reference_text", "");
+        if (body.contains("seed"))           tr.seed           = body["seed"].get<int32_t>();
+        if (body.contains("temperature"))    tr.temperature    = body["temperature"].get<float>();
+        if (body.contains("top_p"))          tr.top_p          = body["top_p"].get<float>();
+        if (body.contains("max_new_tokens")) tr.max_new_tokens = body["max_new_tokens"].get<int32_t>();
+        if (body.contains("max_tokens"))     tr.max_new_tokens = body["max_tokens"].get<int32_t>();
+
+        TtsResponse tresp;
+        std::string err;
+        if (!slot->session->run_tts(&tr, &tresp, &err)) {
+            fail_with(res, err);
+            return;
+        }
+
+        // Render the full WAV once, then chunk-emit it. ~64 KiB per chunk
+        // keeps the latency-vs-overhead tradeoff reasonable for 24 kHz
+        // mono PCM (≈1.4 s of audio per chunk).
+        const std::string wav = pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate);
+        static constexpr size_t kChunkBytes = 64 * 1024;
+        std::shared_ptr<std::string> wav_ref = std::make_shared<std::string>(std::move(wav));
+
+        res.set_chunked_content_provider(
+            "audio/wav",
+            [wav_ref](size_t offset, httplib::DataSink& sink) {
+                if (offset >= wav_ref->size()) {
+                    sink.done();
+                    return true;
+                }
+                const size_t n = std::min(kChunkBytes, wav_ref->size() - offset);
+                if (!sink.write(wav_ref->data() + offset, n)) return false;
+                return true;
+            });
+    });
+
     return svr;
 }
 

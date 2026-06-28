@@ -198,6 +198,33 @@ AUDIOCORE_TEST(speech_route_unknown_model_returns_404) {
     AUDIOCORE_CHECK_EQ(res->status, 404);
 }
 
+AUDIOCORE_TEST(speech_stream_route_returns_chunked_wav) {
+    // The chunked-transfer variant of /v1/audio/speech. cpp-httplib
+    // transparently reassembles chunked responses into res->body on the
+    // client side, so we verify:
+    //   1. The route exists and accepts the same body shape as /speech.
+    //   2. The full reassembled body is a valid WAV header + the same PCM
+    //      ramp the mock produces for the non-streaming route.
+    //   3. The mock saw the parsed request fields.
+    auto rs = start_server();
+    httplib::Client cli("127.0.0.1", rs->port);
+    cli.set_read_timeout(5);
+    json body = {
+        {"model",    "mock-1"},
+        {"input",    "streaming test"},
+        {"language", "de"},
+    };
+    auto res = cli.Post("/v1/audio/speech/stream", body.dump(), "application/json");
+    AUDIOCORE_CHECK(res != nullptr);
+    AUDIOCORE_CHECK_EQ(res->status, 200);
+    AUDIOCORE_CHECK_EQ(res->get_header_value("Content-Type"), std::string("audio/wav"));
+    AUDIOCORE_CHECK(res->body.size() >= 44);
+    AUDIOCORE_CHECK(std::memcmp(res->body.data(),     "RIFF", 4) == 0);
+    AUDIOCORE_CHECK(std::memcmp(res->body.data() + 8, "WAVE", 4) == 0);
+    AUDIOCORE_CHECK_EQ(rs->session->last_text_,     std::string("streaming test"));
+    AUDIOCORE_CHECK_EQ(rs->session->last_language_, std::string("de"));
+}
+
 AUDIOCORE_TEST(speech_route_invalid_json_returns_400) {
     auto rs = start_server();
     httplib::Client cli("127.0.0.1", rs->port);
