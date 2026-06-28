@@ -44,9 +44,10 @@ public:
     // implements tts/clon/sfx, ACE-Step implements music generation. The
     // server dispatches by task name → method.
     //
-    // Concrete I/O structs (TtsRequest, MusicRequest, …) are defined in
-    // headers under include/audiocore/framework/runtime/tasks.h (to be
-    // added when the first family lands).
+    // Concrete I/O structs live in
+    // include/audiocore/framework/runtime/tasks.h. TtsRequest/TtsResponse
+    // are shared across every TTS family; MusicRequest/MusicResponse are
+    // defined in ace_step/family.h (the only music family).
     //
     // Scope: TTS + music generation only. ASR / transcription is explicitly
     // out of scope — those go through CrispASR / whisper.cpp upstream, not

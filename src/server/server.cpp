@@ -14,6 +14,7 @@
 #include "audiocore/models/ace_step/family.h"
 #include "audiocore/models/moss_tts/family.h"
 #include "audiocore/models/qwen3_tts/family.h"
+#include "audiocore/framework/runtime/tasks.h"
 
 namespace audiocore {
 
@@ -135,46 +136,29 @@ std::shared_ptr<httplib::Server> build_server(
         const auto& body = sg->body;
         auto& slot = sg->slot;
 
-        const std::string family = slot->session->family_name();
+        // One request shape for every TTS family. The unified TtsRequest is
+        // a strict superset of the old moss::TtsRequest and qwen3_tts::
+        // TtsRequest fields, so we parse everything the client might send
+        // and let the family read whatever subset it cares about. No more
+        // per-family if/else branch in the routing layer.
+        TtsRequest tr;
+        tr.text            = body.value("input", "");
+        tr.language        = body.value("language", "");
+        tr.voice_path      = body.value("voice", "");
+        tr.mode            = body.value("mode", "tts");
+        tr.speed           = body.value("speed", 1.0f);
+        tr.instruct        = body.value("instruct", "");
+        tr.speaker_name    = body.value("speaker", "");
+        tr.reference_audio = body.value("reference_audio", "");
+        tr.reference_text  = body.value("reference_text", "");
+        if (body.contains("seed"))           tr.seed           = body["seed"].get<int32_t>();
+        if (body.contains("temperature"))    tr.temperature    = body["temperature"].get<float>();
+        if (body.contains("top_p"))          tr.top_p          = body["top_p"].get<float>();
+        // Accept both max_tokens (OpenAI-ish) and max_new_tokens (HF-ish).
+        if (body.contains("max_new_tokens")) tr.max_new_tokens = body["max_new_tokens"].get<int32_t>();
+        if (body.contains("max_tokens"))     tr.max_new_tokens = body["max_tokens"].get<int32_t>();
 
-        if (family == "qwen3_tts") {
-            // ── Qwen3-TTS ─────────────────────────────────────────────────
-            qwen3_tts::TtsRequest tr{};
-            tr.text          = body.value("input", "");
-            tr.language      = body.value("language", "");
-            tr.speed         = body.value("speed", 1.0f);
-            tr.temperature   = body.value("temperature", 0.7f);
-            tr.top_p         = body.value("top_p", 0.9f);
-            tr.instruct      = body.value("instruct", "");
-            tr.speaker_name  = body.value("speaker", "");
-            tr.reference_audio = body.value("reference_audio", "");
-            tr.reference_text  = body.value("reference_text", "");
-            if (body.contains("max_new_tokens"))
-                tr.max_new_tokens = body["max_new_tokens"].get<int>();
-
-            qwen3_tts::TtsResponse tresp;
-            std::string err;
-            if (!slot->session->run_tts(&tr, &tresp, &err)) {
-                fail_with(res, err);
-                return;
-            }
-            res.set_content(pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate),
-                            "audio/wav");
-            return;
-        }
-
-        // ── MOSS TTS (default / fallback) ──────────────────────────────────
-        moss::TtsRequest tr{};
-        tr.text       = body.value("input", "");
-        tr.language   = body.value("language", "en");
-        tr.voice_path = body.value("voice", "");
-        tr.mode       = body.value("mode", "tts");
-        if (body.contains("seed"))        tr.seed       = body["seed"].get<int32_t>();
-        if (body.contains("temperature")) tr.temperature= body["temperature"].get<float>();
-        if (body.contains("top_p"))       tr.top_p      = body["top_p"].get<float>();
-        if (body.contains("max_tokens"))  tr.max_tokens = body["max_tokens"].get<int32_t>();
-
-        moss::TtsResponse tresp;
+        TtsResponse tresp;
         std::string err;
         if (!slot->session->run_tts(&tr, &tresp, &err)) {
             fail_with(res, err);

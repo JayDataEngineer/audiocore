@@ -21,12 +21,19 @@
 
 #include "audiocore/framework/core/session.h"
 #include "audiocore/framework/io/gguf_reader.h"   // complete type — methods take GgufReader&
+#include "audiocore/framework/runtime/tasks.h"    // TtsRequest / TtsResponse
 #include "audiocore/models/qwen3/runner.h"
 
 struct ggml_context;
 struct ggml_tensor;
 
 namespace audiocore::moss {
+
+// MOSS-TTS uses the unified audiocore::TtsRequest / TtsResponse directly.
+// These aliases keep existing references in session.cpp / server.cpp
+// working without touching every call site.
+using TtsRequest  = ::audiocore::TtsRequest;
+using TtsResponse = ::audiocore::TtsResponse;
 
 // Parsed from MOSS GGUF KV metadata. These keys are stable across OpenMOSS
 // releases (the same names are read by openmoss/src/model.cpp).
@@ -52,24 +59,9 @@ struct MossConfig {
     bool    codec_present     = false;  // moss.codec.present
 };
 
-// Concrete request/response shapes. The base Session uses void* because the
-// framework can't know family types; MossSession down-casts inside run_tts.
-struct TtsRequest {
-    std::string text;
-    std::string language   = "en";
-    std::string voice_path;             // optional ref audio for cloning
-    std::string mode       = "tts";     // "tts" | "sfx" | "voice_clone"
-    int32_t     seed       = 0;
-    float       temperature= 0.8f;
-    float       top_p      = 0.9f;
-    int32_t     max_tokens = 0;         // 0 → model default (n_vq * max_secs)
-};
-
-struct TtsResponse {
-    std::vector<float> pcm_mono;       // sampling_rate Hz, mono
-    int32_t            sampling_rate = 24000;
-    std::string        error;
-};
+// Concrete request/response shapes are unified across every TTS family —
+// see include/audiocore/framework/runtime/tasks.h. MossSession down-casts
+// the void* it gets from Session::run_tts to TtsRequest* / TtsResponse*.
 
 class MossSession : public Session {
 public:

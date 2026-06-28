@@ -91,7 +91,7 @@ int main() {
     req.text = "Hello, this is a test of the MOSS-TTS system.";
     req.temperature = 0.8f;
     req.top_p = 0.9f;
-    req.max_tokens = 0;  // default: auto-compute (n_vq * 60 * 30 ≈ 14s)
+    req.max_new_tokens = 0;  // default: auto-compute (n_vq * 60 * 30 ≈ 14s)
 
     TtsResponse resp;
     std::string run_err;
