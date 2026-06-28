@@ -13,12 +13,14 @@
 //
 // Single-process, one loaded model per id. Concurrency = N configured models;
 // requests on the same model serialize through the session's backend.
+//
+// The HTTP routing, WAV encoders, and handler logic live in server.cpp so
+// tests can drive them without forking this binary.
 
 #include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <memory>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -32,6 +34,7 @@
 #include "audiocore/framework/runtime/registry.h"
 #include "audiocore/models/ace_step/family.h"
 #include "audiocore/models/moss_tts/family.h"
+#include "audiocore/server/server.h"
 
 namespace {
 
@@ -40,6 +43,7 @@ using audiocore::LoadOptions;
 using audiocore::BackendConfig;
 using audiocore::BackendKind;
 using audiocore::FamilyRegistry;
+using audiocore::ModelSlot;
 using nlohmann::json;
 
 // Each family loader.cpp exposes one of these. Calling them explicitly here
@@ -118,62 +122,6 @@ bool load_config(const std::string& path, ServerConfig& out) {
     return true;
 }
 
-// Serializes a single session — we serialize requests per model because the
-// underlying backend isn't thread-safe. The server can still handle N models
-// in parallel (one request per model id).
-struct ModelSlot {
-    std::unique_ptr<Session> session;
-    std::mutex               mtx;
-};
-
-// Tiny WAV writer for mono PCM16 → response body. Keeps the server binary
-// dependency-free; we encode MP3 only when libmp3lame is linked (Phase 2).
-std::string pcm_mono_to_wav(const std::vector<float>& pcm, int32_t sr) {
-    std::ostringstream o;
-    auto w16 = [&](uint16_t v) { o.put(v & 0xff); o.put((v >> 8) & 0xff); };
-    auto w32 = [&](uint32_t v) {
-        for (int i = 0; i < 4; i++) o.put((v >> (i * 8)) & 0xff);
-    };
-    const uint16_t channels = 1, bps = 16;
-    const uint32_t data_bytes = static_cast<uint32_t>(pcm.size()) * 2;
-    const uint32_t byte_rate  = sr * channels * bps / 8;
-    o.write("RIFF", 4);
-    w32(36 + data_bytes);
-    o.write("WAVE", 4);
-    o.write("fmt ", 4);  w32(16);  w16(1);
-    w16(channels);  w32(sr);  w32(byte_rate);  w16(channels * bps / 8);  w16(bps);
-    o.write("data", 4);  w32(data_bytes);
-    for (float s : pcm) {
-        if (s >  1.0f) s =  1.0f;
-        if (s < -1.0f) s = -1.0f;
-        w16(static_cast<int16_t>(s * 32767.0f));
-    }
-    return o.str();
-}
-
-std::string pcm_stereo_to_wav(const std::vector<float>& pcm, int32_t sr) {
-    std::ostringstream o;
-    auto w16 = [&](uint16_t v) { o.put(v & 0xff); o.put((v >> 8) & 0xff); };
-    auto w32 = [&](uint32_t v) {
-        for (int i = 0; i < 4; i++) o.put((v >> (i * 8)) & 0xff);
-    };
-    const uint16_t channels = 2, bps = 16;
-    const uint32_t data_bytes = static_cast<uint32_t>(pcm.size()) * 2;
-    const uint32_t byte_rate  = sr * channels * bps / 8;
-    o.write("RIFF", 4);
-    w32(36 + data_bytes);
-    o.write("WAVE", 4);
-    o.write("fmt ", 4);  w32(16);  w16(1);
-    w16(channels);  w32(sr);  w32(byte_rate);  w16(channels * bps / 8);  w16(bps);
-    o.write("data", 4);  w32(data_bytes);
-    for (float s : pcm) {
-        if (s >  1.0f) s =  1.0f;
-        if (s < -1.0f) s = -1.0f;
-        w16(static_cast<int16_t>(s * 32767.0f));
-    }
-    return o.str();
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -194,7 +142,8 @@ int main(int argc, char** argv) {
 
     // Instantiate one Session per configured model id. Each lives behind a
     // mutex so concurrent requests on the same model serialize.
-    std::unordered_map<std::string, std::shared_ptr<ModelSlot>> slots;
+    auto slots = std::make_shared<
+        std::unordered_map<std::string, std::shared_ptr<ModelSlot>>>();
     for (const ConfigModel& m : cfg.models) {
         auto sess = FamilyRegistry::instance().create(m.family);
         if (!sess) {
@@ -215,123 +164,23 @@ int main(int argc, char** argv) {
         }
         auto slot = std::make_shared<ModelSlot>();
         slot->session = std::move(sess);
-        slots[m.id] = slot;
+        (*slots)[m.id] = slot;
         std::fprintf(stderr, "audiocore_server: loaded '%s' (%s)\n",
                      m.id.c_str(), m.family.c_str());
     }
-    if (slots.empty()) {
+    if (slots->empty()) {
         std::fprintf(stderr, "no models configured — exiting\n");
         return 1;
     }
 
-    httplib::Server svr;
-    std::atomic<bool> shutting_down{false};
-
-    svr.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
-        json j = {{"status", "ok"}};
-        res.set_content(j.dump(), "application/json");
-    });
-
-    svr.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-        json arr = json::array();
-        for (const auto& [id, slot] : slots) {
-            std::lock_guard<std::mutex> g(slot->mtx);
-            arr.push_back({
-                {"id", id},
-                {"family", slot->session->family_name()},
-                {"loaded", slot->session->loaded()},
-            });
-        }
-        res.set_content(json{{"object", "list"}, {"data", arr}}.dump(),
-                        "application/json");
-    });
-
-    // OpenAI-compatible TTS. Maps to moss_tts family.
-    svr.Post("/v1/audio/speech", [&](const httplib::Request& req, httplib::Response& res) {
-        json body;
-        try { body = json::parse(req.body); }
-        catch (...) {
-            res.status = 400;
-            res.set_content(R"({"error":"invalid json"})", "application/json");
-            return;
-        }
-        const std::string model_id = body.value("model", "");
-        auto it = slots.find(model_id);
-        if (it == slots.end()) {
-            res.status = 404;
-            res.set_content(R"({"error":"unknown model"})", "application/json");
-            return;
-        }
-        auto& slot = it->second;
-        std::lock_guard<std::mutex> g(slot->mtx);
-
-        audiocore::moss::TtsRequest tr{};
-        tr.text     = body.value("input", "");
-        tr.language = body.value("language", "en");
-        tr.voice_path = body.value("voice", "");
-        if (body.contains("seed"))     tr.seed       = body["seed"].get<int32_t>();
-        if (body.contains("temperature")) tr.temperature = body["temperature"].get<float>();
-        if (body.contains("top_p"))    tr.top_p      = body["top_p"].get<float>();
-
-        audiocore::moss::TtsResponse tresp;
-        std::string err;
-        if (!slot->session->run_tts(&tr, &tresp, &err)) {
-            res.status = 500;
-            json e = {{"error", err}};
-            res.set_content(e.dump(), "application/json");
-            return;
-        }
-        // OpenAI expects audio/mpeg by default; we ship WAV until MP3 is wired.
-        res.set_content(pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate),
-                        "audio/wav");
-    });
-
-    // ACE-Step music generation. Maps to ace_step family.
-    svr.Post("/v1/audio/music", [&](const httplib::Request& req, httplib::Response& res) {
-        json body;
-        try { body = json::parse(req.body); }
-        catch (...) {
-            res.status = 400;
-            res.set_content(R"({"error":"invalid json"})", "application/json");
-            return;
-        }
-        const std::string model_id = body.value("model", "");
-        auto it = slots.find(model_id);
-        if (it == slots.end()) {
-            res.status = 404;
-            res.set_content(R"({"error":"unknown model"})", "application/json");
-            return;
-        }
-        auto& slot = it->second;
-        std::lock_guard<std::mutex> g(slot->mtx);
-
-        audiocore::acestep::MusicRequest mr;
-        mr.caption  = body.value("caption", "");
-        mr.lyrics   = body.value("lyrics", "");
-        mr.duration = body.value("duration", 30.0f);
-        if (body.contains("seed"))           mr.seed              = body["seed"].get<int32_t>();
-        if (body.contains("guidance_scale")) mr.guidance_scale    = body["guidance_scale"].get<float>();
-        if (body.contains("steps"))          mr.n_diffusion_steps = body["steps"].get<int32_t>();
-
-        audiocore::acestep::MusicResponse mresp;
-        std::string err;
-        if (!slot->session->run_music(&mr, &mresp, &err)) {
-            res.status = 500;
-            json e = {{"error", err}};
-            res.set_content(e.dump(), "application/json");
-            return;
-        }
-        res.set_content(pcm_stereo_to_wav(mresp.pcm_stereo, mresp.sampling_rate),
-                        "audio/wav");
-    });
-
-    svr.set_logger([](const httplib::Request& req, const httplib::Response&) {
+    auto svr = audiocore::build_server(slots);
+    svr->set_logger([](const httplib::Request& req, const httplib::Response&) {
         std::fprintf(stderr, "%s %s\n", req.method.c_str(), req.path.c_str());
     });
 
     std::fprintf(stderr, "audiocore_server: listening on %s:%d\n",
                  cfg.host.c_str(), cfg.port);
-    if (!svr.listen(cfg.host, cfg.port)) {
+    if (!svr->listen(cfg.host, cfg.port)) {
         std::fprintf(stderr, "failed to bind %s:%d\n",
                      cfg.host.c_str(), cfg.port);
         return 1;

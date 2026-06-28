@@ -31,19 +31,24 @@ namespace audiocore::moss {
 // Parsed from MOSS GGUF KV metadata. These keys are stable across OpenMOSS
 // releases (the same names are read by openmoss/src/model.cpp).
 struct MossConfig {
+    // Values read from GGUF KV metadata (moss.*). When absent (common for
+    // community GGUFs that only have the backbone), we fall back to the
+    // hardcoded defaults matching the OpenMOSS upstream constants.
     int32_t n_vq              = 32;     // moss.n_vq — RVQ stream count
-    int32_t audio_vocab_size  = 0;      // moss.audio_vocab_size
-    int32_t audio_pad_code    = 0;      // moss.audio_pad_code
+    int32_t audio_vocab_size  = 1024;   // moss.audio_vocab_size (0-1023 + pad=1024)
+    int32_t audio_pad_code    = 1024;   // moss.audio_pad_code
     int32_t sampling_rate     = 24000;  // moss.sampling_rate
-    int32_t downsample_rate   = 0;      // moss.downsample_rate
-    int32_t tok_audio_start   = 0;      // moss.token.audio_start
-    int32_t tok_audio_end     = 0;      // moss.token.audio_end
-    int32_t tok_user_slot     = 0;      // moss.token.user_slot
-    int32_t tok_audio_gen     = 0;      // moss.token.audio_gen_slot
-    int32_t tok_audio_delay   = 0;      // moss.token.audio_delay_slot
-    int32_t tok_im_start      = 0;      // moss.token.im_start
-    int32_t tok_im_end        = 0;      // moss.token.im_end
-    int32_t tok_pad           = 0;      // moss.token.pad
+    int32_t downsample_rate   = 320;    // moss.downsample_rate (codec)
+    int32_t n_quantized_embd  = 0;      // moss.n_quantized_embd (optional)
+    // Token IDs matching _constants.py / delay_state.h:
+    int32_t tok_audio_start   = 151652;
+    int32_t tok_audio_end     = 151653;
+    int32_t tok_user_slot     = 151654;
+    int32_t tok_audio_gen     = 151656;
+    int32_t tok_audio_delay   = 151662;
+    int32_t tok_im_start      = 151644;
+    int32_t tok_im_end        = 151645;
+    int32_t tok_pad           = 151643;
     bool    codec_present     = false;  // moss.codec.present
 };
 
@@ -84,14 +89,35 @@ private:
     bool bind_extension_tensors(const GgufReader& r,
                                 std::string* error);
 
+    // Load audio embedding and head tables from .npy files. Used when the
+    // GGUF only contains the Qwen3 backbone (the common community pattern).
+    //   emb_dir: path to embeddings/  directory (embed_tokens.npy + emb_ext_*.npy)
+    //   lm_dir:  path to lm_heads/    directory (lm_head_audio_*.npy)
+    bool load_npy_extras(const std::string& emb_dir,
+                         const std::string& lm_dir,
+                         std::string* error);
+
+    // Look up raw text-token embeddings from the GGUF's `token_embd.weight`
+    // (which libllama has its own copy of internally; we keep ours for raw
+    // gather without a forward pass). F32/F16 only — quantized tables need
+    // the ggml_cgraph production path. Output: (n_tokens, hidden_size).
+    bool embed_text_tokens(const int32_t* text_tokens, int32_t n_tokens,
+                           std::vector<float>* embd_out,
+                           std::string* error);
+
     // Build a single-row input embedding by summing text-token embeddings
-    // (from libllama) with any in-context audio embeddings (via
+    // (from embed_text_tokens) with any in-context audio embeddings (via
     // audio_embed.{i}.weight * one_hot(codec_token[i])). Output shape:
     //   (n_tokens, hidden_size) row-major float32.
     bool build_input_embeddings(const int32_t* text_tokens, int32_t n_text,
                                 const int32_t* audio_tokens, int32_t n_audio,
                                 std::vector<float>* embd_out,
                                 std::string* error);
+
+    // Embed a single (1+N_VQ) token vector into one hidden_size row.
+    // tokens[0] is the text token, tokens[1..N_VQ] are audio codec tokens.
+    bool embed_one_step(const int32_t* tokens, std::vector<float>* embd_out,
+                        std::string* error);
 
     // Apply audio_head.{i}.weight to a hidden-state row → logits per stream.
     // hidden: (n_tokens, hidden_size). logits_out: (n_tokens, n_vq, vocab+1).
@@ -108,12 +134,22 @@ private:
                       std::vector<float>* pcm_out,
                       std::string* error);
 
+    // NV: npy-loaded data buffers. The ggml_tensor::data pointers for npy-
+    // loaded tensors point into these. Kept alive for the session lifetime.
+    std::vector<std::vector<uint8_t>>  npy_buffers_;
+
     std::unique_ptr<qwen3::Runner> backbone_;     // Qwen3-8B via libllama
     ggml_context*  ext_ctx_   = nullptr;          // moss.* weights
     ggml_tensor*   audio_embed_[32] = {};         // moss.audio_embed.{i}.weight
     ggml_tensor*   audio_head_[32]  = {};         // moss.audio_head.{i}.weight
+    // The Qwen3 token embedding table — we read it from the GGUF directly
+    // (parallel to libllama's internal copy) for raw gathers without a
+    // forward pass. Bound at load time via the GgufReader.
+    ggml_tensor*   token_embd_ = nullptr;         // token_embd.weight
     // Codec weights — anchored here, wired in codec.cpp.
     ggml_tensor*   codec_dec_root_ = nullptr;     // moss.codec.dec.<root>
+    // ONNX decoder path (set from LoadOptions::extras["decoder_onnx"] in load())
+    std::string    decoder_onnx_path_;
     MossConfig     cfg_;
     bool           owns_ext_ctx_ = false;
 };

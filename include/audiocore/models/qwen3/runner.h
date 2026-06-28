@@ -62,8 +62,40 @@ public:
     bool forward_tokens(const int32_t* tokens, int32_t n_tokens, int32_t n_pos,
                         float* logits, std::string* error = nullptr);
 
+    // ---- Tokenizer (libllama-native, no vendored SentencePiece) ---------
+    // These delegate to libllama's Qwen3 tokenizer. add_special inserts
+    // BOS/EOS per the model config; parse_special decodes <|im_start|>-style
+    // control tokens instead of treating them as plaintext.
+    //
+    // Returns false only on hard failure (empty vocab). A too-small output
+    // buffer is reported via the size hint: callers should retry with a
+    // larger buffer when `*needed` > tokens.size().
+    bool tokenize(const std::string& text, bool add_special, bool parse_special,
+                  std::vector<int32_t>* tokens, int32_t* needed = nullptr,
+                  std::string* error = nullptr) const;
+
+    // Inverse: token id → byte piece (no null terminator appended).
+    bool token_to_piece(int32_t token, std::string* out,
+                        std::string* error = nullptr) const;
+
+    // True if `token` is the model's end-of-generation marker.
+    bool is_eog(int32_t token) const;
+
+    // Apply the model's chat template to a message list, returning the
+    // templated string ready for tokenize(). Each message is {role, content}.
+    // libllama supports the Qwen3 chat template natively; we don't need to
+    // ship our own jinja interpreter.
+    bool apply_chat_template(const std::vector<std::pair<std::string, std::string>>& messages,
+                             bool add_assistant_prompt,
+                             std::string* out,
+                             std::string* error = nullptr) const;
+
     int32_t hidden_size() const;
     int32_t vocab_size()  const;
+
+    // Low-level access to decoder results. Pointers valid until next decode.
+    const float* get_embeddings_ith(int32_t i) const;
+    const float* get_logits_ith(int32_t i) const;
 
     llama_model*   raw_model()    const { return model_; }
     llama_context* raw_context()  const { return ctx_;   }
