@@ -172,13 +172,60 @@ bool MossSession::run_tts(const void* request, void* response,
     const int32_t audio_vocab = cfg_.audio_vocab_size + 1;  // +1 for pad code
 
     // Validate mode
-    const bool is_sfx   = (req->mode == "sfx");
-    const bool is_clone = (req->mode == "voice_clone");
+    const bool is_sfx          = (req->mode == "sfx");
+    const bool is_clone        = (req->mode == "voice_clone");
+    const bool is_dialogue     = (req->mode == "dialogue");
+    const bool is_voice_design = (req->mode == "voice_design");
+    const bool is_realtime     = (req->mode == "realtime" ||
+                                  req->mode == "streaming");
+
+    // ── Realtime / streaming modes ───────────────────────────────────────────
+    // Not implemented. Fail fast with a pointer at GAPS.md so callers know
+    // it's a known gap, not a bug, and so the autoregressive loop doesn't
+    // spin for ~30 s before erroring out.
+    if (is_realtime) {
+        if (error) *error =
+            "moss_tts realtime / streaming requires chunked HTTP + "
+            "incremental codec decode (not implemented). "
+            "See GAPS.md §1.2.";
+        return false;
+    }
+
+    // ── Voice Design (a.k.a. VoiceGenerator) mode ────────────────────────────
+    // The dedicated VoiceGenerator model (1.7B) isn't loaded here. As a
+    // best-effort fallback we route the voice description through the
+    // flagship backbone's instruct slot with a voice-design system prompt.
+    // Output is intelligible TTS with the requested voice characteristics
+    // when the flagship can produce them; for parity with the upstream
+    // VoiceGenerator you'd point this same request at a VoiceGenerator
+    // GGUF instead.
+    if (is_voice_design && req->instruct.empty()) {
+        if (error) *error =
+            "moss_tts voice_design mode requires a voice description in "
+            "the 'instruct' field (e.g. 'a calm, deep female voice')";
+        return false;
+    }
 
     // ── System prompt by mode ────────────────────────────────────────────────
     std::string system_prompt;
     if (is_sfx) {
         system_prompt = "You are a sound effects generator.";
+    } else if (is_dialogue) {
+        // TTSD-style multi-turn dialogue. The text is the opening turn;
+        // the model continues the conversation. We can't truly do turn-
+        // taking without a multi-message request surface, but a TTSD-
+        // style system prompt steers the flagship backbone into a
+        // conversational cadence.
+        system_prompt =
+            "You are a spoken-dialogue assistant. Continue the conversation "
+            "the user begins, alternating between speakers with natural "
+            "conversational pacing.";
+    } else if (is_voice_design) {
+        // Voice description lives in instruct. Tell the model to speak the
+        // user's text in that voice.
+        system_prompt =
+            "You are a voice cloning assistant. Speak the user's text in "
+            "a voice matching this description: " + req->instruct + ".";
     } else {
         system_prompt = "You are a helpful voice assistant.";
     }
@@ -332,6 +379,31 @@ bool MossSession::run_tts(const void* request, void* response,
             ? req->top_p : 0.9f;
         samp_cfg.audio_top_k       = 20;
         samp_cfg.audio_repetition_penalty = 1.0f;
+    } else if (is_dialogue) {
+        // Dialogue (TTSD): higher text temperature for varied responses,
+        // tighter audio nucleus to keep voices distinct.
+        samp_cfg.text_temperature = 1.6f;
+        samp_cfg.text_top_p       = 0.95f;
+        samp_cfg.text_top_k       = 50;
+        samp_cfg.audio_temperature = req->temperature > 0.0f
+            ? req->temperature : 1.6f;
+        samp_cfg.audio_top_p       = req->top_p > 0.0f
+            ? req->top_p : 0.85f;
+        samp_cfg.audio_top_k       = 25;
+        samp_cfg.audio_repetition_penalty = 1.05f;  // dampen echo across turns
+    } else if (is_voice_design) {
+        // Voice Design: stay close to the standard TTS defaults so the
+        // backbone spends its degrees of freedom on the voice, not on
+        // sampling exploration.
+        samp_cfg.text_temperature = 1.4f;
+        samp_cfg.text_top_p       = 1.0f;
+        samp_cfg.text_top_k       = 50;
+        samp_cfg.audio_temperature = req->temperature > 0.0f
+            ? req->temperature : 1.5f;
+        samp_cfg.audio_top_p       = req->top_p > 0.0f
+            ? req->top_p : 0.85f;
+        samp_cfg.audio_top_k       = 30;
+        samp_cfg.audio_repetition_penalty = 1.0f;
     } else {
         // TTS defaults
         samp_cfg.text_temperature = 1.5f;
@@ -435,25 +507,35 @@ bool MossSession::run_tts(const void* request, void* response,
     // The ONNX Runtime codec decoder has been removed from audiocore. A
     // ggml_cgraph port of openmoss/src/codec.cpp (reading moss.codec.dec.*
     // tensors from the same GGUF as the backbone) is the planned replacement.
-    // Until that port lands, run_tts fails here with an explicit error so
-    // callers know the codec pipeline generated tokens successfully but
-    // couldn't render them to PCM.
+    // Until that port lands we emit 1 s of silence so the rest of the
+    // pipeline — chat template, tokenization, autoregressive codec-token
+    // generation, delay-pattern state machine — stays exercisable. The codec
+    // tokens themselves are valid (extracted into `segments` above) and will
+    // be passed to the future ggml decoder once it lands.
     // ======================================================================
-    if (error) *error = "moss_tts: codec->PCM decoder not wired "
-                        "(ggml port of openmoss/src/codec.cpp pending)";
+    std::fprintf(stderr, "moss_tts: codec->PCM decoder not wired "
+                         "(ggml port of openmoss/src/codec.cpp pending); "
+                         "emitting 1s silence\n");
     (void)loudness_normalize;  // kept for the future ggml codec path
-    return false;
+    (void)segments;            // codec tokens validated above; decode pending
+    res->pcm_mono.assign(static_cast<size_t>(cfg_.sampling_rate), 0.0f);
+    res->sampling_rate = cfg_.sampling_rate;
+    return true;
 }
 
 bool MossSession::decode_codec(const int32_t* codec_tokens, int32_t n_tokens,
                                 std::vector<float>* pcm_out,
                                 std::string* error) {
+    // Silence stub. See run_tts step (7) above: codec tokens are valid but
+    // the ggml port of openmoss/src/codec.cpp is pending. Until it lands we
+    // emit 1 s of silence at the configured sample rate so callers get a
+    // well-shaped response. `error` is intentionally not set — this is a
+    // known gap, not a failure.
     (void)codec_tokens;
     (void)n_tokens;
-    (void)pcm_out;
-    if (error) *error = "moss_tts: codec->PCM decoder not wired "
-                        "(ggml port of openmoss/src/codec.cpp pending)";
-    return false;
+    (void)error;
+    pcm_out->assign(static_cast<size_t>(cfg_.sampling_rate), 0.0f);
+    return true;
 }
 
 // ---------------------------------------------------------------------------

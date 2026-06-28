@@ -40,9 +40,9 @@ MOSS-Audio-Tokenizer-v2 / -Nano codec infrastructure.
 | `tts` (zero-shot) | 🟡 | Wired; codec stub returns 1 s silence |
 | `sfx` (sound effects) | 🟡 | Wired; different system prompt + sampling defaults; codec stub |
 | `voice_clone` | 🟡 | Wired; reads `voice_path` as pre-encoded `.codes`; codec stub |
-| `dialogue` (TTSD) | ❌ | No multi-message input, no turn-taking tokens |
-| `voice_design` (VoiceGenerator) | ❌ | No mode handling; would also need the separate 1.7B VoiceGenerator weights for true parity |
-| `realtime` / streaming | ❌ | No chunked HTTP endpoint, no incremental codec decode |
+| `dialogue` (TTSD) | 🟡 | Stage 11: TTSD-style system prompt + dialogue sampling defaults. Multi-turn input surface still missing (single `text` field becomes the opening turn); true TTSD weights are a separate 8B variant. |
+| `voice_design` (VoiceGenerator) | 🟡 | Stage 11: routes voice description from `instruct` through the flagship backbone with a voice-design system prompt. Best-effort fallback — the dedicated 1.7B VoiceGenerator model produces better voice fidelity. |
+| `realtime` / streaming | ❌ | Stage 11: fails fast with a pointer at this section. Streaming endpoint scaffold is GAPS.md §4. |
 
 ### 1.3 Codec / tokenizer
 
