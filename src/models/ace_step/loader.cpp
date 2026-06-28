@@ -239,14 +239,6 @@ std::unique_ptr<Session> make_ace_step_session() {
 }  // namespace
 
 AUDIOCORE_REGISTER_FAMILY(ace_step, make_ace_step_session)
-
-// Explicit registration anchor — see comment in moss_tts/loader.cpp.
-extern "C" void audiocore_register_ace_step() {
-    static bool done = false;
-    if (!done) {
-        FamilyRegistry::instance().register_family("ace_step", make_ace_step_session);
-        done = true;
-    }
-}
+AUDIOCORE_EXTERN_C_GUARD(ace_step, make_ace_step_session)
 
 }  // namespace audiocore::acestep

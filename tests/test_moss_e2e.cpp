@@ -3,19 +3,12 @@
 // Compiles into the existing test infrastructure. The test runner handles
 // the weight-path fixtures. This test skips if the model files are absent.
 
+#include "e2e_common.h"
 #include "audiocore/framework/core/backend.h"
 #include "audiocore/framework/core/session.h"
 #include "audiocore/framework/io/weight_loader.h"
 #include "audiocore/framework/runtime/registry.h"
 #include "audiocore/models/moss_tts/family.h"
-
-#include <algorithm>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <fstream>
-#include <string>
-#include <vector>
 
 // Pull in the static registrars so FamilyRegistry knows about moss_tts.
 extern "C" void audiocore_register_moss_tts();
@@ -24,14 +17,6 @@ extern "C" void audiocore_register_moss_tts();
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// Slightly-simpler Check macro that doesn't depend on a test framework.
-#define CHECK(cond, msg) do { \
-    if (!(cond)) { \
-        std::fprintf(stderr, "[FAIL] %s:%d: %s\n", __FILE__, __LINE__, msg); \
-        return 1; \
-    } \
-} while(0)
-
 #define CHECK_OK(x) do { \
     std::string _err; \
     if (!(x)) { \
@@ -39,35 +24,6 @@ extern "C" void audiocore_register_moss_tts();
         return 1; \
     } \
 } while(0)
-
-// Write a WAV file matching the test harness expectations.
-static int write_wav(const std::string& path,
-                     const float* pcm, size_t n_samples, int sr) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) { std::fprintf(stderr, "can't open %s\n", path.c_str()); return 1; }
-
-    auto w16 = [&](uint16_t v) { f.put(v & 0xff); f.put((v >> 8) & 0xff); };
-    auto w32 = [&](uint32_t v) {
-        for (int i = 0; i < 4; ++i) f.put((v >> (i * 8)) & 0xff);
-    };
-
-    const uint16_t channels = 1, bps = 16;
-    const uint32_t data_bytes = static_cast<uint32_t>(n_samples) * 2;
-    const uint32_t byte_rate = static_cast<uint32_t>(sr) * channels * bps / 8;
-
-    f.write("RIFF", 4);
-    w32(36 + data_bytes);
-    f.write("WAVE", 4);
-    f.write("fmt ", 4); w32(16); w16(1);
-    w16(channels); w32(static_cast<uint32_t>(sr)); w32(byte_rate);
-    w16(channels * bps / 8); w16(bps);
-    f.write("data", 4); w32(data_bytes);
-    for (size_t i = 0; i < n_samples; ++i) {
-        float s = std::clamp(pcm[i], -1.0f, 1.0f);
-        w16(static_cast<int16_t>(s * 32767.0f));
-    }
-    return 0;
-}
 
 // ---------------------------------------------------------------------------
 // Paths

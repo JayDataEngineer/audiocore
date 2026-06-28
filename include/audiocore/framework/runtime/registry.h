@@ -48,6 +48,19 @@ struct FamilyRegistrar {
         g_register_##name(#name, factory);                     \
     }
 
+// Registration anchor that doubles as a linkage guard. Each family's loader.cpp
+// calls this after AUDIOCORE_REGISTER_FAMILY so main.cpp can force the
+// object file to be linked (static archives drop unreferenced TUs).
+#define AUDIOCORE_EXTERN_C_GUARD(name, factory)                               \
+    extern "C" void audiocore_register_##name() {                             \
+        static bool done_##name = false;                                      \
+        if (!done_##name) {                                                   \
+            ::audiocore::FamilyRegistry::instance().register_family(           \
+                #name, factory);                                              \
+            done_##name = true;                                               \
+        }                                                                     \
+    }
+
 }  // namespace audiocore
 
 #endif  // AUDIOCORE_FRAMEWORK_RUNTIME_REGISTRY_H

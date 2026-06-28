@@ -487,13 +487,6 @@ std::unique_ptr<Session> make_moss_session() {
 }  // namespace
 
 AUDIOCORE_REGISTER_FAMILY(moss_tts, make_moss_session)
-
-extern "C" void audiocore_register_moss_tts() {
-    static bool done = false;
-    if (!done) {
-        FamilyRegistry::instance().register_family("moss_tts", make_moss_session);
-        done = true;
-    }
-}
+AUDIOCORE_EXTERN_C_GUARD(moss_tts, make_moss_session)
 
 }  // namespace audiocore::moss
