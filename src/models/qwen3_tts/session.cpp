@@ -13,6 +13,7 @@
 
 #include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/models/qwen3/runner.h"
+#include "audiocore/framework/sampling/sampler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -26,6 +27,8 @@ namespace audiocore::qwen3_tts {
 
 using audiocore::qwen3::Runner;
 using audiocore::qwen3::RunnerConfig;
+using audiocore::sampler::Params;
+using audiocore::sampler::sample_token;
 
 // ── Codec special tokens (from official Qwen3-TTS config) ────────────────
 static constexpr int32_t CODEC_PAD    = 4196;
@@ -63,44 +66,9 @@ static int32_t language_to_token(const std::string& lang) {
 }
 
 // ── Sampling ────────────────────────────────────────────────────────────
-
-static int32_t sample_token(const float* logits, int32_t n_vocab,
-                            float temp, float top_p, std::mt19937& rng) {
-    if (n_vocab <= 0) return 0;
-    std::vector<float> probs((size_t)n_vocab);
-    float max_l = -1e38f;
-    for (int i = 0; i < n_vocab; i++) if (logits[i] > max_l) max_l = logits[i];
-    float sum = 0;
-    for (int i = 0; i < n_vocab; i++) {
-        probs[(size_t)i] = std::exp((logits[i] - max_l) / std::max(temp, 1e-6f));
-        sum += probs[(size_t)i];
-    }
-    if (top_p < 1.0f && top_p > 0.0f && sum > 0) {
-        std::vector<int32_t> idx((size_t)n_vocab);
-        std::iota(idx.begin(), idx.end(), 0);
-        std::sort(idx.begin(), idx.end(),
-                  [&](int a, int b) { return probs[(size_t)a] > probs[(size_t)b]; });
-        float cum = 0;
-        std::vector<bool> keep((size_t)n_vocab, false);
-        for (auto ix : idx) {
-            cum += probs[(size_t)ix] / sum;
-            keep[(size_t)ix] = true;
-            if (cum >= top_p) break;
-        }
-        for (size_t i = 0; i < (size_t)n_vocab; i++) if (!keep[i]) probs[i] = 0;
-        sum = 0;
-        for (size_t i = 0; i < (size_t)n_vocab; i++) sum += probs[i];
-    }
-    if (sum <= 0) return 0;
-    std::uniform_real_distribution<float> dist(0, sum);
-    float sample = dist(rng);
-    float cum = 0;
-    for (int i = 0; i < n_vocab; i++) {
-        cum += probs[(size_t)i];
-        if (sample <= cum) return i;
-    }
-    return n_vocab - 1;
-}
+// qwen3_tts uses the unified audiocore::sampler. A small lambda below at
+// each call site builds a Params struct from the request fields and hands
+// the session RNG to it.
 
 // ── Constructor / Destructor ────────────────────────────────────────────
 
@@ -282,8 +250,13 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                 }
                 c0_logits[(size_t)j] = s;
             }
-            code_0 = sample_token(c0_logits.data(), codec_vocab,
-                                  req.temperature, req.top_p, rng);
+            code_0 = [&] {
+                Params sp;
+                sp.temperature = req.temperature;
+                sp.top_p       = req.top_p;
+                return sample_token(c0_logits.data(), codec_vocab, sp,
+                                    /*prev_tokens=*/nullptr, /*n_prev=*/0, &rng);
+            }();
         }
         code_matrix[(size_t)0 * max_steps + step] = code_0;
 
@@ -318,8 +291,12 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                     int32_t cb_vocab = predictor_->vocab_size() / n_total_books;
                     const float* cb_logits = logits.data() +
                         (size_t)(cb + 1) * cb_vocab;
+                    Params sp;
+                    sp.temperature = req.temperature;
+                    sp.top_p       = req.top_p;
                     fine_codes[(size_t)cb] = sample_token(
-                        cb_logits, cb_vocab, req.temperature, req.top_p, rng);
+                        cb_logits, cb_vocab, sp,
+                        /*prev_tokens=*/nullptr, /*n_prev=*/0, &rng);
                 }
             }
         }

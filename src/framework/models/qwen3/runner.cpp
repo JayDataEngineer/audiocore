@@ -10,6 +10,7 @@
 #include "llama.h"
 
 #include "audiocore/framework/io/gguf_reader.h"
+#include "audiocore/framework/sampling/sampler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,6 +25,8 @@ namespace audiocore::qwen3 {
 
 using audiocore::GgufReader;
 using audiocore::TensorStorage;
+using audiocore::sampler::Params;
+using audiocore::sampler::sample_token;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Extras tensor materialization via WeightLoader.
@@ -58,50 +61,6 @@ float* materialize_f32(const GgufReader& reader, const char* name,
     }
     if (out_nfloats) *out_nfloats = n_floats;
     return buf;
-}
-
-// Local RNG + top-p/top-t sampling used by predict_one_step. Consolidated
-// with the moss_tts sampler in Stage 4 — kept here as a private helper for
-// now to avoid pulling model-level headers into the framework library.
-int32_t sample_token_basic(const float* logits, int32_t n_vocab,
-                            float temp, float top_p, std::mt19937& rng) {
-    if (n_vocab <= 0) return 0;
-    std::vector<float> probs(static_cast<size_t>(n_vocab));
-    float max_l = -1e38f;
-    for (int i = 0; i < n_vocab; i++)
-        if (logits[i] > max_l) max_l = logits[i];
-    float sum = 0;
-    for (int i = 0; i < n_vocab; i++) {
-        probs[static_cast<size_t>(i)] =
-            std::exp((logits[i] - max_l) / std::max(temp, 1e-6f));
-        sum += probs[static_cast<size_t>(i)];
-    }
-    if (top_p < 1.0f && top_p > 0.0f && sum > 0) {
-        std::vector<int32_t> idx(static_cast<size_t>(n_vocab));
-        std::iota(idx.begin(), idx.end(), 0);
-        std::sort(idx.begin(), idx.end(),
-                  [&](int a, int b) { return probs[a] > probs[b]; });
-        float cum = 0;
-        std::vector<bool> keep(static_cast<size_t>(n_vocab), false);
-        for (auto ix : idx) {
-            cum += probs[static_cast<size_t>(ix)] / sum;
-            keep[static_cast<size_t>(ix)] = true;
-            if (cum >= top_p) break;
-        }
-        for (size_t i = 0; i < static_cast<size_t>(n_vocab); i++)
-            if (!keep[i]) probs[i] = 0;
-        sum = 0;
-        for (size_t i = 0; i < static_cast<size_t>(n_vocab); i++) sum += probs[i];
-    }
-    if (sum <= 0) return 0;
-    std::uniform_real_distribution<float> dist(0, sum);
-    const float sample = dist(rng);
-    float cum = 0;
-    for (int i = 0; i < n_vocab; i++) {
-        cum += probs[static_cast<size_t>(i)];
-        if (sample <= cum) return i;
-    }
-    return n_vocab - 1;
 }
 
 }  // namespace
@@ -720,8 +679,13 @@ bool Runner::predict_one_step(const float* talker_hidden,
             logits[static_cast<size_t>(j)] = s;
         }
 
-        const int32_t sampled = sample_token_basic(logits.data(), fv,
-                                                    0.7f, 0.9f, rng);
+        const int32_t sampled = [&] {
+            Params sp;
+            sp.temperature = 0.7f;
+            sp.top_p       = 0.9f;
+            return sample_token(logits.data(), fv, sp,
+                                /*prev_tokens=*/nullptr, /*n_prev=*/0, &rng);
+        }();
         out_codes[k] = sampled;
         cur_codes[static_cast<size_t>(k)] = sampled;
     }
