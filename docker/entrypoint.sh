@@ -52,4 +52,18 @@ if command -v jq >/dev/null 2>&1; then
     done < <(jq -r '.models[].path // empty' "${CONFIG}" 2>/dev/null)
 fi
 
+# Inject --config $CONFIG when launching the canonical server without one,
+# so "docker run audiocore" Just Works. If the user passed --config on the
+# command line, or is invoking a different binary (cli, inspect_gguf, sh),
+# we get out of the way (postgres/redis-style wrapper).
+case "${1:-}" in
+    audiocore_server|/opt/audiocore/bin/audiocore_server)
+        has_config=0
+        for a in "$@"; do
+            case "$a" in --config|--config=*) has_config=1 ;; esac
+        done
+        [[ $has_config -eq 0 ]] && set -- "$@" --config "${CONFIG}"
+        ;;
+esac
+
 exec "$@"
