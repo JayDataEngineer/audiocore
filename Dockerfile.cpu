@@ -56,8 +56,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         tini \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 1000 audiocore \
-    && useradd  --system --uid 1000 --gid 1000 \
+    && groupadd --system --gid 10000 audiocore \
+    && useradd  --system --uid 10000 --gid 10000 \
                 --home-dir /var/lib/audiocore --shell /usr/sbin/nologin audiocore
 
 COPY --from=builder /src/build/audiocore_server  /opt/audiocore/bin/audiocore_server
