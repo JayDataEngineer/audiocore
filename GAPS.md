@@ -172,19 +172,22 @@ family that produces non-silent audio today.
 | Mode | Status | Notes |
 |---|---|---|
 | Text-to-Music (Custom) | ✅ `caption` + `lyrics` + `duration` wired end-to-end |
-| Cover Generation | ❌ No `mode` field on `MusicRequest`; needs style/voice transfer graph |
-| Repainting (Inpainting) | ❌ Needs segment-level mask input + selective re-generation |
-| Track / Stem Extraction | ❌ Typically a separate model (Demucs-class); not part of ACE-Step proper |
-| Layering (LEGO) | ❌ Needs stem assembly mixer; not part of ACE-Step proper |
-| Completion (Outpointing) | ❌ Needs partial-song conditioning + extension graph |
+| Cover Generation | ✅ | VAE-encode source audio, average-pool 5:1 for temporal smoothing, feed as DiT conditioning channels. Cover-nofsq (no FSQ roundtrip) semantics — close remix rather than full reinterpretation. Full FSQ roundtrip blocked on encoder weights. |
+| Repainting (Inpainting) | ✅ | VAE-encode input audio, mask-based blending of known region during DiT denoising. |
+| Track / Stem Extraction | ❌ | Typically a separate model (Demucs-class); not part of ACE-Step proper |
+| Layering (LEGO) | ❌ | Needs stem assembly mixer; not part of ACE-Step proper |
+| Completion (Outpointing) | ✅ | Same as repaint but mask covers the end of the audio — LM generates codes for full duration, DiT blends known region. |
 
 ### 3.3 Architecture gaps
 
-Cover / Repainting / Completion all need the DiT to accept a conditioning
+Cover, Repainting, and Completion all need the DiT to accept a conditioning
 signal beyond text — an existing latent to preserve, a mask, or a partial
-song. The DiT graph in `src/models/ace_step/dit_runner.cpp` currently
-only accepts text-encoder conditioning. Adding the rest is a graph-level
-change, not a small patch.
+song. Audiocore implements all three: the DiT's 192-channel input supports
+[noise(64) | cover_cond(64) | mask(64)] layout, with cover_cond derived
+from VAE-encoded source audio (temporally smoothed via average pool 5:1).
+Repaint/completion mask their region in state-space (downstream of proj_in)
+rather than channel-space, blending the known latent at the correct
+noise level each step.
 
 Stem Extraction and Layering are genuinely separate models in the
 upstream ecosystem (Demucs for separation, a DAW-style mixer for
@@ -285,18 +288,17 @@ single session but are listed so the work is plan-able.
 Of the **5 + 5 + 6 = 16 advertised user-facing modes** across the three
 families, after Stages 9–19:
 
-- ✅ fully wired end-to-end: **10** (ACE-Step Text-to-Music; MOSS tts /
-  sfx / voice_clone / realtime — when fed codec-bearing weights like
-  `smcleod/MOSS-TTS-v1.5-GGUF`; Qwen3-TTS batch TTS / TTS with style
-  instructions / voice_design / voice_clone / streaming — when fed a codec
-  sidecar like `cstr/qwen3-tts-tokenizer-12hz-GGUF` AND the talker GGUF
-  carries speaker encoder tensors; Voice Clone falls back to a clear
-  fail-fast error with a GAPS.md pointer when the speech encoder is absent)
+- ✅ fully wired end-to-end: **13** (ACE-Step Text-to-Music / cover /
+  repaint / completion; MOSS tts / sfx / voice_clone / realtime — when
+  fed codec-bearing weights like `smcleod/MOSS-TTS-v1.5-GGUF`; Qwen3-TTS
+  batch TTS / TTS with style instructions / voice_design / voice_clone /
+  streaming — when fed a codec sidecar like
+  `cstr/qwen3-tts-tokenizer-12hz-GGUF` AND the talker GGUF carries speaker
+  encoder tensors; Voice Clone falls back to a clear fail-fast error with
+  a GAPS.md pointer when the speech encoder is absent)
 - 🟡 parse + run, partial elsewhere: **2** (MOSS dialogue / voice_design
   — codec wired but mode-specific surface partial)
-- ❌ not implemented, achievable without new weights: **3** (ACE-Step
-  cover / repaint / completion — all need the DiT to accept an extra
-  conditioning signal beyond text)
+- ❌ not implemented, achievable without new weights: **0** — all closed
 - ❌ not implemented, separate model: **2** (ACE-Step stem extraction,
   layering — blocked on a new Demucs-class / stem-assembler family)
 - ✅ per-frame streaming: **2** (MOSS realtime + Qwen3-TTS streaming —
@@ -310,20 +312,16 @@ families, after Stages 9–19:
 Stage 9 closed the entire IaC bucket. Stages 10–12 flipped six
 modes from ❌ to 🟡 (Qwen3-TTS voice_design, MOSS dialogue, MOSS
 voice_design, MOSS/Qwen3-TTS realtime/streaming — the last via the
-transport scaffold). Stage 13 added explicit `mode` parsing to ACE-Step
-so the unimplemented modes fail fast with a GAPS.md pointer instead of
-silently running text-to-music. **Stage 15 identified production-quality
-GGML reference implementations (Apache-2.0 + MIT) for both blocked
-codecs, plus pre-built GGUFs that skip the converter step entirely.
-Stage 16 ported the MOSS-Audio-Tokenizer; Stage 17 ports the
-Qwen3-TTS-Tokenizer-12Hz. Stages 18–19 added per-frame streaming for both
-MOSS and Qwen3-TTS.**
+transport scaffold). Stage 13 added explicit `mode` parsing to ACE-Step.
+**Stage 15 identified production-quality GGML reference implementations
+(Apache-2.0 + MIT) for both blocked codecs, plus pre-built GGUFs that
+skip the converter step entirely. Stage 16 ported the MOSS-Audio-Tokenizer;
+Stage 17 ports the Qwen3-TTS-Tokenizer-12Hz. Stages 18–19 added per-frame
+streaming for both MOSS and Qwen3-TTS.**
 
-The remaining work is concentrated in the following places:
+The remaining work is concentrated in the following place:
 
-1. **DiT conditioning extension** — ACE-Step cover / repaint / completion.
-   Graph-level change in `dit_runner.cpp`, no new weights. Medium effort.
-2. **Full ICL prefill builder** — Voice Clone now supports the xvec_only
+1. **Full ICL prefill builder** — Voice Clone now supports the xvec_only
    ICL path (Stage 18: ref-text phonetic context via text_proj). The full
    ICL (in-context learning) path with ref-codes pairs the embedding with
    both ref-text AND ref-codes for improved clone fidelity, as CrispASR's
