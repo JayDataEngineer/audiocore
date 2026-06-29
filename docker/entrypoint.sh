@@ -17,10 +17,38 @@
 #
 # AUDIOCORE_ALLOW_EMPTY is tolerated for backwards compat but no longer
 # required — the default config is always safe to seed.
+#
+# Opt-in model pre-pull: set AUDIOCORE_PREPULL=1 to run fetch_models.sh from
+# the entrypoint before the server boots. Honors AUDIOCORE_MODELS_DIR for
+# the destination folder, AUDIOCORE_PREPULL_FAMILY / _VARIANT to filter,
+# and HF_TOKEN for gated repos. Requires /models to be mounted WITHOUT
+# :ro so the audiocore user can write to it.
 set -euo pipefail
 
 CONFIG="${AUDIOCORE_CONFIG:-/etc/audiocore/server.json}"
 DEFAULT="/etc/audiocore/server.json.default"
+FETCH_SCRIPT="/opt/audiocore/scripts/fetch_models.sh"
+
+# ── Optional pre-pull ────────────────────────────────────────────────────
+# Run before config seeding so /models (or wherever AUDIOCORE_MODELS_DIR
+# points) is populated by the time the server boots and auto-discovers.
+if [[ "${AUDIOCORE_PREPULL:-0}" == "1" ]]; then
+    export AUDIOCORE_MODELS_DIR="${AUDIOCORE_MODELS_DIR:-/models}"
+    args=()
+    [[ -n "${AUDIOCORE_PREPULL_FAMILY:-}" ]]  && args+=("$AUDIOCORE_PREPULL_FAMILY")
+    [[ -n "${AUDIOCORE_PREPULL_VARIANT:-}" ]] && args+=("$AUDIOCORE_PREPULL_VARIANT")
+    echo "entrypoint: AUDIOCORE_PREPULL=1 — fetching into ${AUDIOCORE_MODELS_DIR}" >&2
+    [[ -n "${HF_TOKEN:-}" ]] && echo "                                    (HF_TOKEN is set)" >&2
+    [[ ${#args[@]} -gt 0 ]]  && echo "                                    (filter: ${args[*]})" >&2
+    if [[ ! -x "${FETCH_SCRIPT}" ]]; then
+        echo "entrypoint: ${FETCH_SCRIPT} missing or not executable — cannot prepull" >&2
+        exit 2
+    fi
+    if ! "${FETCH_SCRIPT}" "${args[@]}"; then
+        echo "entrypoint: fetch_models.sh failed — refusing to start server" >&2
+        exit 2
+    fi
+fi
 
 if [[ ! -f "${CONFIG}" ]]; then
     # The shipped default config sets "model_dir": "/models" and "models": [],

@@ -70,6 +70,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
         ca-certificates \
         curl \
+        jq \
+        git \
         tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10000 audiocore \
@@ -92,7 +94,11 @@ COPY --from=builder /src/build/bin/lib*.so* /opt/audiocore/lib/
 # Entrypoint + container-friendly default config.
 COPY docker/entrypoint.sh        /opt/audiocore/bin/entrypoint.sh
 COPY docker/server.example.json  /etc/audiocore/server.json.default
-RUN  chmod +x /opt/audiocore/bin/entrypoint.sh \
+# Model-fetch utilities (opt-in via AUDIOCORE_PREPULL=1). fetch_models.sh is
+# pure bash + curl + jq + git; manifest records repo / sha256 / converter.
+COPY scripts/fetch_models.sh     /opt/audiocore/scripts/fetch_models.sh
+COPY models/manifest.json        /opt/audiocore/models/manifest.json
+RUN  chmod +x /opt/audiocore/bin/entrypoint.sh /opt/audiocore/scripts/fetch_models.sh \
     && mkdir -p /etc/audiocore /models /var/lib/audiocore \
     && chown -R audiocore:audiocore /opt/audiocore /etc/audiocore /models /var/lib/audiocore
 
@@ -100,7 +106,8 @@ ENV LD_LIBRARY_PATH=/opt/audiocore/lib \
     PATH=/opt/audiocore/bin:${PATH} \
     AUDIOCORE_HOST=0.0.0.0 \
     AUDIOCORE_PORT=8080 \
-    AUDIOCORE_CONFIG=/etc/audiocore/server.json
+    AUDIOCORE_CONFIG=/etc/audiocore/server.json \
+    AUDIOCORE_BUILD_DIR=/opt/audiocore/bin
 
 USER audiocore
 WORKDIR /var/lib/audiocore
