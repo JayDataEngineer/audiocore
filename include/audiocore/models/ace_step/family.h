@@ -57,17 +57,19 @@ struct MusicRequest {
     int32_t     n_diffusion_steps = 0;  // 0 → variant default (turbo=8, sft=50)
     float       temperature  = 0.0f;   // LM sampling temp (0=argmax, >0=stochastic)
     float       top_p        = 1.0f;   // LM nucleus sampling threshold
+    // ── Repaint / completion conditioning ─────────────────────────────────
+    std::vector<float> input_audio;    // stereo PCM interleaved at 48kHz
+    float              mask_start = 0.0f;  // normalized position [0,1)
+    float              mask_end   = 1.0f;  // normalized position (0,1]
     // ── Mode selection ────────────────────────────────────────────────────
-    // ACE-Step upstream advertises six modes (see GAPS.md §3.2). Only
-    // text-to-music runs the full pipeline today; the rest fail fast with
-    // a pointer at GAPS.md so callers know it's a known gap, not a bug.
-    //   "text_to_music" (default / empty) — full pipeline runs
-    //   "cover"           — DiT needs target-voice conditioning (TODO)
-    //   "repaint"         — DiT needs mask + partial-latent (TODO)
-    //   "stem"            — separate model entirely (BLOCKED)
-    //   "lego"            — separate stem-assembler entirely (BLOCKED)
-    //   "completion"      — DiT needs partial-song conditioning (TODO)
+    //   "text_to_music" (default) — full pipeline from text only
+    //   "repaint"  — regenerate region [mask_start, mask_end) of input_audio
+    //   "completion" — extend/generate end portion of input_audio
+    //   "cover"   — DiT needs target-voice conditioning (TODO, fail-fast)
+    //   "stem"    — separate model entirely (BLOCKED)
+    //   "lego"    — separate stem-assembler entirely (BLOCKED)
     std::string mode = "text_to_music";
+    std::string response_format = "wav"; // "wav" | "mp3"
 };
 
 struct MusicResponse {
@@ -138,6 +140,9 @@ private:
     std::vector<float> te_uncond_;     // null-text TE hidden (for CFG)
     int32_t            te_cond_len_ = 0;   // T_text
     int32_t            fsq_code_offset_ = 0;  // base offset for audio code tokens in LM vocab
+
+    // For repaint/completion: VAE-encoded input audio latent [T, 64]
+    std::vector<float> repaint_latent_cond_;
 };
 
 }  // namespace audiocore::acestep

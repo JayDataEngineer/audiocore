@@ -7,12 +7,35 @@
 //   Code Predictor MTP loop (31 fine codebooks) ─→
 //   [32 × T] code matrix ─→ Speech Tokenizer ─→ PCM audio
 //
+// Stage 17 update: the codec decode step at the tail now runs the
+// Qwen3-TTS-Tokenizer-12Hz ggml port when the codec GGUF was discovered at
+// load time. The 32-codebook talker+predictor matrix is sliced to the first
+// 16 codebooks (the 12Hz codec's n_q) before decode. Silence fallback
+// retained for codec-less configurations (GAPS.md §2.3).
+//
+// Stage 17b update: Voice Clone mode now runs the ECAPA-TDNN speaker encoder
+// (Qwen3TtsSpeakerEncoder) when the speaker encoder was loaded from the talker
+// GGUF. The computed speaker embedding is injected into the codec bridge at the
+// speaker-position slot (analogous to how speaker_name works for CustomVoice),
+// enabling voice cloning from a reference WAV file. Setups without the speaker
+// encoder still fail fast with a GAPS.md pointer.
+//
+// Stage 18 update: ICL prefill (xvec_only) — when `reference_text` is provided
+// in Voice Clone mode, the reference text tokens are embedded via text_proj and
+// inserted between the speaker slot and codec_bos. This gives the talker
+// phonetic context about the reference voice during the prefill, improving
+// clone fidelity. No ref-codes are used (codec encoder not required). The
+// prefill layout becomes:
+//   [syn_text_emb + codec_pad] [spk_emb] [ref_text_emb + codec_pad] [codec_bos]
+// Full ICL with ref-codes remains a follow-up (CODEC_PORTS.md §4.9).
+//
 // Both transformers (talker + predictor) run through the unified
 // qwen3::Runner — the same class MOSS and ACE-Step use. There is no longer
 // a separate TalkerRunner or PredictorRunner in audiocore.
 
 #include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/models/qwen3/runner.h"
+#include "audiocore/framework/io/gguf_reader.h"   // Stage 17: full type for unique_ptr<GgufReader> dtor
 #include "audiocore/framework/sampling/sampler.h"
 
 #include <algorithm>
@@ -110,20 +133,48 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     // ── Mode routing ──────────────────────────────────────────────────────
     //
     // qwen3_tts understands four modes from the unified TtsRequest.mode
-    // field. voice_clone + streaming are NOT implemented and fail fast with
-    // a pointer at GAPS.md so callers know it's a known gap, not a bug.
+    // field. streaming is NOT implemented and fails fast with a pointer at
+    // GAPS.md. voice_clone requires the ECAPA-TDNN speaker encoder (Stage
+    // 17b); when present we compute the embedding from reference_audio and
+    // inject it into the codec bridge.
     const Qwen3TtsMode mode = parse_mode(req.mode);
-    if (mode == Qwen3TtsMode::VoiceClone) {
-        if (error) *error =
-            "qwen3_tts voice_clone requires the ECAPA-TDNN speaker encoder "
-            "(not yet ported to ggml). See GAPS.md §2.3 for the port plan.";
-        return false;
-    }
     if (mode == Qwen3TtsMode::Streaming) {
         if (error) *error =
             "qwen3_tts streaming requires chunked HTTP + Dual-Track "
             "incremental decode (not implemented). See GAPS.md §2.2.";
         return false;
+    }
+
+    // For Voice Clone mode, compute the ECAPA speaker embedding from the
+    // reference WAV before building the prefill. We store the result in a
+    // local so Phase 1 can inject it at the speaker-position slot.
+    std::vector<float> vc_spk_emb;
+    if (mode == Qwen3TtsMode::VoiceClone) {
+        if (!config_.speaker_present) {
+            if (error) *error =
+                "qwen3_tts voice_clone requires the ECAPA-TDNN speaker encoder "
+                "(GGUF lacks `speaker.*` tensors). See GAPS.md §2.3.";
+            return false;
+        }
+        if (req.reference_audio.empty()) {
+            if (error) *error = "voice_clone requires reference_audio path";
+            return false;
+        }
+        std::fprintf(stderr, "qwen3_tts: voice clone: computing ECAPA embedding from %s\n",
+                     req.reference_audio.c_str());
+        vc_spk_emb = speaker_encoder_.compute_embedding(req.reference_audio);
+        if (vc_spk_emb.empty()) {
+            if (error) *error = "voice_clone: speaker encoder failed on reference audio";
+            return false;
+        }
+        const int d = talker_->n_embd();
+        if ((int)vc_spk_emb.size() != d) {
+            std::fprintf(stderr, "qwen3_tts: voice clone: spk_emb dim %zu != d_model %d; "
+                                 "padding to match\n", vc_spk_emb.size(), d);
+            vc_spk_emb.resize((size_t)d, 0.0f);
+        }
+        std::fprintf(stderr, "qwen3_tts: voice clone: ECAPA embedding computed (%zu dims)\n",
+                     vc_spk_emb.size());
     }
 
     // Voice Design mode: the instruct field carries the voice description.
@@ -220,13 +271,29 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         n_text_tokens = (int32_t)text_tokens.size();
     }
 
+    // ── ICL prefill: reference text embedding for Voice Clone ─────────────
+    std::vector<float> ref_text_embd;
+    int32_t n_ref_tokens = 0;
+    bool has_ref_text = false;
+    if (mode == Qwen3TtsMode::VoiceClone && !req.reference_text.empty()) {
+        has_ref_text = true;
+        if (!talker_->compute_text_embedding(req.reference_text, &ref_text_embd,
+                                              &n_ref_tokens, error)) {
+            return false;
+        }
+        std::fprintf(stderr, "qwen3_tts: ICL prefill: %d ref text tokens\n", n_ref_tokens);
+    }
+
     // Build codec prefix sequence.
-    //   [codec_pad × n_text_tokens] + [speaker_token?] + [codec_bos]
-    // The optional speaker_token slot only appears when the request names
-    // a known default speaker (CustomVoice variant) — that injects the
-    // "<|spk_NAME|>" codec token Qwen3-TTS uses to switch voice profile.
-    const bool has_speaker = (speaker_token >= 0);
-    const int32_t prefix_len = n_text_tokens + (has_speaker ? 1 : 0) + 1;
+    //   [codec_pad × n_text_tokens] + [speaker_token? / vc_embedding?] + [codec_bos]
+    // The optional speaker_token slot appears when the request names a known
+    // default speaker (CustomVoice variant). Voice Clone mode replaces this
+    // slot with the ECAPA speaker embedding (compute above in mode routing).
+    // They are mutually exclusive — Voice Clone ignores speaker_name.
+    const bool has_speaker   = (speaker_token >= 0);
+    const bool has_vc_spk    = !vc_spk_emb.empty();
+    const bool has_spk_slot  = has_speaker || has_vc_spk;
+    const int32_t prefix_len = n_text_tokens + (has_spk_slot ? 1 : 0) + (has_ref_text ? n_ref_tokens : 0) + 1;
 
     std::vector<float> codec_prefix((size_t)prefix_len * n_embd, 0.0f);
 
@@ -238,9 +305,17 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                         (size_t)n_embd * sizeof(float));
         }
         int32_t cursor = n_text_tokens;
-        // Optional speaker slot (CustomVoice variant): one codec token row.
-        if (has_speaker) {
-            if (speaker_token < talker_->codec_vocab()) {
+        // Optional speaker slot: CustomVoice speaker token OR Voice Clone
+        // ECAPA embedding (mutually exclusive — Voice Clone mode does not
+        // use speaker_name).
+        if (has_spk_slot) {
+            if (has_vc_spk) {
+                // Voice Clone: inject the ECAPA-computed speaker embedding
+                // directly into the codec bridge at the speaker position.
+                std::memcpy(&codec_prefix[(size_t)cursor * n_embd],
+                            vc_spk_emb.data(),
+                            (size_t)n_embd * sizeof(float));
+            } else if (speaker_token < talker_->codec_vocab()) {
                 const float* spk_row =
                     talker_->codec_embedding() + (size_t)speaker_token * n_embd;
                 std::memcpy(&codec_prefix[(size_t)cursor * n_embd], spk_row,
@@ -253,6 +328,15 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
             }
             cursor += 1;
         }
+        // codec_pad for reference text (ICL prefill, Voice Clone only)
+        if (has_ref_text) {
+            for (int32_t i = 0; i < n_ref_tokens; i++) {
+                const float* pad_row = talker_->codec_embedding() + (size_t)CODEC_PAD * n_embd;
+                std::memcpy(&codec_prefix[(size_t)cursor * n_embd], pad_row,
+                            (size_t)n_embd * sizeof(float));
+                cursor += 1;
+            }
+        }
         // codec_bos for the final position.
         const float* bos_row = talker_->codec_embedding() + (size_t)CODEC_BOS * n_embd;
         std::memcpy(&codec_prefix[(size_t)cursor * n_embd], bos_row,
@@ -262,27 +346,44 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     }
 
     // Sum text embeddings + codec prefix
-    // Positions 0..n_text_tokens-1: text_emb + codec_pad_emb
-    // Position n_text_tokens: 0 + codec_bos_emb
+    // Layout (no ICL):         [syn_text_emb + codec_pad × L_syn] [spk_emb] [codec_bos]
+    // Layout (with ICL):       [syn_text_emb + codec_pad × L_syn] [spk_emb] [ref_text_emb + codec_pad × L_ref] [codec_bos]
     std::vector<float> talker_input((size_t)prefix_len * n_embd);
 
     if (talker_->has_text_embedding() && !text_embd.empty()) {
+        // Synthesis text positions: text_emb + codec_pad
         for (int32_t i = 0; i < n_text_tokens; i++) {
             for (int32_t j = 0; j < n_embd; j++) {
                 size_t idx = (size_t)i * n_embd + j;
                 talker_input[idx] = text_embd[idx] + codec_prefix[idx];
             }
         }
+        // Speaker slot (at n_text_tokens): codec_prefix has spk_emb or speaker_row
+        if (has_spk_slot) {
+            std::memcpy(&talker_input[(size_t)n_text_tokens * n_embd],
+                        &codec_prefix[(size_t)n_text_tokens * n_embd],
+                        (size_t)n_embd * sizeof(float));
+        }
+        // Reference text positions (ICL prefill): ref_text_emb + codec_pad
+        if (has_ref_text) {
+            const size_t ref_offset = (size_t)(n_text_tokens + (has_spk_slot ? 1 : 0)) * n_embd;
+            for (int32_t i = 0; i < n_ref_tokens; i++) {
+                for (int32_t j = 0; j < n_embd; j++) {
+                    size_t idx = ref_offset + (size_t)i * n_embd + j;
+                    talker_input[idx] = ref_text_embd[(size_t)i * n_embd + j] + codec_prefix[idx];
+                }
+            }
+        }
+        // codec_bos is already at its position in codec_prefix; copy it over
+        // (it lives at the last position, which the initial zero-init leaves unset).
+        const size_t bos_pos = (size_t)(prefix_len - 1) * n_embd;
+        std::memcpy(&talker_input[bos_pos], &codec_prefix[bos_pos],
+                    (size_t)n_embd * sizeof(float));
     } else {
         // Lunavox fallback: zero text embedding, just codec prefix
         std::memcpy(talker_input.data(), codec_prefix.data(),
                     (size_t)prefix_len * n_embd * sizeof(float));
     }
-
-    // Copy codec_bos position (position n_text_tokens)
-    std::memcpy(&talker_input[(size_t)n_text_tokens * n_embd],
-                &codec_prefix[(size_t)n_text_tokens * n_embd],
-                (size_t)n_embd * sizeof(float));
 
     // ═══════════════════════════════════════════════════════════════════
     //  Phase 2: Talker forward pass (prefill)
@@ -482,16 +583,62 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
 
     std::fprintf(stderr, "qwen3_tts: %d frames generated\n", n_frames);
 
-    // ── Codec decode → PCM ─────────────────────────────────────────────────
-    // The ONNX speech tokenizer has been removed from audiocore. Codec
-    // decode will be a ggml port of the speech-tokenizer graph that reads
-    // its weights from the talker GGUF. Until that port lands we emit a
-    // 1-second silence buffer so the rest of the pipeline stays exercisable.
-    std::fprintf(stderr, "qwen3_tts: codec->PCM decoder not wired "
-                         "(ggml speech-tokenizer port pending); emitting silence\n");
-    resp.pcm_mono.assign(24000, 0.0f);
-    resp.sampling_rate = 24000;
-    return true;
+    // ── Codec decode → PCM (Stage 17) ─────────────────────────────────────
+    // When the Qwen3-TTS-Tokenizer-12Hz codec GGUF was discovered at load
+    // time, run the real ggml decode graph. Otherwise emit 1 s of silence
+    // (GAPS.md §2.3 — pre-Stage-17 behavior).
+    //
+    // Codec/talker codebook count match-up: the talker + predictor emit a
+    // 32-codebook matrix (QwenLM/Qwen3-TTS original architecture), but the
+    // 12Hz codec consumes only the first `codec_graphs_.hp.n_q` codebooks
+    // (typically 16). We pack the first codec_n_q codebooks × n_frames
+    // columns into a contiguous row-major buffer before calling decode().
+    // A misconfigured setup where the codec wants MORE codebooks than the
+    // talker produces falls back to silence rather than crashing.
+    if (!config_.codec_present || !codec_graphs_.is_present()) {
+        std::fprintf(stderr, "qwen3_tts: codec not bound (no codec GGUF "
+                             "discovered); emitting silence\n");
+        resp.pcm_mono.assign(24000, 0.0f);
+        resp.sampling_rate = 24000;
+        return true;
+    }
+
+    const int32_t codec_n_q = (int32_t)codec_graphs_.hp.n_q;
+    if (codec_n_q > n_total_books) {
+        std::fprintf(stderr, "qwen3_tts: codec expects %d codebooks but "
+                             "talker+predictor only produce %d; emitting silence\n",
+                     codec_n_q, n_total_books);
+        resp.pcm_mono.assign(24000, 0.0f);
+        resp.sampling_rate = 24000;
+        return true;
+    }
+
+    // Pack (codec_n_q, n_frames) row-major out of the (n_total_books, max_steps)
+    // matrix. code_matrix is indexed [cb * max_steps + step] so we walk the
+    // first codec_n_q rows and pick the first n_frames columns.
+    std::vector<int32_t> codec_codes((size_t)codec_n_q * (size_t)n_frames);
+    for (int32_t cb = 0; cb < codec_n_q; ++cb) {
+        for (int32_t t = 0; t < n_frames; ++t) {
+            codec_codes[(size_t)cb * n_frames + t] =
+                code_matrix[(size_t)cb * max_steps + t];
+        }
+    }
+
+    try {
+        resp.pcm_mono = codec_graphs_.decode(codec_codes.data(),
+                                              codec_n_q, n_frames);
+        resp.sampling_rate = 24000;
+        std::fprintf(stderr, "qwen3_tts: codec decode ok (%zu samples, %.2fs)\n",
+                     resp.pcm_mono.size(),
+                     double(resp.pcm_mono.size()) / 24000.0);
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "qwen3_tts: codec decode failed (%s); "
+                             "emitting silence\n", e.what());
+        resp.pcm_mono.assign(24000, 0.0f);
+        resp.sampling_rate = 24000;
+        return true;
+    }
 }
 
 // ── run_tts ─────────────────────────────────────────────────────────────

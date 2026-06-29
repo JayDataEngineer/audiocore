@@ -9,9 +9,16 @@
 //      separate codec_embedding tables + 31 lm_heads. Generates fine codebooks
 //      1-31 via MTP-style autoregressive sub-steps.
 //   3. Speaker Encoder (ECAPA-TDNN) — extracts speaker embedding from
-//      reference audio. (Future GGUF port; ONNX version removed.)
-//   4. Speech Tokenizer — decodes [32 × T] code matrix to waveform.
-//      (Future ggml port; ONNX version removed.)
+//      reference audio. (Stage 17b: ggml port wired — `Qwen3TtsSpeakerEncoder`
+//      in speaker_encoder.h, adapted from CrispStrobe/CrispASR's ECAPA-TDNN
+//      section. Loads `speaker.*` tensors from the talker GGUF. Unblocks
+//      Voice Clone mode.)
+//   4. Speech Tokenizer — decodes [16 × T] code matrix to waveform.
+//      (Stage 17: ggml port wired — `Qwen3TtsCodecGraphs` in codec.h,
+//      adapted from CrispStrobe/CrispASR's qwen3_tts.cpp codec section.
+//      Auto-activates when the codec sidecar GGUF is discovered. Stage 17b
+//      wires the ECAPA-TDNN speaker encoder — `Qwen3TtsSpeakerEncoder` in
+//      speaker_encoder.h — loaded from the talker GGUF's `speaker.*` tensors.)
 //
 // Official weights: QwenLM/Qwen3-TTS on HuggingFace.
 // Use tools/convert_qwen3tts (C++) to produce GGUFs from safetensors.
@@ -35,6 +42,13 @@
 #include "audiocore/framework/core/session.h"
 #include "audiocore/framework/runtime/tasks.h"    // TtsRequest / TtsResponse
 #include "audiocore/models/qwen3/runner.h"
+#include "audiocore/models/qwen3_tts/codec.h"     // Stage 17: Qwen3TtsCodecGraphs
+#include "audiocore/models/qwen3_tts/speaker_encoder.h"  // Stage 17b: Qwen3TtsSpeakerEncoder
+
+// Forward decl — full GgufReader brings sys/mman.h into the TU; family.h is
+// included widely enough that we keep it opaque here. The loader.cpp TU sees
+// the full definition and owns the reader instance.
+namespace audiocore { class GgufReader; struct TensorStorage; }
 
 namespace audiocore::qwen3_tts {
 
@@ -64,7 +78,8 @@ enum class Qwen3TtsVariant {
 // Per-request mode, mirroring Qwen3-TTS's five user-facing modes. Comes from
 // the unified TtsRequest.mode field. The default ("tts") works on every
 // variant. "voice_design" is intended for the VoiceDesign variant;
-// "voice_clone" is rejected up-front until the ECAPA-TDNN port lands.
+// "voice_clone" runs the ECAPA-TDNN speaker encoder (Stage 17b) when the
+// speaker encoder is loaded; falls back to a fail-fast error otherwise.
 enum class Qwen3TtsMode {
     TtsBatch = 0,    // default plain batch TTS (also covers instruct style)
     VoiceDesign,     // describe a voice → generate with that voice
@@ -75,6 +90,9 @@ enum class Qwen3TtsMode {
 struct Qwen3TtsConfig {
     std::string talker_path;          // Path to talker GGUF
     std::string predictor_path;       // Path to predictor GGUF
+    std::string codec_path;           // Stage 17: path to codec GGUF
+                                       // (cstr/qwen3-tts-tokenizer-12hz-GGUF);
+                                       // empty if no codec sidecar found.
     int  n_codebooks        = 32;
     int  n_ctx_talker       = 8192;
     int  n_ctx_predictor    = 4096;
@@ -87,6 +105,14 @@ struct Qwen3TtsConfig {
     // Populated from extras["model_size_b"] when known (1.7 or 0.6). Used
     // only for logging / future size-aware defaults. Zero = unknown.
     float model_size_b      = 0.0f;
+    // Stage 17: true once the codec GGUF was discovered, opened, and
+    // Qwen3TtsCodecGraphs::bind() succeeded. Drives the run_inference
+    // Phase 4 branch: bound → real codec decode; unbound → silence fallback.
+    bool codec_present      = false;
+    // Stage 17b: true once the ECAPA-TDNN speaker encoder was loaded from
+    // the talker GGUF. Drives the Voice Clone branch in run_inference:
+    // bound → real ECAPA embedding; unbound → fail-fast with GAPS.md pointer.
+    bool speaker_present    = false;
 };
 
 // Parse a mode string ("tts" | "voice_design" | "voice_clone" | "streaming")
@@ -131,6 +157,25 @@ private:
     std::unique_ptr<qwen3::Runner> talker_;     // qwen3tts backbone + dual-embedding extras
     std::unique_ptr<qwen3::Runner> predictor_;  // qwen3tts_cp + MTP extras
     Qwen3TtsConfig config_;
+
+    // Stage 17: codec graphs + the GGUF reader that owns the mmap'd codec
+    // weight bytes. The reader must outlive codec_graphs_ — order matters in
+    // the destructor (codec_graphs_' tensors alias the reader's mmap).
+    // backend_ matches the device the talker chose so codec + talker share
+    // VRAM rather than round-tripping through host RAM.
+    std::unique_ptr<GgufReader>     codec_reader_;
+    std::unique_ptr<Backend>        codec_backend_;
+    Qwen3TtsCodecGraphs             codec_graphs_;
+
+    // Stage 17b: ECAPA-TDNN speaker encoder. The speaker.* tensors live in
+    // the talker GGUF, not a separate file — we open a separate GgufReader
+    // on the same file to load them (llama.cpp skips unrecognized tensor
+    // names). The reader must outlive speaker_encoder_ (same dtor ordering).
+    // speaker_backend_ shares the talker's device so weight tensors live
+    // in VRAM alongside the talker/predictor.
+    std::unique_ptr<GgufReader>         speaker_reader_;
+    std::unique_ptr<Backend>            speaker_backend_;
+    Qwen3TtsSpeakerEncoder              speaker_encoder_;
 
     bool run_inference(const TtsRequest& req, TtsResponse& resp,
                        std::string* error);

@@ -52,6 +52,23 @@ static const BlockCfg kBlocks[5] = {
     { 128,  128,  2,  4, 1},
 };
 
+// Encoder block config (mirror of decoder, ResUnit at in_ch before strided conv)
+struct EncBlockCfg {
+    int32_t channel;   // ResUnit + snake operate at this channel count
+    int32_t out_ch;    // after strided conv
+    int32_t stride;
+    int32_t kernel;    // stride × 2
+    int32_t padding;   // stride / 2
+};
+
+static const EncBlockCfg kEncBlocks[5] = {
+    {128,  128,  2,  4, 1},
+    {128,  256,  4,  8, 2},
+    {256,  512,  4,  8, 2},
+    {512,  1024, 6, 12, 3},
+    {1024, 2048, 10, 20, 5},
+};
+
 static const int32_t kResDilations[3] = {1, 3, 9};
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -448,6 +465,235 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
     pcm->resize(static_cast<size_t>(T_audio) * 2);
     memcpy(pcm->data(), audio.data(),
            static_cast<size_t>(T_audio) * 2 * sizeof(float));
+
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  VAE Encoder: stereo PCM [T, 2] → latent [T/1920, 64]
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The encoder is the mirror of the decoder:
+//   conv1(k=7,s=1,p=3):         [T, 2]     → [T, 128]
+//   block 0: 3×ResUnit(128) → Snake → StridedConv(s=2)  → [T/2,   128]
+//   block 1: 3×ResUnit(128) → Snake → StridedConv(s=4)  → [T/8,   256]
+//   block 2: 3×ResUnit(256) → Snake → StridedConv(s=4)  → [T/32,  512]
+//   block 3: 3×ResUnit(512) → Snake → StridedConv(s=6)  → [T/192, 1024]
+//   block 4: 3×ResUnit(1024)→ Snake → StridedConv(s=10) → [T/1920,2048]
+//   snake → conv2(k=3,s=1,p=1): [T/1920,2048] → [T/1920,128]
+//   extract mean: channels 0..63 → [T/1920, 64]
+//
+// Total downsample: 2×4×4×6×10 = 1920× (mirrors decoder upsample).
+// Tensor names: encoder.* (bound in ext_ctx_ as vae.encoder.*).
+
+bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
+                        std::vector<float>* latents, std::string* error) {
+    if (!ext_ctx_ || n_samples <= 0) {
+        if (error) *error = "VAE encode: invalid state";
+        return false;
+    }
+
+    // ── Shared scratch buffer (256 MB) ─────────────────────────────────────
+    const size_t buf_size = 256u * 1024u * 1024u;
+    std::vector<char> buf(buf_size);
+
+    // ── conv1: [T, 2] → [T, 128] (k=7, s=1, p=3) ─────────────────────────
+    ggml_tensor* c1w = weight("vae.encoder.conv1");
+    ggml_tensor* c1b = weight("vae.encoder.conv1_bias");
+    if (!c1w) {
+        if (error) *error = "VAE encode: missing vae.encoder.conv1";
+        return false;
+    }
+
+    std::vector<float> cur;
+    int32_t T = n_samples;
+    int32_t C = 2;
+    {
+        std::vector<float> out;
+        int32_t T_out = 0;
+        if (!op_conv1d(pcm_stereo, T, 2, 128,
+                        c1w, c1b, 1, 3, 1,
+                        &out, &T_out, buf.data(), buf_size))
+            return false;
+        cur = std::move(out);
+        T = T_out;
+        C = 128;
+    }
+
+    // ── 5 encoder blocks ───────────────────────────────────────────────────
+    for (int b = 0; b < 5; b++) {
+        const auto& bc = kEncBlocks[b];
+        std::string pfx = "vae.encoder.block." + std::to_string(b) + ".";
+
+        // Load block weights
+        struct EncResData {
+            std::vector<float> s1a, s1b;
+            ggml_tensor* c1w = nullptr, * c1b = nullptr;
+            std::vector<float> s2a, s2b;
+            ggml_tensor* c2w = nullptr, * c2b = nullptr;
+        };
+        EncResData ru[3];
+
+        // Load snake params for block
+        std::vector<float> blk_sa, blk_sb;
+        {
+            ggml_tensor* at = weight((pfx + "snake1.alpha").c_str());
+            ggml_tensor* bt = weight((pfx + "snake1.beta").c_str());
+            if (!at || !bt) {
+                if (error) *error = "VAE encode: missing " + pfx + "snake1";
+                return false;
+            }
+            size_t nch = static_cast<size_t>(bc.channel);
+            const float* ad = static_cast<const float*>(at->data);
+            const float* bd = static_cast<const float*>(bt->data);
+            blk_sa.assign(ad, ad + nch);
+            blk_sb.assign(bd, bd + nch);
+        }
+
+        // Strided conv weight
+        ggml_tensor* conv_w = weight((pfx + "conv1").c_str());
+        ggml_tensor* conv_b = weight((pfx + "conv1_bias").c_str());
+        if (!conv_w) {
+            if (error) *error = "VAE encode: missing " + pfx + "conv1";
+            return false;
+        }
+
+        // 3× ResUnit weights
+        for (int r = 0; r < 3; r++) {
+            std::string rp = pfx + "res_unit" + std::to_string(r + 1) + ".";
+            int32_t ch = bc.channel;
+
+            ggml_tensor* s1a = weight((rp + "snake1.alpha").c_str());
+            ggml_tensor* s1b = weight((rp + "snake1.beta").c_str());
+            if (!s1a || !s1b) {
+                if (error) *error = "VAE encode: missing " + rp + "snake1";
+                return false;
+            }
+            {
+                const float* d = static_cast<const float*>(s1a->data);
+                ru[r].s1a.assign(d, d + ch);
+                d = static_cast<const float*>(s1b->data);
+                ru[r].s1b.assign(d, d + ch);
+            }
+
+            ru[r].c1w = weight((rp + "conv1").c_str());
+            ru[r].c1b = weight((rp + "conv1_bias").c_str());
+            if (!ru[r].c1w) {
+                if (error) *error = "VAE encode: missing " + rp + "conv1";
+                return false;
+            }
+
+            ggml_tensor* s2a = weight((rp + "snake2.alpha").c_str());
+            ggml_tensor* s2b = weight((rp + "snake2.beta").c_str());
+            if (!s2a || !s2b) {
+                if (error) *error = "VAE encode: missing " + rp + "snake2";
+                return false;
+            }
+            {
+                const float* d = static_cast<const float*>(s2a->data);
+                ru[r].s2a.assign(d, d + ch);
+                d = static_cast<const float*>(s2b->data);
+                ru[r].s2b.assign(d, d + ch);
+            }
+
+            ru[r].c2w = weight((rp + "conv2").c_str());
+            ru[r].c2b = weight((rp + "conv2_bias").c_str());
+            if (!ru[r].c2w) {
+                if (error) *error = "VAE encode: missing " + rp + "conv2";
+                return false;
+            }
+        }
+
+        // ── Block forward ──────────────────────────────────────────────────
+
+        // 2a. 3× ResUnit (at bc.channel)
+        const float* in = cur.data();
+        int32_t T_in = T;
+        for (int r = 0; r < 3; r++) {
+            std::vector<float> h;
+            if (!op_resunit(in, T_in, bc.channel,
+                            ru[r].s1a.data(), ru[r].s1b.data(),
+                            ru[r].c1w, ru[r].c1b, kResDilations[r],
+                            ru[r].s2a.data(), ru[r].s2b.data(),
+                            ru[r].c2w, ru[r].c2b,
+                            &h, buf.data(), buf_size))
+                return false;
+            in = h.data();
+            T_in = static_cast<int32_t>(h.size() / bc.channel);
+        }
+
+        // 2b. Snake (at bc.channel)
+        std::vector<float> after_snake;
+        if (!op_snake(in, T_in, bc.channel,
+                       blk_sa.data(), blk_sb.data(),
+                       &after_snake, buf.data(), buf_size))
+            return false;
+
+        // 2c. Strided conv1d: bc.channel → bc.out_ch
+        std::vector<float> after_conv;
+        int32_t T_conv = 0;
+        if (!op_conv1d(after_snake.data(), T_in, bc.channel, bc.out_ch,
+                        conv_w, conv_b, bc.stride, bc.padding, 1,
+                        &after_conv, &T_conv, buf.data(), buf_size))
+            return false;
+
+        // Copy block output
+        cur.assign(after_conv.data(),
+                   after_conv.data() + static_cast<size_t>(T_conv) * bc.out_ch);
+        T = T_conv;
+        C = bc.out_ch;
+    }
+
+    // cur: [T, 2048] at sample-rate/1920
+
+    // ── Final snake (encoder.snake1.*) ────────────────────────────────────
+    {
+        ggml_tensor* fn_a = weight("vae.encoder.snake1.alpha");
+        ggml_tensor* fn_b = weight("vae.encoder.snake1.beta");
+        if (!fn_a || !fn_b) {
+            if (error) *error = "VAE encode: missing encoder.snake1";
+            return false;
+        }
+        const float* ad = static_cast<const float*>(fn_a->data);
+        const float* bd = static_cast<const float*>(fn_b->data);
+        std::vector<float> fn_exp_a(ad, ad + 2048);
+        std::vector<float> fn_inv_b(bd, bd + 2048);
+
+        std::vector<float> after_fn;
+        if (!op_snake(cur.data(), T, 2048,
+                       fn_exp_a.data(), fn_inv_b.data(),
+                       &after_fn, buf.data(), buf_size))
+            return false;
+        cur = std::move(after_fn);
+    }
+
+    // ── Final conv2: [T, 2048] → [T, 128] (k=3, s=1, p=1) ───────────────
+    std::vector<float> encoded_128;
+    int32_t T_128 = 0;
+    {
+        ggml_tensor* c2w = weight("vae.encoder.conv2");
+        ggml_tensor* c2b = weight("vae.encoder.conv2_bias");
+        if (!c2w) {
+            if (error) *error = "VAE encode: missing vae.encoder.conv2";
+            return false;
+        }
+        if (!op_conv1d(cur.data(), T, 2048, 128,
+                        c2w, c2b, 1, 1, 1,
+                        &encoded_128, &T_128, buf.data(), buf_size))
+            return false;
+    }
+
+    // ── Extract mean: channels 0..63 → [T, 64] time-major ────────────────
+    const int32_t T_latent = T_128;
+    latents->resize(static_cast<size_t>(T_latent) * 64);
+    float* dst = latents->data();
+    const float* src = encoded_128.data();
+    for (int32_t t = 0; t < T_latent; t++) {
+        for (int32_t c = 0; c < 64; c++) {
+            dst[static_cast<size_t>(t) * 64 + c] =
+                src[static_cast<size_t>(t) * 128 + c];
+        }
+    }
 
     return true;
 }

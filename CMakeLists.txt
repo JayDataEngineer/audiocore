@@ -32,6 +32,7 @@ option(ENGINE_ENABLE_OPENMP      "Enable OpenMP"                ON)
 option(ENGINE_ENABLE_LLAMAFILE   "Enable llamafile SGEMM"       ON)
 option(ENGINE_BUILD_CLI          "Build audiocore_cli"          ON)
 option(ENGINE_BUILD_SERVER       "Build audiocore_server"       ON)
+option(ENGINE_ENABLE_MP3        "Enable MP3 output via libmp3lame" ON)
 option(ENGINE_BUILD_TESTS        "Build unit tests"             OFF)
 
 # ── llama.cpp (subtree in third_party/llama.cpp) ─────────────────────────
@@ -80,14 +81,21 @@ add_library(audiocore_framework STATIC
     src/models/ace_step/session.cpp
     src/models/ace_step/dit_runner.cpp
     src/models/ace_step/vae_runner.cpp
-    # Qwen3-TTS (C++ via llama.cpp; codec decode pending ggml port):
+    # Qwen3-TTS (C++ via llama.cpp; Stage 17 codec + Stage 17b speaker encoder from CrispASR/MIT):
     src/models/qwen3_tts/loader.cpp
     src/models/qwen3_tts/session.cpp
+    src/models/qwen3_tts/codec.cpp
+    src/models/qwen3_tts/speaker_encoder.cpp
     # HTTP server factory (routes + WAV encoders). Linked into the
     # audiocore_server binary AND into the e2e HTTP test, so both share the
     # same routing code path.
     src/server/server.cpp
 )
+if(ENGINE_ENABLE_MP3)
+    target_sources(audiocore_framework PRIVATE src/framework/io/mp3_encoder.cpp)
+    target_link_libraries(audiocore_framework PUBLIC mp3lame)
+    target_compile_definitions(audiocore_framework PRIVATE AUDIOCORE_ENABLE_MP3=1)
+endif()
 target_include_directories(audiocore_framework
     PUBLIC
         include

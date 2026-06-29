@@ -8,7 +8,7 @@ is the only implementation language.
 | Model | Family | Capabilities | Status |
 |---|---|---|---|
 | **[MOSS-TTS](https://github.com/pwilkin/openmoss)** (8B) | `moss_tts` | TTS, dialogue (TTSD-style), voice design (VoiceGenerator-equivalent), sound effects, voice cloning | ✅ Stage 16: codec → PCM ported (adapted from `pwilkin/openmoss`, Apache-2.0). 3 of 6 modes wired end-to-end when fed codec-bearing weights (e.g. `smcleed/MOSS-TTS-v1.5-GGUF` sidecar); dialogue/voice_design are best-effort fallbacks for dedicated variants; realtime/streaming fails fast. |
-| **[Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS)** (Talker + MTP Predictor) | `qwen3_tts` | Multilingual TTS, instructable voice design, 9 default speakers (CustomVoice) | 🟡 Talker + predictor wired; variant detection + speaker routing wired; codec → PCM is a silence stub pending a ggml port |
+| **[Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS)** (Talker + MTP Predictor) | `qwen3_tts` | Multilingual TTS, instructable voice design, 9 default speakers (CustomVoice) | ✅ Stage 17b: codec → PCM ported (Stage 17) + ECAPA-TDNN speaker encoder (Stage 17b), both adapted from `CrispStrobe/CrispASR` (MIT). 4 of 5 modes wired end-to-end when fed the codec sidecar GGUF and talker with `speaker.*` tensors; voice_clone fails fast only when the speaker encoder tensors are absent; streaming fails fast. |
 | **[ACE-Step](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF)** (DiT + LM) | `ace_step` | Music generation (text-conditional, lyrics) | ✅ Text-to-Music fully wired end-to-end; 5 other modes fail fast with a pointer at GAPS.md |
 
 Run `audiocore_cli --list-supported` for the live mode matrix, or see
@@ -293,12 +293,12 @@ GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 |---|---|
 | **Source** | [QwenLM/Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS) |
 | **Backbone** | Talker (qwen3tts arch) + Code Predictor (qwen3tts_cp), both via the unified `qwen3::Runner` with `load_extras(ExtraKind::Talker/Predictor)` |
-| **Audio codec** | 16-codebook matrix (1 coarse + 15 MTP fine). Codec-token → PCM decoder is a silence stub pending Stage 17 (ggml port of `CrispStrobe/CrispASR`'s Qwen3-TTS codec, MIT); pre-built GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`. See `docs/CODEC_PORTS.md` §2. |
+| **Audio codec** | 16-codebook matrix (1 coarse + 15 MTP fine). Codec-token → PCM decoder is `Qwen3TtsCodecGraphs` in `src/models/qwen3_tts/codec.cpp` (Stage 17, adapted from `CrispStrobe/CrispASR` MIT). Auto-binds when the codec sidecar GGUF is discovered (`extras["codec_path"]` or `tokenizer-{f16,q8_0}.gguf` next to the talker); silence fallback otherwise. Pre-built GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`. See `docs/CODEC_PORTS.md` §2. Speaker embedding via ECAPA-TDNN (`src/models/qwen3_tts/speaker_encoder.cpp`, Stage 17b) for Voice Clone — loaded from `speaker.*` tensors in the talker GGUF. |
 | **Sampling** | Top-p / temperature via `audiocore::sampler`; MTP predictor uses the same sampler for fine-codebook draws |
 | **Output** | 24 kHz mono PCM |
 | **Weight formats** | Two GGUFs (talker + predictor) produced by `tools/convert_qwen3tts` from the official safetensors; pre-built codec GGUF from `cstr/qwen3-tts-tokenizer-12hz-GGUF` (no conversion) |
-| **Status** | 🚧 Talker + predictor load and run; codec → PCM is a silence stub pending Stage 17 (reference impl identified) |
-| **Reference** | `QwenLM/Qwen3-TTS` (Python) — parity target. Codec parity: `CrispStrobe/CrispASR` (C++, MIT) |
+| **Status** | ✅ Stage 17b: talker + predictor load and run; codec → PCM ported (Stage 17); ECAPA-TDNN speaker encoder ported for Voice Clone (Stage 17b); auto-bind for both; silence / fail-fast fallbacks |
+| **Reference** | `QwenLM/Qwen3-TTS` (Python) — parity target. Codec + ECAPA parity: `CrispStrobe/CrispASR` (C++, MIT) |
 
 ### ACE-Step (`ace_step`)
 
@@ -343,7 +343,7 @@ GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 │   │   └── runtime/                  #   registry
 │   ├── models/                       # Per-family code
 │   │   ├── moss_tts/                 #   loader, session, projection, delay_state, sampler (shim)
-│   │   ├── qwen3_tts/                #   loader, session
+│   │   ├── qwen3_tts/                #   loader, session, codec (Stage 17: Tokenizer-12Hz), speaker_encoder (Stage 17b: ECAPA-TDNN)
 │   │   └── ace_step/                 #   loader, session, dit_runner, vae_runner
 │   └── server/                       # main.cpp, server.cpp (routes + WAV encoding)
 ├── tests/                            # Unit + e2e tests (one binary per file)
@@ -363,7 +363,7 @@ GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 ├── docs/
 │   ├── ARCHITECTURE.md               # Two-seam deep-dive
 │   ├── GGUF_FORMAT.md                # Tensor maps for each family
-│   └── CODEC_PORTS.md                # Stage 15: reference impls for the MOSS + Qwen3-TTS codec ports
+│   └── CODEC_PORTS.md                # Stage 15: references for the MOSS + Qwen3-TTS codec ports (Stages 16 & 17 wired)
 ├── examples/
 │   └── server.json                   # Reference server config
 ├── scripts/

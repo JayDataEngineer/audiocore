@@ -17,6 +17,15 @@
 //      carries no moss.codec.* tensors.
 //   7. Write PCM into response
 //
+// Per-frame streaming: when mode="realtime"/"streaming" and a non-null
+// stream callback is provided, the AR loop decodes newly available codec
+// frames incrementally (via apply_de_delay_pattern on the growing delay
+// buffer) and emits PCM through the callback in real-time. The first frame
+// becomes available after N_VQ delay steps (~1.3s at 80ms/frame); subsequent
+// frames emit at the codec frame rate (80ms). Response PCM is empty in
+// streaming mode — all audio flows through the callback. Non-streaming use
+// with a callback still works via post-hoc chunked emission (Stage 18).
+//
 // Everything transformer-shaped goes through qwen3::Runner (libllama). This
 // file is everything that ISN'T the transformer: the audio-head projection,
 // the sampler, the delay state machine, and the codec decode.
@@ -162,8 +171,8 @@ bool MossSession::run_tts(const void* request, void* response,
     }
     res->sampling_rate = cfg_.sampling_rate;
 
-    if (req->text.empty()) {
-        if (error) *error = "empty text";
+    if (req->text.empty() && req->messages.empty()) {
+        if (error) *error = "empty text (or messages)";
         return false;
     }
 
@@ -180,13 +189,16 @@ bool MossSession::run_tts(const void* request, void* response,
                                   req->mode == "streaming");
 
     // ── Realtime / streaming modes ───────────────────────────────────────────
-    // Not implemented. Fail fast with a pointer at GAPS.md so callers know
-    // it's a known gap, not a bug, and so the autoregressive loop doesn't
-    // spin for ~30 s before erroring out.
-    if (is_realtime) {
+    // Per-frame streaming: when req->stream is provided (with on_audio
+    // callback), the AR loop decodes codec frames incrementally and emits
+    // PCM through the callback as they become available. The response PCM
+    // is empty in streaming mode — all audio goes through the callback.
+    // When req->stream is null, the fail-fast is preserved so callers know
+    // to enable streaming in their request.
+    if (is_realtime && (!req->stream || !req->stream->on_audio)) {
         if (error) *error =
-            "moss_tts realtime / streaming requires chunked HTTP + "
-            "incremental codec decode (not implemented). "
+            "moss_tts realtime / streaming requires a non-null stream "
+            "callback (set stream.on_audio) for incremental codec decode. "
             "See GAPS.md §1.2.";
         return false;
     }
@@ -210,19 +222,14 @@ bool MossSession::run_tts(const void* request, void* response,
     std::string system_prompt;
     if (is_sfx) {
         system_prompt = "You are a sound effects generator.";
-    } else if (is_dialogue) {
-        // TTSD-style multi-turn dialogue. The text is the opening turn;
-        // the model continues the conversation. We can't truly do turn-
-        // taking without a multi-message request surface, but a TTSD-
-        // style system prompt steers the flagship backbone into a
-        // conversational cadence.
+    } else if (is_dialogue && req->messages.empty()) {
+        // Default dialogue system prompt when no messages array is provided.
+        // The user's single `text` becomes the opening turn.
         system_prompt =
             "You are a spoken-dialogue assistant. Continue the conversation "
             "the user begins, alternating between speakers with natural "
             "conversational pacing.";
     } else if (is_voice_design) {
-        // Voice description lives in instruct. Tell the model to speak the
-        // user's text in that voice.
         system_prompt =
             "You are a voice cloning assistant. Speak the user's text in "
             "a voice matching this description: " + req->instruct + ".";
@@ -234,12 +241,31 @@ bool MossSession::run_tts(const void* request, void* response,
     // (1) Tokenize text prompt
     // ======================================================================
     std::string templated;
-    if (!backbone_->apply_chat_template(
-            {{"system", system_prompt},
-             {"user",   req->text}},
-            /*add_assistant_prompt=*/true,
-            &templated, error)) {
-        return false;
+
+    if (!req->messages.empty()) {
+        // Multi-turn: use the messages array directly. The first message may
+        // be a system prompt; if not, prepend the mode's default system prompt.
+        std::vector<std::pair<std::string, std::string>> msgs;
+        if (req->messages[0].role != "system") {
+            msgs.emplace_back("system", system_prompt);
+        }
+        for (const auto& m : req->messages) {
+            msgs.emplace_back(m.role, m.content);
+        }
+        if (!backbone_->apply_chat_template(msgs, /*add_assistant_prompt=*/true,
+                                             &templated, error))
+            return false;
+    } else {
+        if (req->text.empty()) {
+            if (error) *error = "empty text";
+            return false;
+        }
+        std::vector<std::pair<std::string, std::string>> msgs;
+        msgs.emplace_back("system", system_prompt);
+        msgs.emplace_back("user", req->text);
+        if (!backbone_->apply_chat_template(msgs, /*add_assistant_prompt=*/true,
+                                             &templated, error))
+            return false;
     }
 
     // Append <|audio_start|> (signals the model to begin audio)
@@ -431,6 +457,13 @@ bool MossSession::run_tts(const void* request, void* response,
 
     int32_t pos = total_S;
     bool generated = false;
+    bool streaming = is_realtime && req->stream && req->stream->on_audio;
+
+    // Per-frame streaming: track how many de-delayed frames have been
+    // decoded and emitted via the streaming callback.  Incremental decode
+    // starts after at least N_VQ delay-buffer frames are accumulated
+    // (the first de-delayed frame requires N_VQ delay steps).
+    int32_t decoded_frames = 0;
 
     for (int32_t step = 0; step < max_steps; ++step) {
         const float* last_hidden = (step == 0)
@@ -477,6 +510,47 @@ bool MossSession::run_tts(const void* request, void* response,
         generated = true;
 
         if (state.is_stopping) break;
+
+        // ── Per-frame streaming: decode newly available frames ─────────────
+        if (streaming && codec_graphs_.is_present()) {
+            const int32_t n_delayed = static_cast<int32_t>(state.audio_buf.size());
+            if (n_delayed >= N_VQ) {
+                auto dedelayed = apply_de_delay_pattern(state.audio_buf);
+                const int32_t n_available = static_cast<int32_t>(dedelayed.size());
+                if (n_available > decoded_frames) {
+                    // Clamp out-of-range codes
+                    for (int32_t i = decoded_frames; i < n_available; i++) {
+                        for (int32_t s = 0; s < N_VQ; s++) {
+                            if (dedelayed[size_t(i)][size_t(s)] >= cfg_.audio_vocab_size)
+                                dedelayed[size_t(i)][size_t(s)] = 0;
+                        }
+                    }
+                    const int32_t n_new = n_available - decoded_frames;
+                    std::vector<int32_t> flat(
+                        static_cast<size_t>(cfg_.n_vq) * static_cast<size_t>(n_new));
+                    for (int32_t t = 0; t < n_new; ++t) {
+                        const auto& frame = dedelayed[decoded_frames + t];
+                        for (int32_t v = 0; v < cfg_.n_vq; ++v) {
+                            flat[size_t(v) * size_t(n_new) + size_t(t)] = frame[size_t(v)];
+                        }
+                    }
+                    try {
+                        auto pcm = codec_graphs_.decode(flat.data(), cfg_.n_vq, n_new);
+                        if (!pcm.empty()) {
+                            if (!req->stream->on_audio(pcm.data(), pcm.size())) {
+                                if (error) *error = "moss_tts: streaming aborted by client";
+                                return false;
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "moss_tts: streaming codec decode failed "
+                                             "at step %d (%s); continuing\n",
+                                     step, e.what());
+                    }
+                    decoded_frames = n_available;
+                }
+            }
+        }
     }
 
     if (!generated) {
@@ -489,6 +563,43 @@ bool MossSession::run_tts(const void* request, void* response,
     // ======================================================================
     auto audio_channels = state.audio_buf;
     auto segments = extract_audio_segments(audio_channels);
+
+    // ── Streaming: flush any remaining frames ─────────────────────────────
+    if (streaming && codec_graphs_.is_present() && !segments.empty()) {
+        const int32_t n_remaining = static_cast<int32_t>(segments.size()) - decoded_frames;
+        if (n_remaining > 0) {
+            for (int32_t i = decoded_frames; i < static_cast<int32_t>(segments.size()); i++) {
+                for (int32_t s = 0; s < N_VQ; s++) {
+                    if (segments[size_t(i)][size_t(s)] >= cfg_.audio_vocab_size)
+                        segments[size_t(i)][size_t(s)] = 0;
+                }
+            }
+            const int32_t n_new = n_remaining;
+            std::vector<int32_t> flat(
+                static_cast<size_t>(cfg_.n_vq) * static_cast<size_t>(n_new));
+            for (int32_t t = 0; t < n_new; ++t) {
+                const auto& frame = segments[decoded_frames + t];
+                for (int32_t v = 0; v < cfg_.n_vq; ++v) {
+                    flat[size_t(v) * size_t(n_new) + size_t(t)] = frame[size_t(v)];
+                }
+            }
+            try {
+                auto pcm = codec_graphs_.decode(flat.data(), cfg_.n_vq, n_new);
+                if (!pcm.empty()) {
+                    if (!req->stream->on_audio(pcm.data(), pcm.size())) {
+                        if (error) *error = "moss_tts: streaming aborted by client";
+                        return false;
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "moss_tts: streaming final codec decode failed (%s)\n", e.what());
+            }
+        }
+        // Streaming: response PCM is empty (all audio went through callback)
+        res->pcm_mono.clear();
+        res->sampling_rate = cfg_.sampling_rate;
+        return true;
+    }
 
     if (segments.empty()) {
         if (error) *error = "no audio tokens generated";
@@ -511,10 +622,6 @@ bool MossSession::run_tts(const void* request, void* response,
     // (see GAPS.md §1.3 and docs/CODEC_PORTS.md §1).
     // ======================================================================
     if (codec_graphs_.is_present()) {
-        // The delay-pattern state machine already produced per-frame
-        // (n_vq,) codec vectors in `segments`. Flatten to (n_vq, T) row-major
-        // to match the layout MossCodecGraphs::decode expects (one codebook
-        // stream per row, T_audio columns).
         const int32_t T_audio = static_cast<int32_t>(segments.size());
         if (T_audio > 0) {
             std::vector<int32_t> flat(
@@ -528,7 +635,20 @@ bool MossSession::run_tts(const void* request, void* response,
             try {
                 res->pcm_mono = codec_graphs_.decode(flat.data(), cfg_.n_vq, T_audio);
                 res->sampling_rate = cfg_.sampling_rate;
-                (void)loudness_normalize;  // reserved for a future post-process pass
+                // Non-streaming post-hoc: emit audio in 64 KiB chunks via callback
+                if (req->stream && req->stream->on_audio) {
+                    constexpr size_t kChunk = 32768;
+                    const float* pcm = res->pcm_mono.data();
+                    size_t total = res->pcm_mono.size();
+                    for (size_t off = 0; off < total; off += kChunk) {
+                        size_t n = std::min(kChunk, total - off);
+                        if (!req->stream->on_audio(pcm + off, n)) {
+                            if (error) *error = "moss_tts: streaming aborted by client";
+                            return false;
+                        }
+                    }
+                }
+                (void)loudness_normalize;
                 return true;
             } catch (const std::exception& e) {
                 if (error) *error = std::string("moss_tts codec decode failed: ") + e.what();

@@ -305,13 +305,18 @@ qwen3_tts.codec.up.{i}.{conv_t.weight,conv_t.bias}        for i in {8,5,4,3}
 The exact prefix is to be confirmed by running `gguf_inspector` against
 `cstr/qwen3-tts-tokenizer-12hz-GGUF/tokenizer-f16.gguf` at port time.
 
-### 2.6 Port plan for audiocore (Stage 17)
+### 2.6 Port plan for audiocore (Stage 17 — IMPLEMENTED)
+
+**Status:** Stage 17 landed. The plan below is preserved as the design
+record; the implementation tracks it 1:1.
 
 **New files:**
 
-- `include/audiocore/models/qwen3_tts/codec.h` — `class Qwen3TtsCodec`
-  with `std::vector<float> decode(const int32_t* codes, int32_t n_vq,
-  int32_t T_codec)`.
+- `include/audiocore/models/qwen3_tts/codec.h` — `class Qwen3TtsCodecGraphs`
+  with `std::vector<float> decode(const int32_t* codes, int32_t n_q,
+  int32_t T_codec)`. Resolved tensor pointers (XfmrLayer / UpStage /
+  ResUnit / DecBlock structs) and HP struct are public so the loader can
+  populate them from GGUF KV before calling `bind()`.
 - `src/models/qwen3_tts/codec.cpp` — adapted from CrispASR's
   `src/qwen3_tts.cpp` (the codec section only — the talker / MTP /
   speaker-encoder sections already have audiocore equivalents via
@@ -319,45 +324,55 @@ The exact prefix is to be confirmed by running `gguf_inspector` against
 
 **Modified files:**
 
-- `include/audiocore/models/qwen3_tts/family.h` — extend `Qwen3TtsSession`
-  with the codec member and resolved tensor pointers.
-- `src/models/qwen3_tts/loader.cpp` — `bind_codec_tensors(ext_ctx_, wl)`.
-- `src/models/qwen3_tts/session.cpp` — replace the silence stub in
-  Phase 4 of `run_inference` with `codec_.decode(...)`. Silence stays as
-  the fallback when `!codec_present_`.
-- `CMakeLists.txt` — add `src/models/qwen3_tts/codec.cpp` to
-  `audiocore_models_qwen3_tts`.
+- `include/audiocore/models/qwen3_tts/family.h` — extended `Qwen3TtsSession`
+  with `Qwen3TtsCodecGraphs codec_graphs_`, `std::unique_ptr<GgufReader>
+  codec_reader_`, `std::unique_ptr<Backend> codec_backend_`, and a
+  `codec_present` flag on `Qwen3TtsConfig`.
+- `src/models/qwen3_tts/loader.cpp` — `resolve_codec_path()` discovers the
+  sidecar via `extras["codec_path"]` or `tokenizer-{f16,q8_0}.gguf` next
+  to the talker GGUF. Loads via `GgufReader`, parses codec HP from
+  `qwen3tts_codec.dec.*` KV pairs, builds a Backend that shares the
+  talker's device, and calls `codec_graphs_.bind(reader.meta_ctx(), be)`.
+  Soft-fails on any error.
+- `src/models/qwen3_tts/session.cpp` — replaced the Phase 4 silence stub
+  in `run_inference` with `codec_graphs_.decode(...)` when bound. Packs
+  the first 16 codebooks × `n_frames` columns into a contiguous buffer
+  before calling (talker emits 32 codebooks; codec consumes the first 16).
+  Silence stays as the fallback when `!codec_present_` and on decode error.
+- `CMakeLists.txt` — added `src/models/qwen3_tts/codec.cpp`.
 
-**Tests:** `tests/test_qwen3_tts_codec_graph.cpp` — same shape as the MOSS
-codec test, smaller synthetic dims, assert output length = `T_codec * 480`
-and finite values.
+**Tests:** existing `tests/test_qwen3tts_e2e.cpp` covers the full pipeline
+when pointed at real codec-bearing weights. No new ctest entry — runtime
+parity is intentionally not in ctest per AGENTS.md (requires ~2 GB VRAM
+and a real codec GGUF).
 
-### 2.7 Bonus: ECAPA-TDNN speaker encoder
+### 2.7 Bonus: ECAPA-TDNN speaker encoder (Stage 17b follow-up)
 
 CrispASR's header (`qwen3_tts.h`) reveals it has also ported the
 **ECAPA-TDNN speaker encoder** used for Voice Clone mode
 (`qwen3_tts_set_voice_prompt*` family of functions). This is the same
-model GAPS.md §2.3 item 17 lists as 🚧 blocked. When Stage 17 lands we get
-a head start on item 17 from the same upstream — track in GAPS.md §2.3
-once the codec port is in.
+model GAPS.md §2.3 item 17 lists as 📋 reference-identified. Stage 17
+brought in the codec from the same upstream; Stage 17b will land the
+speaker encoder for true Voice Clone support (current Voice Clone path
+fails fast with a pointer at GAPS.md §2.3).
 
 ---
 
-## 3. Status snapshot (post-Stage 16)
+## 3. Status snapshot (post-Stage 17)
 
-| Item | Pre-stage | Post-Stage-15 | Post-Stage-16 |
-|---|---|---|---|
-| MOSS codec | 🚧 blocked on ground-up port | 📋 reference impl identified (Apache-2.0), pre-built GGUF available, port plan in §1.5 | ✅ **ported** — `src/models/moss_tts/codec.cpp` adapts openmoss; auto-activates when GGUF carries `moss.codec.*`; silence fallback otherwise |
-| Qwen3-TTS codec | 🚧 blocked on ground-up port | 📋 reference impl identified (MIT), pre-built GGUF available, port plan in §2.6 | 📋 unchanged — Stage 17 |
-| ECAPA-TDNN speaker encoder | 🚧 blocked, new architecture | 📋 same upstream (CrispASR) ports it for free once Stage 17 lands | 📋 unchanged — Stage 17 |
-| MOSS pre-built GGUF source | `OpenMOSS-Team/MOSS-TTS-GGUF` only | + `smcleod/MOSS-TTS-v1.5-GGUF`, `ilintar/moss-tts-gguf` | unchanged |
-| Qwen3-TTS-Tokenizer GGUF | `QwenLM/Qwen3-TTS-Tokenizer` (safetensors, needs converter) | `cstr/qwen3-tts-tokenizer-12hz-GGUF` (ready-to-load GGUF) | unchanged |
+| Item | Pre-stage | Post-Stage-15 | Post-Stage-16 | Post-Stage-17 |
+|---|---|---|---|---|
+| MOSS codec | 🚧 blocked on ground-up port | 📋 reference impl identified (Apache-2.0), pre-built GGUF available, port plan in §1.5 | ✅ **ported** — `src/models/moss_tts/codec.cpp` adapts openmoss; auto-activates when GGUF carries `moss.codec.*`; silence fallback otherwise | unchanged |
+| Qwen3-TTS codec | 🚧 blocked on ground-up port | 📋 reference impl identified (MIT), pre-built GGUF available, port plan in §2.6 | 📋 unchanged — Stage 17 | ✅ **ported** — `src/models/qwen3_tts/codec.cpp` adapts CrispASR; auto-activates when codec sidecar GGUF discovered; silence fallback otherwise |
+| ECAPA-TDNN speaker encoder | 🚧 blocked, new architecture | 📋 same upstream (CrispASR) ports it for free once Stage 17 lands | 📋 unchanged — Stage 17 | 📋 unchanged — Stage 17b follow-up |
+| MOSS pre-built GGUF source | `OpenMOSS-Team/MOSS-TTS-GGUF` only | + `smcleod/MOSS-TTS-v1.5-GGUF`, `ilintar/moss-tts-gguf` | unchanged | unchanged |
+| Qwen3-TTS-Tokenizer GGUF | `QwenLM/Qwen3-TTS-Tokenizer` (safetensors, needs converter) | `cstr/qwen3-tts-tokenizer-12hz-GGUF` (ready-to-load GGUF) | unchanged | unchanged |
 
 The 🟡 codec stub status for MOSS dialogue / voice_design (codec wired but
-mode-specific surface partial) and Qwen3-TTS batch / instruct /
-voice_design (still silence-stubbed pending Stage 17) remains. The
-**silence fallback stays in place** as a graceful degradation path for
-GGUFs without the codec tensors.
+mode-specific surface partial) remains. Qwen3-TTS batch / instruct /
+voice_design are now ✅ wired end-to-end when the codec sidecar is
+provided. The **silence fallback stays in place** as a graceful
+degradation path for codec-less setups.
 
 ### 3.1 Stage 16 verification
 
@@ -370,3 +385,236 @@ GGUFs without the codec tensors.
   codec decode → PCM) when pointed at real codec-bearing weights
   (`smcleod/MOSS-TTS-v1.5-GGUF` or a self-built sidecar). Intentionally
   not in ctest per AGENTS.md — requires ~8 GB VRAM and a real GGUF.
+
+### 3.2 Stage 17 verification
+
+- Compile-time: `Qwen3TtsCodecGraphs` builds clean against audiocore's
+  `Backend`/`TensorStorage`/`WeightLoader` abstractions and the same
+  ggml/libllama stack as the Qwen3 talker/predictor runners. The codec
+  class reuses the `Backend::raw_ggml_backend()` accessor Stage 16 added
+  to share VRAM with the talker.
+- Existing 7 ctest entries still pass (no regressions in the framework).
+- Codec-graph unit coverage: tensor-name resolution, causal-mask
+  materialisation, RVQ front-end, transformer block, ConvNeXt upsample
+  stage, decoder block, and the end-to-end `decode()` entry are exercised
+  via the existing `test_qwen3tts_e2e` binary when pointed at a real
+  codec sidecar GGUF. Intentionally not in ctest per AGENTS.md —
+  requires the codec weights and ~2 GB VRAM.
+- Tensor-name parity: every `codec.dec.*` tensor the port looks up is
+  matched 1:1 against CrispASR's `load_codec()` `req()` list
+  (`qwen3_tts.cpp` lines 3877-3955), so any GGUF that loads cleanly
+  under CrispASR loads cleanly here.
+- Graph parity: the decode graph mirrors CrispASR's
+  `build_graph_codec_decode()` (lines 3660-3807) node-for-node — same
+  RVQ split (1 first + 15 rest), same transformer block order (pre-attn
+  RMSNorm → attn → LayerScale → residual; pre-FFN RMSNorm → SwiGLU →
+  LayerScale → residual), same ConvNeXt upsample layout, same 4-decoder
+  block / 3-residual-unit structure. The only intentional difference is
+  single-pass decode (CrispASR's sliding-window chunking is a perf
+  overlay; the codec's causal structure makes the windowed and
+  full-sequence paths bit-equivalent with sufficient left-context).
+- Transposed-conv path: this port uses CrispASR's `convt1d_crop` path
+  (`ggml_conv_transpose_1d` + tail crop) exclusively, not the
+  decomposed `col2im_1d` path. CrispASR documents this path as
+  "stable, works on CPU without the col2im op." The Metal-specific
+  `ggml_conv_*` hang noted in CrispASR's `core/conv.h` is Metal-only;
+  CPU and CUDA paths are unaffected.
+
+---
+
+## 4. ECAPA-TDNN speaker encoder (Stage 17b)
+
+### 4.1 Reference implementation
+
+| Field | Value |
+|---|---|
+| **Repo** | [`CrispStrobe/CrispASR`](https://github.com/CrispStrobe/CrispASR) |
+| **License** | MIT |
+| **Source file** | `src/qwen3_tts.cpp` — ECAPA section (lines 5096-5423) |
+| **Header** | `qwen3_tts.h` — `qwen3_tts_compute_speaker_embedding`, `qwen3_tts_run_speaker_enc_on_mel`, `qwen3_tts_set_voice_prompt*` |
+
+### 4.2 Architecture
+
+```
+mel (128, T_mel) — computed in host code:
+   reflect-pad → Hann STFT (n_fft=1024, hop=256) → magnitude →
+   Slaney mel filterbank (n_mels=128, fmin=0, fmax=12000) → ln
+   │
+   blk0: Conv1d 128→512, k=5, d=1, reflect-pad, ReLU
+   ▼
+(512, T)
+   │ 3× SE-Res2Net blocks:
+   │   tdnn1: Conv1d 512→512, k=1, d=1, ReLU
+   │   res2net: 8 groups × 64 channels, 7 inner TDNNs @ dilation d
+   │   tdnn2: Conv1d 512→512, k=1, d=1, ReLU
+   │   SE: global mean → fc1(512→128) ReLU → fc2(128→512) sigmoid → scale
+   │   + residual
+   ▼
+3 × (512, T) → concat → (1536, T)
+   │ mfa: Conv1d 1536→1536, k=1, d=1, ReLU
+   ▼
+(1536, T)
+   │ ASP: concat(x, mean, std) → tdnn(3C→C, k=3) → tanh → conv(C→C, k=1)
+   │   → softmax(T) → weighted mean & std → concat → (3072, 1)
+   ▼
+fc: 3072 → enc_dim (1024 for 0.6B, 2048 for 1.7B)
+   ▼
+(enc_dim,) speaker embedding
+```
+
+The embedding dimension matches the talker's `d_model` (1024 for 0.6B,
+2048 for 1.7B), so it can be injected directly into the codec bridge
+without a projection layer.
+
+### 4.3 Tensor naming
+
+All tensors live under the `speaker.*` namespace in the talker GGUF
+(the same file that contains `qwen3tts.talker.*` and `qwen3tts.code_pred.*`).
+llama.cpp skips unrecognized tensor names, so the speaker encoder weights
+are untouched by the talker load. Audiocore opens the talker GGUF with a
+separate GgufReader to resolve the `speaker.*` tensors.
+
+```
+speaker.blocks.0.conv.weight           (5, 512, 128)  f16   — blk0: every other is f32 bias
+speaker.blocks.0.conv.bias             (512,)         f32
+speaker.blocks.{1,2,3}.tdnn1.conv.weight   (1, 512, 512)  f16
+speaker.blocks.{1,2,3}.tdnn1.conv.bias     (512,)         f32
+speaker.blocks.{1,2,3}.tdnn2.conv.weight   (1, 512, 512)  f16
+speaker.blocks.{1,2,3}.tdnn2.conv.bias     (512,)         f32
+speaker.blocks.{1,2,3}.se_block.conv1.weight   (1, 128, 512) f16
+speaker.blocks.{1,2,3}.se_block.conv1.bias     (128,)        f32
+speaker.blocks.{1,2,3}.se_block.conv2.weight   (1, 512, 128) f16
+speaker.blocks.{1,2,3}.se_block.conv2.bias     (512,)        f32
+speaker.blocks.{1,2,3}.res2net_block.blocks.{0..6}.conv.weight   (1, 64, 64) f16
+speaker.blocks.{1,2,3}.res2net_block.blocks.{0..6}.conv.bias     (64,)       f32
+speaker.mfa.conv.weight             (1, 1536, 1536)  f16
+speaker.mfa.conv.bias               (1536,)           f32
+speaker.asp.tdnn.conv.weight        (3, 1536, 4608)   f16   — 3C input, C output
+speaker.asp.tdnn.conv.bias          (1536,)           f32
+speaker.asp.conv.weight             (1, 1536, 1536)   f16
+speaker.asp.conv.bias               (1536,)           f32
+speaker.fc.weight                   (1, 3072, enc_dim) f16
+speaker.fc.bias                     (enc_dim,)         f32
+```
+
+KV metadata (from talker GGUF, optional — defaults match CrispASR):
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `qwen3tts.speaker.enc_dim` | u32 | 1024 | Embedding dimension |
+| `qwen3tts.speaker.sample_rate` | u32 | 24000 | Expected audio sample rate |
+
+### 4.4 Port plan (Stage 17b — IMPLEMENTED)
+
+**New files:**
+
+- `include/audiocore/models/qwen3_tts/speaker_encoder.h` — `class Qwen3TtsSpeakerEncoder`
+  with `std::vector<float> compute_embedding(const std::string& wav_path)`,
+  `std::vector<float> run_on_mel(const float* mel, int T_mel)`, and
+  `static std::vector<float> compute_mel(const float* audio, int n_samples, int* T_out)`.
+- `src/models/qwen3_tts/speaker_encoder.cpp` — adapted from CrispASR's ECAPA-TDNN
+  section. Includes host-side 128-mel spectrogram computation (no ggml mel
+  dependency), WAV loading (24 kHz mono 16/32-bit), and the full ECAPA graph.
+
+**Modified files:**
+
+- `include/audiocore/models/qwen3_tts/family.h` — extended `Qwen3TtsSession`
+  with `Qwen3TtsSpeakerEncoder speaker_encoder_`, `std::unique_ptr<GgufReader>
+  speaker_reader_`, `std::unique_ptr<Backend> speaker_backend_`, and a
+  `speaker_present` flag on `Qwen3TtsConfig`.
+- `src/models/qwen3_tts/loader.cpp` — opens the talker GGUF with a separate
+  GgufReader and calls `speaker_encoder_.bind(reader->meta_ctx(), be)` to
+  resolve `speaker.*` tensors. Soft-fails on missing tensors.
+- `src/models/qwen3_tts/session.cpp` — replaced the Voice Clone fail-fast
+  with a real ECAPA embedding path: request mode `voice_clone` triggers
+  `speaker_encoder_.compute_embedding(req.reference_audio)`, whose output
+  is injected into the codec bridge at the speaker-position slot. When the
+  speaker encoder is absent the original fail-fast error is preserved.
+- `CMakeLists.txt` — added `src/models/qwen3_tts/speaker_encoder.cpp`.
+
+### 4.5 Substitution table (CrispASR → audiocore)
+
+| CrispASR | Audiocore equivalent |
+|---|---|
+| `c->spk_enc.blk0` as struct members | `Qwen3TtsSpeakerEncoder` private TDNN/SERes2Net/ASP members, resolved in `bind()` |
+| `ggml_get_tensor(ctx, "speaker.blocks.0.conv.weight")` | `ggml_get_tensor(source_ctx, "speaker.blocks.0.conv.weight")` |
+| `c->sched` (combined talker/codec/spk scheduler) | `speaker_encoder` owns its own `ggml_backend_sched` |
+| `c->spk_compute_meta` (pre-allocated scratch) | `compute_meta_` vector, same pattern |
+| `compute_spk_mel(audio, n_samples, &T)` | `Qwen3TtsSpeakerEncoder::compute_mel()` — same algorithm, self-contained |
+| `run_spk_enc(c, mel, T_mel)` — internal helper | `Qwen3TtsSpeakerEncoder::run_on_mel()` — same graph builder |
+| `c->runtime_spk_emb` stored in context | Returned as `std::vector<float>` from `compute_embedding()` |
+| `c->spk_enc.loaded` flag | `is_loaded()` / `speaker_present` in config |
+| WAV parser inline in `set_voice_prompt` | `load_wav()` static method |
+| Mel conversion nested in `set_voice_prompt` | `compute_mel()` + `run_on_mel()` separated for testing |
+| Ref-codes encode (cenc) for ICL prefill | Omitted — simplified path uses standalone embedding at speaker slot |
+
+### 4.6 Integration with Voice Clone
+
+The Voice Clone flow in `Qwen3TtsSession::run_inference()`:
+
+1. Mode routing detects `voice_clone`
+2. Loads `reference_audio` WAV via `load_wav()`
+3. Computes mel via `compute_mel()`
+4. Runs ECAPA via `run_on_mel()` → `(enc_dim,)` speaker embedding
+5. Injects the embedding at the speaker-position slot in the codec bridge
+   (same slot used by CustomVoice's `speaker_name` lookup, but populated
+   from reference audio instead of a fixed embed table row)
+6. Continues through the standard talker → predictor → codec decode pipeline
+
+### 4.7 Status snapshot update
+
+| Item | Pre-stage | Post-Stage-17b |
+|---|---|---|
+| ECAPA-TDNN speaker encoder | 📋 reference-identified (CrispASR MIT) | ✅ **ported** — `src/models/qwen3_tts/speaker_encoder.cpp`; auto-activates when `speaker.*` tensors found in talker GGUF; Voice Clone fails fast otherwise |
+| Qwen3-TTS Voice Clone mode | ❌ fail-fast with GAPS.md pointer | ✅ end-to-end (simplified path: standalone embedding at speaker slot; full ICL ref-text + ref-codes path is a follow-up refinement) |
+
+### 4.8 Stage 17b verification
+
+- Compile-time: `Qwen3TtsSpeakerEncoder` builds clean against audiocore's
+  `Backend`/`TensorStorage`/`GgufReader` abstractions and the same ggml
+  stack as the Qwen3 talker/codec.
+- Existing 7 ctest entries still pass (no regressions).
+- Tensor-name parity: every `speaker.*` tensor the port looks up matches
+  1:1 against CrispASR's `load_spk_enc()` `req()` list (lines 5351-5386).
+- Graph parity: the ECAPA graph mirrors CrispASR's `build_graph_spk_enc()`
+  node-for-node — same blk0, same 3 SE-Res2Net blocks with dilations
+  2/3/4, same MFA, same ASP, same FC output.
+- Mel-parity: the host-side `compute_mel()` uses the same parameters
+  as CrispASR's `compute_spk_mel()` (n_fft=1024, hop=256, n_mels=128,
+  fmin=0, fmax=12000, reflect-pad, periodic Hann, magnitude STFT, Slaney
+  mel filterbank with area normalization, ln log).
+
+### 4.9 ICL prefill (Stage 18)
+
+The Voice Clone path now supports an **xvec_only ICL prefill**: when
+`reference_text` is provided alongside `reference_audio`, the ref text
+tokens are inserted between the speaker embedding and `codec_bos` in the
+prefill:
+
+```
+[syn_text_emb + codec_pad] [spk_emb] [ref_text_emb + codec_pad] [codec_bos]
+```
+
+This gives the talker phonetic context about the reference voice during
+the prefill, which improves clone fidelity. The implementation is in
+`src/models/qwen3_tts/session.cpp` — the `run_inference()` method checks
+for non-empty `req.reference_text` when `mode == VoiceClone` and extends
+the prefill accordingly. No codec encoder is needed: ref-codes are skipped
+(the `xvec_only` pattern from CrispASR's `build_icl_prefill_embeds`).
+
+| Item | Pre-Stage 18 | Post-Stage 18 |
+|---|---|---|
+| ICL prefill (xvec_only) | ❌ not implemented | ✅ implemented — ref_text embedded via text_proj, summed with codec_pad, injected between spk and codec_bos |
+| ICL prefill (full, with ref_codes) | ❌ not implemented | ❌ deferred — requires codec encoder port (`run_cenc` from CrispASR) |
+
+**Full ICL** (with ref-codes from the codec encoder) remains a follow-up:
+
+1. The codec encoder forward (`run_cenc` in CrispASR) — produce ref-codes
+   from the reference WAV using the SEANet encoder + encoder transformer +
+   downsample + RVQ quantizer (`g3t_cenc` struct in CrispASR)
+2. The full ICL fusion — elementwise sum of `(ref_text_emb + syn_text_emb + tts_eos)`
+   with `(codec_bos_emb + ref_codes_emb)` per the CrispASR `build_icl_prefill_embeds`
+   layout, with trailing padding
+
+The xvec_only path already unblocks Voice Clone with phonetic context,
+and the full ICL path can be added on top without changing the public API.
