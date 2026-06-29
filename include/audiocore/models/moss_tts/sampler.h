@@ -5,6 +5,7 @@
 #define AUDIOCORE_MODELS_MOSS_TTS_SAMPLER_H
 
 #include <cstdint>
+#include <random>
 #include <vector>
 
 namespace audiocore::moss {
@@ -18,7 +19,8 @@ int32_t sample_token(const float* logits, int32_t vocab_size,
                      const int32_t* prev_tokens = nullptr, int32_t n_prev = 0,
                      float repetition_penalty = 1.0f,
                      float top_p = 1.0f, int top_k = 0,
-                     bool do_sample = true);
+                     bool do_sample = true,
+                     std::mt19937* rng = nullptr);
 
 // Sample from per-stream audio logits. Convenience wrapper for the 2D case.
 //   logits: (n_streams, vocab_size) row-major

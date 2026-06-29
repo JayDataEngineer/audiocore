@@ -424,24 +424,22 @@ bool MossSession::run_tts(const void* request, void* response,
     }
 
     // Map the unified TtsRequest fields onto the upstream optional slots.
-    //   req->instruct → Instruction slot
-    //   req->language → Language slot (empty → "None"; upstream default)
-    //   req->quality  → Quality slot — not exposed yet, defaults to None
-    //   req->tokens   → Tokens slot — not exposed yet, defaults to None
-    // The Quality / Tokens fields are family-specific knobs that would belong
-    // on TtsRequest if we extend it; for now they use upstream defaults.
     std::optional<std::string> opt_instruction;
     if (!req->instruct.empty()) opt_instruction = req->instruct;
     std::optional<std::string> opt_language;
     if (!req->language.empty()) opt_language = req->language;
+    std::optional<std::string> opt_quality;
+    if (!req->quality.empty()) opt_quality = req->quality;
+    std::optional<int> opt_duration_tokens;
+    if (req->duration_tokens > 0) opt_duration_tokens = req->duration_tokens;
 
     int32_t n_text = 0;
     std::vector<int32_t> grid;
     try {
         grid = build_prompt_grid(backbone_.get(), cfg_,
                                   opt_instruction,
-                                  /*tokens=*/std::nullopt,
-                                  /*quality=*/std::nullopt,
+                                  opt_duration_tokens,
+                                  opt_quality,
                                   opt_language,
                                   text_to_speak,
                                   reference_block,
@@ -530,13 +528,16 @@ bool MossSession::run_tts(const void* request, void* response,
     DelayState state = init_delay_state(all_ids);
 
     SamplingConfig samp_cfg;
-    samp_cfg.text_temperature  = 1.5f;
-    samp_cfg.text_top_p        = 1.0f;
-    samp_cfg.text_top_k        = 50;
+    samp_cfg.text_temperature  = req->text_temperature > 0.0f ? req->text_temperature : 1.5f;
+    samp_cfg.text_top_p        = req->text_top_p  > 0.0f ? req->text_top_p  : 1.0f;
+    samp_cfg.text_top_k        = req->text_top_k  > 0    ? req->text_top_k  : 50;
     samp_cfg.audio_temperature = req->temperature > 0.0f ? req->temperature : 1.7f;
-    samp_cfg.audio_top_p       = req->top_p > 0.0f ? req->top_p : 0.8f;
+    samp_cfg.audio_top_p       = req->top_p       > 0.0f ? req->top_p       : 0.8f;
     samp_cfg.audio_top_k       = 25;
     samp_cfg.audio_repetition_penalty = 1.0f;
+    samp_cfg.rng = req->seed != 0
+        ? std::mt19937(static_cast<uint32_t>(req->seed))
+        : std::mt19937(std::random_device{}());
 
     // ── 5. Autoregressive generation loop ──────────────────────────────────
     const int32_t max_steps = req->max_new_tokens > 0
