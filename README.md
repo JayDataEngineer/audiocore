@@ -194,6 +194,76 @@ Example `server.json` (`examples/server.json`):
 }
 ```
 
+### Docker
+
+The repo ships two multi-stage Dockerfiles:
+
+| File | Base | Size | Use |
+|---|---|---|---|
+| `Dockerfile` | `nvidia/cuda:13.1-devel-ubuntu24.04` (build) → `…-runtime-…` | ~1.1 GB | Production. GPU inference via ggml CUDA backend. |
+| `Dockerfile.cpu` | `ubuntu:24.04` | ~350 MB | Dev, CI, or CPU-only hosts. |
+
+Both expect the git submodules to be populated at clone time:
+
+```bash
+git clone https://github.com/JayDataEngineer/audiocore.git
+cd audiocore
+git submodule update --init --recursive   # llama.cpp + ggml
+```
+
+Then build and run:
+
+```bash
+# GPU image (needs Docker with --gpus all + a matching NVIDIA driver)
+docker build -t audiocore .
+
+# CPU image
+docker build -f Dockerfile.cpu -t audiocore:cpu .
+
+# Run — mount weights under /models, override config if you have one
+docker run --gpus all -p 8080:8080 \
+    -v "$PWD/weights:/models:ro" \
+    -v "$PWD/examples/server.json:/etc/audiocore/server.json:ro" \
+    audiocore
+
+# Smoke test with no models mounted (server starts, /health returns 200,
+# /v1/models returns []; useful for verifying the image)
+docker run --rm -p 8080:8080 -e AUDIOCORE_ALLOW_EMPTY=1 audiocore
+```
+
+Once `curl http://localhost:8080/health` returns `{"status":"ok"}`, the API is
+live — see [API](#api) below. The image exposes these mount points and env
+vars:
+
+| Mount | Purpose |
+|---|---|
+| `/models` | GGUF weights (read-only) |
+| `/etc/audiocore/server.json` | Override the default config |
+
+| Env | Default | Purpose |
+|---|---|---|
+| `AUDIOCORE_CONFIG` | `/etc/audiocore/server.json` | Path to the config file |
+| `AUDIOCORE_PORT` | `8080` | Used by the in-image `HEALTHCHECK` |
+| `AUDIOCORE_ALLOW_EMPTY` | `0` | Set `1` to fall back to the no-model default config |
+| `LD_LIBRARY_PATH` | `/opt/audiocore/lib` | Where the ggml/llama `.so`s live |
+
+#### Build knobs
+
+```bash
+docker build \
+  --build-arg CUDA_VERSION=12.4.1 \
+  --build-arg UBUNTU=22.04 \
+  --build-arg BUILD_TYPE=RelWithDebInfo \
+  --build-arg BUILD_JOBS=8 \
+  -t audiocore:cuda-12.4 .
+```
+
+`CUDA_VERSION` must match a tag on
+[`nvidia/cuda`](https://hub.docker.com/r/nvidia/cuda/tags) and the runtime
+must be backed by a driver that supports it (CUDA 13.x → driver ≥ 580, CUDA
+12.x → driver ≥ 545). The container's major CUDA version must match the host
+driver — the ggml CUDA backend links against `libcudart.so.<major>`.
+
 ### Test
 
 ```bash
