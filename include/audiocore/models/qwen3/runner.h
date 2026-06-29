@@ -150,6 +150,7 @@ public:
         return (i >= 0 && i < n_fine_books_) ? fine_embd_[i] : nullptr;
     }
     int32_t fine_vocab() const { return fine_vocab_; }
+    int32_t fine_embd_dim() const { return fine_embd_dim_; }
 
     // ── Tokenizer (libllama-native, no vendored SentencePiece) ---------
     // These delegate to libllama's Qwen3 tokenizer. add_special inserts
@@ -222,6 +223,7 @@ private:
     float**  fine_embd_     = nullptr;      // [n_fine_books_] each [fine_vocab, n_embd]
     float**  fine_head_     = nullptr;      // [n_fine_books_] each [n_embd, fine_vocab]
     int32_t  fine_vocab_    = 0;
+    int32_t  fine_embd_dim_ = 0;
     int32_t  n_fine_books_  = 0;
     float*   small_to_mtp_w_ = nullptr;     // [n_embd, n_embd]
     float*   small_to_mtp_b_ = nullptr;     // [n_embd]

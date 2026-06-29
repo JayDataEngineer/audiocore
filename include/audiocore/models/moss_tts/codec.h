@@ -119,10 +119,20 @@ private:
     ggml_gallocr_t       galloc_    = nullptr;   // owned
 
     // Effective-weight context + buffer (post-weight-norm materialisation).
+    // ALSO contains device copies of all codec weight tensors from source_ctx_
+    // (which only have host mmap data pointers). w_buf_ allocates device memory
+    // for the entire w_ctx_ at once via ggml_backend_alloc_ctx_tensors.
     ggml_context*         w_ctx_ = nullptr;       // owned
     ggml_backend_buffer_t w_buf_ = nullptr;       // owned
 
-    std::array<ggml_tensor*, 32> codebook_     {};
+    // All source_ctx_ tensors that the codec decoder reads. During
+    // resolve_decoder_(), each resolved tensor is stored here. During
+    // compute_effective_weights_(), device copies are created in w_ctx_ and
+    // the copy replaces the original in the Layer/Stage member fields.
+    struct TensorSrc { ggml_tensor** field_ptr; ggml_tensor* src; };
+    std::vector<TensorSrc> tensor_srcs_;
+
+    std::array<ggml_tensor*, 32> codebook_     {};   // (will be updated to device copy)
     std::array<ggml_tensor*, 32> q_oproj_w_    {};  // per-quantizer effective
     std::array<ggml_tensor*, 32> q_oproj_b_    {};
     ggml_tensor*                quant_oproj_w_ = nullptr;

@@ -300,6 +300,20 @@ ggml_tensor* Qwen3TtsCodecGraphs::transposed_conv1d_(ggml_context* ctx,
     const int crop_right = (K > stride) ? (K - stride) : 0;
     const int Cout = (int)w->ne[1];
 
+    // CUDA ggml_conv_transpose_1d requires F32 weights (asserts in
+    // conv-transpose-1d.cu:67). The codec GGUF stores most tensors quantized
+    // (Q8_0 for the q8_0 variant). Dequantize on-the-fly via a graph-level
+    // ggml_cpy — the CUDA backend handles Q8_0→F32 conversion natively
+    // (ggml_cuda_cpy at cpy.cu:506-508).
+    //
+    // Preserve all weight dimensions (some conv weights are 3D [K, C_out, C_in]
+    // while others are 2D [K, C_out]) so the nelements match assertion in
+    // ggml_cpy passes.
+    if (w->type != GGML_TYPE_F32) {
+        const int nd = ggml_n_dims(w);
+        w = ggml_cpy(ctx, w, ggml_new_tensor(ctx, GGML_TYPE_F32, nd, w->ne));
+    }
+
     ggml_tensor* xT = ggml_cont(ctx, ggml_transpose(ctx, x));      // [T_in, Cin]
     ggml_tensor* y  = ggml_conv_transpose_1d(ctx, w, xT, stride, /*p0=*/0, /*d0=*/1);
     const int64_t T_unpad = y->ne[0];
@@ -466,6 +480,27 @@ void Qwen3TtsCodecGraphs::fill_causal_mask_(ggml_tensor* mask) {
     ggml_backend_tensor_set(mask, buf.data(), 0, buf.size() * sizeof(uint16_t));
 }
 
+// ── Weight upload ──────────────────────────────────────────────────────────
+// Copy weight data from GGUF mmap (host) to backend device memory. Safe to
+// call on every decode() — after the first call the weight tensors already
+// have data pointing to device memory with correct values, so each subsequent
+// call is a no-op (upload_weights_ skips tensors with data==NULL, and
+// gallocr does not re-allocate tensors that already have data set).
+// ─────────────────────────────────────────────────────────────────────────────
+
+void Qwen3TtsCodecGraphs::register_weight(ggml_tensor* t,
+                                           const void* host_data,
+                                           size_t nbytes) {
+    weight_srcs_.push_back({t, host_data, nbytes});
+}
+
+void Qwen3TtsCodecGraphs::upload_weights_() {
+    for (auto& ws : weight_srcs_) {
+        if (!ws.tensor->data || !ws.data) continue;
+        ggml_backend_tensor_set(ws.tensor, ws.data, 0, ws.nbytes);
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Decode entry point (CrispASR build_graph_codec_decode + codec_decode_window
 // fused into a single-pass entry — lines 3660-3807 + 4192-4274).
@@ -605,6 +640,13 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
         ggml_free(ctx);
         throw std::runtime_error("Qwen3TtsCodecGraphs::decode: gallocr_alloc_graph failed");
     }
+
+    // ── Upload weight data from GGUF mmap to device memory ──────────────
+    // The weight tensors from meta_ctx_ have data==NULL (no_alloc=true).
+    // gallocr allocated device memory for them above, but it's
+    // uninitialized. Copy the actual weight data from the GGUF mmap into
+    // the freshly-allocated device buffers before compute.
+    upload_weights_();
 
     // ── Upload inputs ───────────────────────────────────────────────────
     // codes is already (n_q, T_codec) row-major, which matches codes_inp's

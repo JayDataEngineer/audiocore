@@ -131,6 +131,12 @@ private:
                       std::vector<float>* pcm_out,
                       std::string* error);
 
+    // Buffers for data materialized from GGUF files (used when tensor_data_ptr
+    // returns null, e.g. some extras GGUFs have incorrect data offsets).
+    // The ggml_tensor::data pointers point into these. Kept alive for the
+    // session lifetime.
+    std::vector<std::vector<uint8_t>>  gguf_buffers_;
+
     // NV: npy-loaded data buffers. The ggml_tensor::data pointers for npy-
     // loaded tensors point into these. Kept alive for the session lifetime.
     std::vector<std::vector<uint8_t>>  npy_buffers_;

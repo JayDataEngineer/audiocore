@@ -344,14 +344,36 @@ bool MossSession::bind_extension_tensors(const GgufReader& r,
             if (err) *err = "ggml_new_tensor failed for " + t.name;
             return false;
         }
-        ggml_set_name(gt, t.name.c_str());
 
         const void* data_ptr = r.tensor_data_ptr(t);
-        if (!data_ptr) {
-            if (err) *err = "tensor_data_ptr(" + t.name + ") returned null";
-            return false;
+        if (data_ptr) {
+            gt->data = const_cast<void*>(data_ptr);
+        } else {
+            // tensor_data_ptr may return null when the GGUF's data offsets
+            // don't map into the mmap'd region (e.g. extras GGUFs with
+            // incorrect alignment). Fall back to materialize() into a buffer.
+            gguf_buffers_.emplace_back(t.nbytes_to_read());
+            if (!r.materialize(t, gguf_buffers_.back().data(), err)) {
+                // Individual tensor materialization failure is not fatal.
+                // Some extras GGUFs have corrupted offset metadata for
+                // tensors we don't strictly need (e.g., the codec encoder
+                // which is not ported). Log a warning and skip the tensor.
+                gguf_buffers_.pop_back();
+                // Tensor stays allocated in ext_ctx_ but won't be looked up
+                // by name since skip_unreadable_ will remain unset.
+                std::fprintf(stderr, "moss_tts: warning: skipping unreadable "
+                                     "tensor \"%s\" (%s)\n",
+                             t.name.c_str(), err->c_str());
+                err->clear();
+                continue;
+            }
+            gt->data = gguf_buffers_.back().data();
         }
-        gt->data = const_cast<void*>(data_ptr);
+
+        // Only name the tensor after successfully assigning data. Skipped
+        // tensors (materialize failure) remain nameless so ggml_get_tensor
+        // won't find them, preventing downstream crashes.
+        ggml_set_name(gt, t.name.c_str());
 
         // Bind well-known tensors to slots for fast access.
         constexpr static const char kEmbedPrefix[]  = "moss.audio_embed.";
@@ -467,15 +489,39 @@ bool MossSession::load(const std::string& model_path,
     if (has_moss_tensors) {
         if (!bind_extension_tensors(*gguf, error)) return false;
     } else {
-        auto it_emb = opts.extras.find("embeddings_dir");
-        auto it_lm  = opts.extras.find("lm_heads_dir");
-        if (it_emb == opts.extras.end() || it_lm == opts.extras.end()) {
-            if (error) *error = "GGUF has no moss.* tensors — pass embeddings_dir"
-                                " and lm_heads_dir in LoadOptions::extras";
-            return false;
+        // Path C: separate extras GGUF (e.g. moss-tts-v1.5-q8_0.extras.gguf).
+        auto it_extras_gguf = opts.extras.find("extras_gguf_path");
+        if (it_extras_gguf != opts.extras.end()) {
+            auto extras_loader = make_weight_loader(it_extras_gguf->second, error);
+            if (!extras_loader) return false;
+            auto* extras_gguf = dynamic_cast<GgufReader*>(extras_loader.get());
+            if (!extras_gguf) {
+                if (error) *error = "extras_gguf_path must be a .gguf file";
+                return false;
+            }
+            bool extras_has_moss = false;
+            for (const auto& t : extras_gguf->tensors()) {
+                if (t.name.rfind("moss.", 0) == 0) { extras_has_moss = true; break; }
+            }
+            if (!extras_has_moss) {
+                if (error) *error = "extras GGUF \"" + it_extras_gguf->second +
+                                    "\" has no moss.* tensors";
+                return false;
+            }
+            extra_loaders_.push_back(std::move(extras_loader));
+            if (!bind_extension_tensors(*extras_gguf, error)) return false;
+        } else {
+            // Path B: .npy files from embeddings_dir / lm_heads_dir.
+            auto it_emb = opts.extras.find("embeddings_dir");
+            auto it_lm  = opts.extras.find("lm_heads_dir");
+            if (it_emb == opts.extras.end() || it_lm == opts.extras.end()) {
+                if (error) *error = "GGUF has no moss.* tensors — pass extras_gguf_path,"
+                                    " embeddings_dir, or lm_heads_dir in LoadOptions::extras";
+                return false;
+            }
+            if (!load_npy_extras(it_emb->second, it_lm->second, error))
+                return false;
         }
-        if (!load_npy_extras(it_emb->second, it_lm->second, error))
-            return false;
     }
 
     // (4b) Bind the codec graphs (Stage 16) if the GGUF carries the

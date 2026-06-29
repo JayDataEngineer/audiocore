@@ -2,20 +2,18 @@
 //
 // Prerequisites:
 //   Download GGUFs from:
-//     https://huggingface.co/wkwong/Lunavox-Qwen3-TTS-GGUF
-//   Or use the Lunavox model repo structure:
-//     /mnt/data/models/audio/qwen3-tts/
-//       qwen3_tts_talker.q5_k.gguf
-//       qwen3_tts_predictor.q8_0.gguf
-//
-// The speech-tokenizer ONNX that used to live alongside these GGUFs is no
-// longer loaded by audiocore; run_tts currently emits silence for the codec
-// decode phase pending a ggml port of the speech tokenizer.
+//     https://huggingface.co/wkwong/Lunavox-Qwen3-TTS-GGUF  (talker + predictor)
+//     https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF  (codec sidecar)
+//   Or use the default paths:
+//     /mnt/data/models/audio/qwen3-tts/talker.q5_k.gguf
+//     /mnt/data/models/audio/qwen3-tts/predictor.q8_0.gguf
+//     /mnt/data/models/audio/qwen3-tts/tokenizer-q8_0.gguf
 //
 // Environment variables:
 //   QWEN3TTS_DIR        Model directory           (default: /mnt/data/models/audio/qwen3-tts)
-//   QWEN3TTS_TALKER     Talker filename           (default: qwen3_tts_talker.q5_k.gguf)
-//   QWEN3TTS_PREDICTOR  Predictor filename        (default: qwen3_tts_predictor.q8_0.gguf)
+//   QWEN3TTS_TALKER     Talker filename           (default: talker.q5_k.gguf)
+//   QWEN3TTS_PREDICTOR  Predictor filename        (default: predictor.q8_0.gguf)
+//   QWEN3TTS_CODEC      Codec sidecar filename    (default: tokenizer-q8_0.gguf)
 //   QWEN3TTS_NGPU       GPU layers                (default: 99)
 //   QWEN3TTS_DEVICE     Backend kind              (default: ggml_cuda)
 
@@ -35,15 +33,17 @@ int main() {
 
     audiocore_register_qwen3_tts();
 
-    // ── Configure paths from env or defaults ────────────────────────────────
     const char* env_dir  = std::getenv("QWEN3TTS_DIR");
     std::string model_dir = env_dir ? env_dir : "/mnt/data/models/audio/qwen3-tts/";
 
     const char* env_talker = std::getenv("QWEN3TTS_TALKER");
-    std::string talker_fn  = env_talker ? env_talker : "qwen3_tts_talker.q5_k.gguf";
+    std::string talker_fn  = env_talker ? env_talker : "talker.q5_k.gguf";
 
     const char* env_pred = std::getenv("QWEN3TTS_PREDICTOR");
-    std::string pred_fn  = env_pred ? env_pred : "qwen3_tts_predictor.q8_0.gguf";
+    std::string pred_fn  = env_pred ? env_pred : "predictor.q8_0.gguf";
+
+    const char* env_codec = std::getenv("QWEN3TTS_CODEC");
+    std::string codec_fn  = env_codec ? env_codec : "tokenizer-q8_0.gguf";
 
     const char* env_ngpu = std::getenv("QWEN3TTS_NGPU");
     std::string ngpu_str = env_ngpu ? env_ngpu : "99";
@@ -54,19 +54,19 @@ int main() {
     std::fprintf(stderr, "[INFO] Qwen3-TTS dir: %s\n", model_dir.c_str());
     std::fprintf(stderr, "[INFO] talker:         %s\n", talker_fn.c_str());
     std::fprintf(stderr, "[INFO] predictor:      %s\n", pred_fn.c_str());
+    std::fprintf(stderr, "[INFO] codec:          %s\n", codec_fn.c_str());
     std::fprintf(stderr, "[INFO] n_gpu_layers:   %s\n", ngpu_str.c_str());
     std::fprintf(stderr, "[INFO] backend:        %s\n", backend_dev.c_str());
 
-    // ── Create session via FamilyRegistry ───────────────────────────────────
     auto sess = FamilyRegistry::instance().create("qwen3_tts");
     CHECK(sess != nullptr, "FamilyRegistry::create(qwen3_tts) failed");
     std::fprintf(stderr, "[INFO] qwen3_tts session created\n");
 
-    // ── Configure load options ──────────────────────────────────────────────
     LoadOptions opts;
-    opts.extras["talker_path"]         = talker_fn;
-    opts.extras["predictor_path"]      = pred_fn;
-    opts.extras["n_gpu_layers"]        = ngpu_str;
+    opts.extras["talker_path"]    = talker_fn;
+    opts.extras["predictor_path"] = pred_fn;
+    opts.extras["codec_path"]     = codec_fn;
+    opts.extras["n_gpu_layers"]   = ngpu_str;
 
     BackendKind kind = BackendKind::ggml_cpu;
     if (backend_dev == "ggml_cuda")  kind = BackendKind::ggml_cuda;
@@ -78,26 +78,23 @@ int main() {
         .n_threads = 4,
     };
 
-    // ── Load model ──────────────────────────────────────────────────────────
     std::string load_err;
-    std::fprintf(stderr, "[INFO] loading Qwen3-TTS (talker ~1GB + predictor ~156MB) ...\n");
+    std::fprintf(stderr, "[INFO] loading Qwen3-TTS (talker + predictor + codec) ...\n");
     bool loaded = sess->load(model_dir, opts, bc, &load_err);
     if (!loaded) {
-        // If the weights aren't found, skip rather than failing — this test
-        // requires external model files that aren't part of the build.
         std::fprintf(stderr, "[SKIP] load failed (weights not available?): %s\n",
                      load_err.c_str());
-        return 77;  // ctest skip code
+        return 77;
     }
     std::fprintf(stderr, "[INFO] model loaded\n");
 
-    // ── Build TTS request ───────────────────────────────────────────────────
     TtsRequest req;
-    req.text        = "Hello, this is a test of Qwen3-TTS on audiocore.";
-    req.speed       = 1.0f;
-    req.temperature = 0.7f;
-    req.top_p       = 0.9f;
-    req.language    = "en";
+    req.text           = "Hello, this is a test of Qwen3-TTS on audiocore.";
+    req.max_new_tokens = 50;
+    req.speed          = 1.0f;
+    req.temperature    = 0.7f;
+    req.top_p          = 0.9f;
+    req.language       = "en";
 
     TtsResponse resp;
     std::string run_err;
@@ -105,21 +102,19 @@ int main() {
     bool ok = sess->run_tts(&req, &resp, &run_err);
     CHECK(ok, ("run_tts failed: " + run_err).c_str());
 
-    // ── Verify output ───────────────────────────────────────────────────────
     CHECK(!resp.pcm_mono.empty(), "output PCM is empty");
     std::fprintf(stderr, "[INFO] output: %zu samples @ %d Hz (%.2f sec)\n",
                  resp.pcm_mono.size(), resp.sampling_rate,
                  static_cast<double>(resp.pcm_mono.size()) / resp.sampling_rate);
 
     double sum_sq = 0.0;
-    for (float s : resp.pcm_mono) sum_sq += static_cast<double>(s) * s;
+    for (float s : resp.pcm_mono)
+        sum_sq += static_cast<double>(s) * s;
     double rms = std::sqrt(sum_sq / resp.pcm_mono.size());
-    // The codec decode is currently a silence stub (see src/models/qwen3_tts/
-    // session.cpp); until the ggml speech-tokenizer port lands, RMS is ~0
-    // and we only assert that run_tts returned PCM of the expected shape.
-    std::fprintf(stderr, "[INFO] RMS level: %.6f (silence expected until codec wired)\n", rms);
+    std::fprintf(stderr, "[INFO] RMS=%.6f\n", rms);
+    // Codec is wired — expect real audio, not silence.
+    CHECK(rms > 1e-6, "output is silent (RMS ~ 0) — codec decode issue");
 
-    // ── Write output WAV ────────────────────────────────────────────────────
     CHECK(write_wav(OUTPUT_WAV, resp.pcm_mono.data(),
                     resp.pcm_mono.size(), resp.sampling_rate) == 0,
           "failed to write output WAV");

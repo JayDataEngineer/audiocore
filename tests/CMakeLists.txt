@@ -38,6 +38,7 @@ audiocore_test(test_projection)
 audiocore_test(test_acestep_units)
 audiocore_test(test_server_e2e)
 audiocore_test(test_sampler)
+audiocore_test(test_moss_units)
 audiocore_test_with_bin(test_convert_acestep convert_acestep)
 
 # End-to-end MOSS-TTS test — requires ~7.5GB model files + ~7GB ONNX codec.
@@ -52,3 +53,6 @@ target_link_libraries(test_moss_e2e PRIVATE audiocore_framework)
 # Set QWEN3TTS_DIR / QWEN3TTS_NGPU / QWEN3TTS_DEVICE env vars to configure.
 add_executable(test_qwen3tts_e2e test_qwen3tts_e2e.cpp)
 target_link_libraries(test_qwen3tts_e2e PRIVATE audiocore_framework)
+
+add_executable(test_gguf_dump test_gguf_dump.cpp)
+target_link_libraries(test_gguf_dump PRIVATE audiocore_framework)

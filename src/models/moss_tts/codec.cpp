@@ -180,6 +180,14 @@ ggml_tensor* MossCodecGraphs::tensor_or_null_(const std::string& name) const {
     return ggml_get_tensor(source_ctx_, name.c_str());
 }
 
+// ── Macro to register a tensor pointer for device copy ──────────────────────
+// Called in resolve_decoder_() after assigning each member field.
+#define REG_SRC(member_ptr) do { \
+    if ((member_ptr)) { \
+        tensor_srcs_.push_back({&(member_ptr), (member_ptr)}); \
+    } \
+} while(0)
+
 // ───────────────────────────────────────────────────────────────────────────
 // Tensor resolution
 // ───────────────────────────────────────────────────────────────────────────
@@ -189,6 +197,7 @@ void MossCodecGraphs::resolve_decoder_() {
     for (int i = 0; i < CODEC_NUM_VQ; ++i) {
         codebook_[i] = tensor_("moss.codec.quantizer.q." + std::to_string(i)
                                 + ".codebook.weight");
+        REG_SRC(codebook_[i]);
     }
 
     // Decoder stages.
@@ -200,23 +209,25 @@ void MossCodecGraphs::resolve_decoder_() {
         // Optional input/output projections (Identity in PyTorch when dim matches).
         S.iproj = (S.spec.d_model != S.spec.input_dim)
             ? tensor_(base + "iproj.weight") : nullptr;
+        REG_SRC(S.iproj);
         S.oproj = (S.spec.d_model != S.spec.output_dim)
             ? tensor_(base + "oproj.weight") : nullptr;
+        REG_SRC(S.oproj);
 
         S.layers.resize(size_t(S.spec.n_layers));
         for (int li = 0; li < S.spec.n_layers; ++li) {
             const std::string lb = base + "tr.l." + std::to_string(li) + ".";
             Layer& L = S.layers[size_t(li)];
-            L.norm1_w       = tensor_(lb + "norm1.weight");
-            L.norm1_b       = tensor_(lb + "norm1.bias");
-            L.norm2_w       = tensor_(lb + "norm2.weight");
-            L.norm2_b       = tensor_(lb + "norm2.bias");
-            L.attn_in       = tensor_(lb + "attn.inp.0.weight");
-            L.attn_out      = tensor_(lb + "attn.outp.0.weight");
-            L.linear1       = tensor_(lb + "linear1.weight");
-            L.linear2       = tensor_(lb + "linear2.weight");
-            L.layer_scale_1 = tensor_(lb + "layer_scale_1.scale");
-            L.layer_scale_2 = tensor_(lb + "layer_scale_2.scale");
+            L.norm1_w       = tensor_(lb + "norm1.weight");       REG_SRC(L.norm1_w);
+            L.norm1_b       = tensor_(lb + "norm1.bias");         REG_SRC(L.norm1_b);
+            L.norm2_w       = tensor_(lb + "norm2.weight");       REG_SRC(L.norm2_w);
+            L.norm2_b       = tensor_(lb + "norm2.bias");         REG_SRC(L.norm2_b);
+            L.attn_in       = tensor_(lb + "attn.inp.0.weight");  REG_SRC(L.attn_in);
+            L.attn_out      = tensor_(lb + "attn.outp.0.weight"); REG_SRC(L.attn_out);
+            L.linear1       = tensor_(lb + "linear1.weight");     REG_SRC(L.linear1);
+            L.linear2       = tensor_(lb + "linear2.weight");     REG_SRC(L.linear2);
+            L.layer_scale_1 = tensor_(lb + "layer_scale_1.scale"); REG_SRC(L.layer_scale_1);
+            L.layer_scale_2 = tensor_(lb + "layer_scale_2.scale"); REG_SRC(L.layer_scale_2);
         }
     }
 }
@@ -235,7 +246,8 @@ void MossCodecGraphs::compute_effective_weights_() {
     // Build a fresh ggml_context for the effective-weight descriptors.
     {
         ggml_init_params ip{};
-        ip.mem_size   = ggml_tensor_overhead() * 200;
+        // ~1320 entries from tensor_srcs_ + ~200 effective-weight tensors.
+        ip.mem_size   = ggml_tensor_overhead() * 2000;
         ip.mem_buffer = nullptr;
         ip.no_alloc   = true;
         w_ctx_ = ggml_init(ip);
@@ -261,13 +273,53 @@ void MossCodecGraphs::compute_effective_weights_() {
     quant_oproj_w_ = make_w("quant.oproj.w", CODEC_RVQ_DIM, CODEC_OUT_DIM);
     quant_oproj_b_ = make_b("quant.oproj.b", CODEC_OUT_DIM);
 
-    // Allocate backing storage on the backend.
+    // ── Device copies of ALL codec weight tensors from source_ctx_ ──────────
+    // The source_ctx_ tensors have data pointing to host mmap memory. Create
+    // copies in w_ctx_ so ggml_backend_alloc_ctx_tensors puts them in device
+    // memory, then upload the actual weight data.
+    //
+    // tensor_srcs_ was populated by resolve_decoder_() — each entry has a
+    // field_ptr pointing to the source tensor pointer in the Layer/Stage
+    // structs (or codebook_[]). We create identical-shaped tensors in w_ctx_,
+    // then after allocation+upload, update *field_ptr to point to the device
+    // copy so the graph builders automatically reference device memory.
+    const size_t n_src = tensor_srcs_.size();
+    std::vector<ggml_tensor*> dst_tensors(n_src, nullptr);
+    for (size_t i = 0; i < n_src; ++i) {
+        ggml_tensor* src = tensor_srcs_[i].src;
+        const int nd = ggml_n_dims(src);
+        const int64_t ne_arr[] = {src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
+        ggml_tensor* dst = ggml_new_tensor(w_ctx_, src->type, nd, ne_arr);
+        if (src->name[0]) {
+            ggml_set_name(dst, (std::string("d_") + src->name).c_str());
+        } else {
+            ggml_set_name(dst, ("d_src_" + std::to_string(i)).c_str());
+        }
+        dst_tensors[i] = dst;
+    }
+
+    // Allocate backing storage on the backend. This allocates device memory
+    // for ALL tensors in w_ctx_ (effective weights + all source tensor copies).
     w_buf_ = ggml_backend_alloc_ctx_tensors(w_ctx_, backend_);
     if (!w_buf_) {
         throw std::runtime_error("compute_effective_weights_: alloc_ctx_tensors for weight buf failed");
     }
 
-    // Helper: read f16 backend tensor into a host buffer.
+    // Upload source tensor data from host mmap to device memory, and update
+    // field pointers to the device copies.
+    for (size_t i = 0; i < n_src; ++i) {
+        ggml_tensor* dst = dst_tensors[i];
+        ggml_tensor* src = tensor_srcs_[i].src;
+        const size_t nbytes = ggml_nbytes(src);
+        ggml_backend_tensor_set(dst, src->data, 0, nbytes);
+        *tensor_srcs_[i].field_ptr = dst;
+    }
+    // Clear src list — the pointers now live in the field members.
+    tensor_srcs_.clear();
+
+    // Helper: read f16 tensor data into a host buffer. Handles both
+    // device-resident tensors (backend buffer present) and host-resident
+    // source_ctx_ tensors that have mmap data but no backend buffer.
     auto read_f16 = [](ggml_tensor* t, std::vector<uint16_t>& out) {
         if (t->type != GGML_TYPE_F16) {
             throw std::runtime_error(std::string("read_f16: expected f16 for ")
@@ -275,7 +327,14 @@ void MossCodecGraphs::compute_effective_weights_() {
         }
         const size_t n = ggml_nelements(t);
         out.resize(n);
-        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(uint16_t));
+        if (t->buffer) {
+            ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(uint16_t));
+        } else if (t->data) {
+            std::memcpy(out.data(), t->data, n * sizeof(uint16_t));
+        } else {
+            throw std::runtime_error(std::string("read_f16: tensor has no buffer and no data for ")
+                                     + (t->name[0] ? std::string(t->name) : "<unnamed>"));
+        }
     };
 
     // Reconstruct effective weight from wp0/wp1/bias (all f16 on device)
@@ -580,6 +639,8 @@ std::vector<float> MossCodecGraphs::decode(const int32_t* codes,
     ggml_tensor* sum = nullptr;
     for (int i = 0; i < CODEC_NUM_VQ; ++i) {
         // (codebook_dim=8, T) via embedding lookup → f32 (get_rows promotes).
+        // codebook_[i] now points to the device copy in w_buf_ (the generic
+        // device-copy mechanism in compute_effective_weights_ updated it).
         ggml_tensor* z = ggml_get_rows(gctx, codebook_[i], codes_in[i]);
         // Conv1d 8 → 512 (kernel=1). Effective weight stored as (in=8, out=512) f16.
         z = ggml_mul_mat(gctx, q_oproj_w_[i], z);                    // (512, T) f32

@@ -69,8 +69,9 @@ using audiocore::sampler::Params;
 using audiocore::sampler::sample_token;
 
 // ── Codec special tokens (from official Qwen3-TTS config) ────────────────
-static constexpr int32_t CODEC_PAD    = 4196;
-static constexpr int32_t CODEC_BOS    = 4197;
+// PAD and BOS are the last two rows of the codec embedding table.
+static int32_t codec_pad(int32_t vocab) { return vocab - 2; }
+static int32_t codec_bos(int32_t vocab) { return vocab - 1; }
 static constexpr int32_t CODEC_EOS    = 4198;
 static constexpr int32_t CODEC_THINK  = 4202;
 static constexpr int32_t CODEC_NOT    = 4203;
@@ -358,43 +359,44 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
 
     std::vector<float> codec_prefix((size_t)prefix_len * n_embd, 0.0f);
 
-    if (talker_->codec_embedding()) {
+    const int32_t ce_dim = talker_->codec_embd_dim();
+    const int32_t pad_idx     = codec_pad(codec_vocab);
+    const int32_t bos_idx     = codec_bos(codec_vocab);
+
+
+    if (talker_->codec_embedding() && ce_dim > 0) {
         // codec_pad for all text+instruct positions
         for (int32_t i = 0; i < n_text_tokens; i++) {
-            const float* pad_row = talker_->codec_embedding() + (size_t)CODEC_PAD * n_embd;
+            const float* pad_row = talker_->codec_embedding() + (size_t)pad_idx * ce_dim;
             std::memcpy(&codec_prefix[(size_t)i * n_embd], pad_row,
-                        (size_t)n_embd * sizeof(float));
+                        (size_t)ce_dim * sizeof(float));
         }
         int32_t cursor = n_text_tokens;
-        // Optional speaker slot: CustomVoice speaker token OR Voice Clone
-        // ECAPA embedding (mutually exclusive — Voice Clone mode does not
-        // use speaker_name).
+        // Optional speaker slot
         if (has_spk_slot) {
             if (has_vc_spk) {
-                // Voice Clone: inject the ECAPA-computed speaker embedding
-                // directly into the codec bridge at the speaker position.
                 std::memcpy(&codec_prefix[(size_t)cursor * n_embd],
                             vc_spk_emb.data(),
                             (size_t)n_embd * sizeof(float));
-            } else if (speaker_token < talker_->codec_vocab()) {
+            } else if (speaker_token < codec_vocab) {
                 const float* spk_row =
-                    talker_->codec_embedding() + (size_t)speaker_token * n_embd;
+                    talker_->codec_embedding() + (size_t)speaker_token * ce_dim;
                 std::memcpy(&codec_prefix[(size_t)cursor * n_embd], spk_row,
-                            (size_t)n_embd * sizeof(float));
+                            (size_t)ce_dim * sizeof(float));
             } else {
                 std::fprintf(stderr,
                     "qwen3_tts: speaker token %d out of codec vocab range %d; "
                     "skipping speaker slot\n",
-                    speaker_token, talker_->codec_vocab());
+                    speaker_token, codec_vocab);
             }
             cursor += 1;
         }
-        // codec_pad for reference text (ICL prefill, Voice Clone only)
+        // codec_pad for reference text (ICL prefill)
         if (has_ref_text) {
             for (int32_t i = 0; i < n_ref_tokens; i++) {
-                const float* pad_row = talker_->codec_embedding() + (size_t)CODEC_PAD * n_embd;
+                const float* pad_row = talker_->codec_embedding() + (size_t)pad_idx * ce_dim;
                 std::memcpy(&codec_prefix[(size_t)cursor * n_embd], pad_row,
-                            (size_t)n_embd * sizeof(float));
+                            (size_t)ce_dim * sizeof(float));
                 cursor += 1;
             }
         }
@@ -402,24 +404,28 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         if (has_ref_codes) {
             for (int32_t i = 0; i < n_ref_frames; i++) {
                 int32_t code = ref_codes[(size_t)i];
-                if (code >= 0 && code < talker_->codec_vocab()) {
-                    const float* code_row = talker_->codec_embedding() + (size_t)code * n_embd;
-                    const float* pad_row  = talker_->codec_embedding() + (size_t)CODEC_PAD * n_embd;
-                    for (int j = 0; j < n_embd; j++) {
+                if (code >= 0 && code < codec_vocab) {
+                    const float* code_row = talker_->codec_embedding() + (size_t)code * ce_dim;
+                    const float* pad_row  = talker_->codec_embedding() + (size_t)pad_idx * ce_dim;
+                    for (int j = 0; j < ce_dim; j++) {
                         codec_prefix[(size_t)cursor * n_embd + j] = code_row[j] + pad_row[j];
                     }
                 } else {
-                    const float* pad_row = talker_->codec_embedding() + (size_t)CODEC_PAD * n_embd;
+                    const float* pad_row = talker_->codec_embedding() + (size_t)pad_idx * ce_dim;
                     std::memcpy(&codec_prefix[(size_t)cursor * n_embd], pad_row,
-                                (size_t)n_embd * sizeof(float));
+                                (size_t)ce_dim * sizeof(float));
                 }
                 cursor += 1;
             }
         }
         // codec_bos for the final position.
-        const float* bos_row = talker_->codec_embedding() + (size_t)CODEC_BOS * n_embd;
-        std::memcpy(&codec_prefix[(size_t)cursor * n_embd], bos_row,
-                    (size_t)n_embd * sizeof(float));
+        if (bos_idx >= 0 && bos_idx < codec_vocab) {
+            const float* bos_row = talker_->codec_embedding() + (size_t)bos_idx * ce_dim;
+            std::memcpy(&codec_prefix[(size_t)cursor * n_embd], bos_row,
+                        (size_t)ce_dim * sizeof(float));
+        } else {
+            std::fprintf(stderr, "qwen3_tts: codec_bos index %d out of range\n", bos_idx);
+        }
     } else {
         std::fprintf(stderr, "qwen3_tts: no codec embedding table!\n");
     }
@@ -487,7 +493,7 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     } else {
         // Lunavox fallback: use token-mode with text tokens + codec_bos
         std::vector<int32_t> token_input(text_tokens);
-        token_input.push_back(CODEC_BOS);
+        token_input.push_back(bos_idx);
         if (!talker_->forward_get_hidden(token_input.data(), (int32_t)token_input.size(),
                                          0, talker_hidden.data(), error)) {
             return false;
@@ -533,12 +539,12 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         // ── 3a. Sample codebook 0 via codec_head ───
         int32_t code_0 = 0;
         if (talker_->codec_head()) {
-            const float* head = talker_->codec_head();  // [codec_vocab, n_embd]
+            const float* head = talker_->codec_head();  // [codec_vocab, ce_dim]
             std::vector<float> c0_logits((size_t)codec_vocab);
             for (int j = 0; j < codec_vocab; j++) {
                 float s = 0;
-                for (int d = 0; d < n_embd; d++) {
-                    s += cur_hidden[(size_t)d] * head[(size_t)j * n_embd + d];
+                for (int d = 0; d < ce_dim; d++) {
+                    s += cur_hidden[(size_t)d] * head[(size_t)j * ce_dim + d];
                 }
                 c0_logits[(size_t)j] = s;
             }
@@ -653,19 +659,20 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
             // Coarse code (codebook 0) uses talker's codec_embedding
             int32_t c0 = std::max(0, code_0);
             if (c0 < talker_->codec_vocab()) {
-                const float* c0_row = talker_->codec_embedding() + (size_t)c0 * n_embd;
-                for (int d = 0; d < n_embd; d++) next_embd[(size_t)d] += c0_row[d];
+                const float* c0_row = talker_->codec_embedding() + (size_t)c0 * ce_dim;
+                for (int d = 0; d < ce_dim; d++) next_embd[(size_t)d] += c0_row[d];
             }
 
             // Fine codes use predictor's fine_embd tables
+            const int32_t fe_dim = predictor_->fine_embd_dim();
             for (int i = 0; i < n_fine_books; i++) {
                 int32_t cid = fine_codes[(size_t)i];
                 if (predictor_->has_mtp()) {
                     const float* fi_row = predictor_->fine_embedding(i);
                     if (fi_row && cid >= 0) {
                         cid = cid % predictor_->vocab_size();
-                        const float* row = fi_row + (size_t)cid * n_embd;
-                        for (int d = 0; d < n_embd; d++) next_embd[(size_t)d] += row[d];
+                        const float* row = fi_row + (size_t)cid * fe_dim;
+                        for (int d = 0; d < fe_dim; d++) next_embd[(size_t)d] += row[d];
                     }
                 }
             }
