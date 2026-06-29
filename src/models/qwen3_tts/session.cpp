@@ -25,14 +25,16 @@
 // enabling voice cloning from a reference WAV file. Setups without the speaker
 // encoder still fail fast with a GAPS.md pointer.
 //
-// Stage 18 update: ICL prefill (xvec_only) — when `reference_text` is provided
+// Stage 18 update: ICL prefill — when `reference_text` is provided
 // in Voice Clone mode, the reference text tokens are embedded via text_proj and
 // inserted between the speaker slot and codec_bos. This gives the talker
 // phonetic context about the reference voice during the prefill, improving
-// clone fidelity. No ref-codes are used (codec encoder not required). The
-// prefill layout becomes:
-//   [syn_text_emb + codec_pad] [spk_emb] [ref_text_emb + codec_pad] [codec_bos]
-// Full ICL with ref-codes remains a follow-up (CODEC_PORTS.md §4.9).
+// clone fidelity. When the codec encoder is present (codec.enc.* tensors), the
+// reference audio is also encoded into code tokens (ref_codes) and injected as
+// additional prefill positions between ref_text and codec_bos, giving the
+// talker full acoustic context. The prefill layout becomes:
+//   [syn_text_emb + codec_pad] [spk_emb] [ref_text_emb + codec_pad]
+//   [codec_emb(ref_code) + codec_pad] [codec_bos]
 //
 // Stage 19 update: per-frame streaming for Qwen3-TTS. When mode="streaming"
 // and a non-null stream callback is provided (req.stream->on_audio), the AR
@@ -197,6 +199,42 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                      vc_spk_emb.size());
     }
 
+    // ── Full ICL: encode reference audio via codec encoder ────────────────
+    // When the codec encoder is present, we encode the reference WAV into
+    // code tokens and inject them as ref_code positions in the talker prefill.
+    // This gives the talker acoustic context about the reference voice.
+    std::vector<int32_t> ref_codes;
+    bool has_ref_codes = false;
+    if (mode == Qwen3TtsMode::VoiceClone && !req.reference_audio.empty()
+        && codec_graphs_.has_encoder()) {
+        std::string wav_err;
+        std::vector<float> ref_pcm = Qwen3TtsSpeakerEncoder::load_wav(
+            req.reference_audio, &wav_err);
+        if (ref_pcm.empty()) {
+            std::fprintf(stderr, "qwen3_tts: full ICL: failed to load reference WAV "
+                                 "for codec encode (%s); skipping ref codes\n",
+                         wav_err.c_str());
+        } else {
+            std::fprintf(stderr, "qwen3_tts: full ICL: encoding %zu PCM samples "
+                                 "via codec encoder\n", ref_pcm.size());
+            std::vector<int32_t> ref_codes_all = codec_graphs_.encode(
+                ref_pcm.data(), (int32_t)ref_pcm.size());
+            if (ref_codes_all.empty()) {
+                std::fprintf(stderr, "qwen3_tts: full ICL: codec encoder failed; "
+                                     "skipping ref codes\n");
+            } else {
+                // ref_codes_all is [16, T_ref] row-major. Extract codebook 0.
+                const int32_t T_ref = (int32_t)(ref_codes_all.size() / 16);
+                ref_codes.resize(size_t(T_ref));
+                for (int32_t t = 0; t < T_ref; ++t)
+                    ref_codes[size_t(t)] = ref_codes_all[size_t(t)];
+                has_ref_codes = true;
+                std::fprintf(stderr, "qwen3_tts: full ICL: %d ref code frames\n",
+                             T_ref);
+            }
+        }
+    }
+
     // Voice Design mode: the instruct field carries the voice description.
     // We prefix it with the VoiceDesign template so the model knows to
     // synthesize the voice before speaking. If instruct is empty we still
@@ -313,7 +351,10 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     const bool has_speaker   = (speaker_token >= 0);
     const bool has_vc_spk    = !vc_spk_emb.empty();
     const bool has_spk_slot  = has_speaker || has_vc_spk;
-    const int32_t prefix_len = n_text_tokens + (has_spk_slot ? 1 : 0) + (has_ref_text ? n_ref_tokens : 0) + 1;
+    const int32_t n_ref_frames = has_ref_codes ? (int32_t)ref_codes.size() : 0;
+    const int32_t prefix_len = n_text_tokens + (has_spk_slot ? 1 : 0)
+                             + (has_ref_text ? n_ref_tokens : 0)
+                             + n_ref_frames + 1;
 
     std::vector<float> codec_prefix((size_t)prefix_len * n_embd, 0.0f);
 
@@ -357,6 +398,24 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                 cursor += 1;
             }
         }
+        // codec_pad + ref_code embedding for reference code frames (full ICL)
+        if (has_ref_codes) {
+            for (int32_t i = 0; i < n_ref_frames; i++) {
+                int32_t code = ref_codes[(size_t)i];
+                if (code >= 0 && code < talker_->codec_vocab()) {
+                    const float* code_row = talker_->codec_embedding() + (size_t)code * n_embd;
+                    const float* pad_row  = talker_->codec_embedding() + (size_t)CODEC_PAD * n_embd;
+                    for (int j = 0; j < n_embd; j++) {
+                        codec_prefix[(size_t)cursor * n_embd + j] = code_row[j] + pad_row[j];
+                    }
+                } else {
+                    const float* pad_row = talker_->codec_embedding() + (size_t)CODEC_PAD * n_embd;
+                    std::memcpy(&codec_prefix[(size_t)cursor * n_embd], pad_row,
+                                (size_t)n_embd * sizeof(float));
+                }
+                cursor += 1;
+            }
+        }
         // codec_bos for the final position.
         const float* bos_row = talker_->codec_embedding() + (size_t)CODEC_BOS * n_embd;
         std::memcpy(&codec_prefix[(size_t)cursor * n_embd], bos_row,
@@ -368,6 +427,7 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     // Sum text embeddings + codec prefix
     // Layout (no ICL):         [syn_text_emb + codec_pad × L_syn] [spk_emb] [codec_bos]
     // Layout (with ICL):       [syn_text_emb + codec_pad × L_syn] [spk_emb] [ref_text_emb + codec_pad × L_ref] [codec_bos]
+    // Layout (full ICL):       [syn_text_emb + codec_pad × L_syn] [spk_emb] [ref_text_emb + codec_pad × L_ref] [codec_emb(ref_code) + codec_pad × T_ref] [codec_bos]
     std::vector<float> talker_input((size_t)prefix_len * n_embd);
 
     if (talker_->has_text_embedding() && !text_embd.empty()) {
@@ -393,6 +453,14 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                     talker_input[idx] = ref_text_embd[(size_t)i * n_embd + j] + codec_prefix[idx];
                 }
             }
+        }
+        // Reference code positions (full ICL): codec_prefix already has
+        // codec_embedding(ref_code) + codec_pad, just copy the values.
+        if (has_ref_codes) {
+            const size_t rc_offset = (size_t)(n_text_tokens + (has_spk_slot ? 1 : 0)
+                                            + (has_ref_text ? n_ref_tokens : 0)) * n_embd;
+            std::memcpy(&talker_input[rc_offset], &codec_prefix[rc_offset],
+                        (size_t)n_ref_frames * n_embd * sizeof(float));
         }
         // codec_bos is already at its position in codec_prefix; copy it over
         // (it lives at the last position, which the initial zero-init leaves unset).

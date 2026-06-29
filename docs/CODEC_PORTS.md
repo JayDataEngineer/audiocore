@@ -584,37 +584,41 @@ The Voice Clone flow in `Qwen3TtsSession::run_inference()`:
   fmin=0, fmax=12000, reflect-pad, periodic Hann, magnitude STFT, Slaney
   mel filterbank with area normalization, ln log).
 
-### 4.9 ICL prefill (Stage 18)
+### 4.9 ICL prefill (Stage 18 / Phase B)
 
-The Voice Clone path now supports an **xvec_only ICL prefill**: when
-`reference_text` is provided alongside `reference_audio`, the ref text
-tokens are inserted between the speaker embedding and `codec_bos` in the
-prefill:
+The Voice Clone path supports two levels of ICL prefill depending on
+whether the codec encoder port is available in the GGUF.
+
+**xvec_only** (always available): when `reference_text` is provided, the
+ref text tokens are embedded via `text_proj` and summed with `codec_pad`,
+inserted between the speaker embedding and `codec_bos`:
 
 ```
 [syn_text_emb + codec_pad] [spk_emb] [ref_text_emb + codec_pad] [codec_bos]
 ```
 
-This gives the talker phonetic context about the reference voice during
-the prefill, which improves clone fidelity. The implementation is in
-`src/models/qwen3_tts/session.cpp` — the `run_inference()` method checks
-for non-empty `req.reference_text` when `mode == VoiceClone` and extends
-the prefill accordingly. No codec encoder is needed: ref-codes are skipped
-(the `xvec_only` pattern from CrispASR's `build_icl_prefill_embeds`).
+**Full ICL** (requires `codec.enc.*` tensors in the codec GGUF): the
+reference audio is encoded through the SEANet encoder + encoder transformer
++ downsample + RVQ quantizer (see §4.8). The resulting coarse codes
+(codebook 0) are embedded via the talker's `codec_embedding()` table, summed
+with `codec_pad`, and inserted between `ref_text` and `codec_bos`:
 
-| Item | Pre-Stage 18 | Post-Stage 18 |
+```
+[syn_text_emb + codec_pad] [spk_emb] [ref_text_emb + codec_pad]
+[codec_emb(ref_code) + codec_pad × T_ref] [codec_bos]
+```
+
+This gives the talker both phonetic context (ref text) and acoustic context
+(ref code tokens), matching CrispASR's `build_icl_prefill_embeds` layout.
+
+| Item | Pre-Stage 18 | Post-Phase B |
 |---|---|---|
-| ICL prefill (xvec_only) | ❌ not implemented | ✅ implemented — ref_text embedded via text_proj, summed with codec_pad, injected between spk and codec_bos |
-| ICL prefill (full, with ref_codes) | ❌ not implemented | ❌ deferred — requires codec encoder port (`run_cenc` from CrispASR) |
+| ICL prefill (xvec_only) | ❌ not implemented | ✅ implemented |
+| ICL prefill (full, with ref_codes) | ❌ not implemented | ✅ implemented — codec encoder port (§4.8) + prefill fusion |
 
-**Full ICL** (with ref-codes from the codec encoder) remains a follow-up:
-
-1. The codec encoder forward (`run_cenc` in CrispASR) — produce ref-codes
-   from the reference WAV using the SEANet encoder + encoder transformer +
-   downsample + RVQ quantizer (`g3t_cenc` struct in CrispASR)
-2. The full ICL fusion — elementwise sum of `(ref_text_emb + syn_text_emb + tts_eos)`
-   with `(codec_bos_emb + ref_codes_emb)` per the CrispASR `build_icl_prefill_embeds`
-   layout, with trailing padding
-
-The xvec_only path already unblocks Voice Clone with phonetic context,
-and the full ICL path can be added on top without changing the public API.
+Implementation:
+- Codec encoder: `codec.cpp` — `encode()` entry point, SEANet graph builder,
+  encoder transformer, downsample, CPU-side RVQ quantize
+- ICL fusion: `session.cpp` — `run_inference()` encodes ref WAV, stores
+  coarse codes, extends `prefix_len`, fills `codec_prefix` at ref-code
+  positions with `codec_embedding(code) + codec_pad`, copies into `talker_input`
