@@ -120,6 +120,23 @@ inline int run_all() {
         }                                                                  \
     } while (0)
 
+#define AUDIOCORE_CHECK_CLOSE(a, b, tol)                                   \
+    do {                                                                   \
+        auto _a = (a);                                                     \
+        auto _b = (b);                                                     \
+        double _diff = (_a > _b)                                           \
+            ? (double)(_a - _b)                                            \
+            : (double)(_b - _a);                                           \
+        if (_diff > (double)(tol)) {                                       \
+            throw ::audiocore::test::Failure(                              \
+                __FILE__, __LINE__, #a " ≈ " #b,                           \
+                "got: " + ::audiocore::test::to_dbg(_a) +                  \
+                ", want: " + ::audiocore::test::to_dbg(_b) +               \
+                ", diff: " + ::audiocore::test::to_dbg(_diff) +            \
+                ", tol: " + ::audiocore::test::to_dbg((double)(tol)));     \
+        }                                                                  \
+    } while (0)
+
 #define AUDIOCORE_FAIL(msg)                                                \
     throw ::audiocore::test::Failure(__FILE__, __LINE__, "", (msg))
 
