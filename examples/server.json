@@ -1,32 +1,21 @@
 {
-  "_comment": "audiocore server config. One entry per loaded model id. Concurrency = N entries; requests on the same id serialize through that session. Copy this file, edit the 'path' fields to point at your local GGUFs, then run: audiocore_server --config your_server.json",
+  "_comment": "audiocore server config",
 
-  "host":   "127.0.0.1",
-  "port":   8080,
+  "host":   "0.0.0.0",
+  "port":   8081,
   "device": 0,
   "threads": 4,
 
   "models": [
     {
-      "id":       "moss-tts",
-      "family":   "moss_tts",
-      "path":     "/path/to/your/weights/moss-tts/moss-tts-q8_0.gguf",
-      "backend":  "ggml_cuda"
-    },
-    {
-      "id":       "ace-step-turbo",
-      "family":   "ace_step",
-      "path":     "/path/to/your/weights/ace-step/",
-      "backend":  "ggml_cuda"
-    },
-    {
       "id":       "qwen3-tts",
       "family":   "qwen3_tts",
-      "path":     "/path/to/your/weights/qwen3-tts/",
+      "path":     "/mnt/data/models/audio/qwen3-tts/",
       "backend":  "ggml_cuda",
       "extras": {
-        "talker_path":    "qwen3_tts_talker.q5_k.gguf",
-        "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+        "talker_path":    "talker.q5_k.gguf",
+        "predictor_path": "predictor.q8_0.gguf",
+        "codec_path":     "tokenizer-f16.gguf",
         "n_gpu_layers":   "99"
       }
     }
@@ -35,7 +24,7 @@
   "_endpoints": [
     "GET  /health",
     "GET  /v1/models",
-    "POST /v1/audio/speech   { model: 'moss-tts',        input: 'hello', voice: '', language: 'en' }",
-    "POST /v1/audio/music    { model: 'ace-step-turbo',  caption: 'lo-fi piano', lyrics: '', duration: 30, guidance_scale: 7.5, steps: 8 }"
+    "POST /v1/audio/speech   { model: 'qwen3-tts', input: 'hello', voice: 'Vivian' }",
+    "POST /v1/audio/music    { model: 'ace-step-turbo', caption: 'lo-fi piano', duration: 30 }"
   ]
 }
