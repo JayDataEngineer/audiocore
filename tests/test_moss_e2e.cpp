@@ -1,14 +1,12 @@
 // test_moss_e2e.cpp — Load MOSS-TTS, run one TTS request, verify output.
 //
 // Requires the following model files (download via fetch_models.sh or
-// manually):
-//   /mnt/data/models/audio/moss-tts/moss-tts-v1.5-q8_0.gguf          (backbone)
-//   /mnt/data/models/audio/moss-tts/moss-tts-v1.5-q8_0.extras.gguf   (codec +
-//                                                                      audio
-//                                                                      embeds +
-//                                                                      LM heads)
+// manually) somewhere on disk, pointed at by AUDIOCORE_MOSS_DIR:
+//   $AUDIOCORE_MOSS_DIR/moss-tts-v1.5-q8_0.gguf          (backbone)
+//   $AUDIOCORE_MOSS_DIR/moss-tts-v1.5-q8_0.extras.gguf   (codec + audio
+//                                                          embeds + LM heads)
 //
-// Sets AUDIOCORE_MOSS_DIR to override the model directory.
+// Skips cleanly (exit 0) when AUDIOCORE_MOSS_DIR is unset.
 
 #include "e2e_common.h"
 #include "audiocore/framework/core/backend.h"
@@ -26,8 +24,13 @@ int main() {
     audiocore_register_moss_tts();
 
     const char* env_dir = std::getenv("AUDIOCORE_MOSS_DIR");
-    std::string model_dir = env_dir ? env_dir
-                                    : "/mnt/data/models/audio/moss-tts/";
+    if (!env_dir) {
+        std::fprintf(stderr,
+            "[SKIP] set AUDIOCORE_MOSS_DIR to the directory holding the "
+            "MOSS GGUFs to run this e2e test\n");
+        return 0;
+    }
+    std::string model_dir = env_dir;
     std::string backbone_path = model_dir + "/moss-tts-v1.5-q8_0.gguf";
 
     // Try a prioritized list of extras GGUFs. The full extras (moss-tts.extras.gguf)

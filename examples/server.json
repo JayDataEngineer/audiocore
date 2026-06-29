@@ -1,5 +1,5 @@
 {
-  "_comment": "audiocore server config. One entry per loaded model id. Concurrency = N entries; requests on the same id serialize through that session.",
+  "_comment": "audiocore server config. One entry per loaded model id. Concurrency = N entries; requests on the same id serialize through that session. Copy this file, edit the 'path' fields to point at your local GGUFs, then run: audiocore_server --config your_server.json",
 
   "host":   "127.0.0.1",
   "port":   8080,
@@ -10,19 +10,19 @@
     {
       "id":       "moss-tts",
       "family":   "moss_tts",
-      "path":     "/mnt/data/models/audio/moss-tts/moss-tts-q8_0.gguf",
+      "path":     "/path/to/your/weights/moss-tts/moss-tts-q8_0.gguf",
       "backend":  "ggml_cuda"
     },
     {
       "id":       "ace-step-turbo",
       "family":   "ace_step",
-      "path":     "/mnt/data/models/audio/ace-step/",
+      "path":     "/path/to/your/weights/ace-step/",
       "backend":  "ggml_cuda"
     },
     {
       "id":       "qwen3-tts",
       "family":   "qwen3_tts",
-      "path":     "/mnt/data/models/audio/qwen3-tts/",
+      "path":     "/path/to/your/weights/qwen3-tts/",
       "backend":  "ggml_cuda",
       "extras": {
         "talker_path":    "qwen3_tts_talker.q5_k.gguf",

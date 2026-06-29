@@ -36,8 +36,13 @@ int main() {
     audiocore_register_moss_tts();
 
     const char* env_dir = std::getenv("AUDIOCORE_MOSS_DIR");
-    std::string model_dir = env_dir ? env_dir
-                                    : "/mnt/data/models/audio/moss-tts/";
+    if (!env_dir) {
+        std::fprintf(stderr,
+            "[SKIP] set AUDIOCORE_MOSS_DIR to the directory holding the "
+            "MOSS GGUFs to run this voice-clone e2e test\n");
+        return 0;
+    }
+    std::string model_dir = env_dir;
     std::string backbone_path = model_dir + "/moss-tts-v1.5-q8_0.gguf";
 
     // Prefer the full extras (codec tensors + encoder) over the v1.5 truncated
