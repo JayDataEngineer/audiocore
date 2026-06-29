@@ -9,10 +9,9 @@ is the only implementation language.
 |---|---|---|---|
 | **[MOSS-TTS](https://github.com/pwilkin/openmoss)** (8B) | `moss_tts` | TTS, dialogue (TTSD-style), voice design (VoiceGenerator-equivalent), sound effects, voice cloning | ✅ Stage 16: codec → PCM ported (adapted from `pwilkin/openmoss`, Apache-2.0). 3 of 6 modes wired end-to-end when fed codec-bearing weights (e.g. `smcleed/MOSS-TTS-v1.5-GGUF` sidecar); dialogue/voice_design are best-effort fallbacks for dedicated variants; realtime/streaming fails fast. |
 | **[Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS)** (Talker + MTP Predictor) | `qwen3_tts` | Multilingual TTS, instructable voice design, 9 default speakers (CustomVoice) | ✅ Stage 17b: codec → PCM ported (Stage 17) + ECAPA-TDNN speaker encoder (Stage 17b), both adapted from `CrispStrobe/CrispASR` (MIT). 4 of 5 modes wired end-to-end when fed the codec sidecar GGUF and talker with `speaker.*` tensors; voice_clone fails fast only when the speaker encoder tensors are absent; streaming fails fast. |
-| **[ACE-Step](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF)** (DiT + LM) | `ace_step` | Music generation (text-conditional, lyrics) | ✅ Text-to-Music fully wired end-to-end; 5 other modes fail fast with a pointer at GAPS.md |
+| **[ACE-Step](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF)** (DiT + LM) | `ace_step` | Music generation (text-conditional, lyrics) | ✅ Text-to-Music fully wired end-to-end; 5 other modes fail fast. |
 
-Run `audiocore_cli --list-supported` for the live mode matrix, or see
-[`GAPS.md`](GAPS.md) for the full per-family audit.
+Run `audiocore_cli --list-supported` for the live mode matrix.
 
 ---
 
@@ -79,7 +78,7 @@ sampling decoupled:
    / repetition-penalty / argmax in one place, used by every family and the
    MTP predictor.
 
-Detailed architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Detailed architecture lives in `CLAUDE.md` (in this repo) and the source tree itself.
 
 ---
 
@@ -91,6 +90,36 @@ Detailed architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - C++17 compiler (GCC 11+, Clang 14+, MSVC 2022+)
 - Git submodules: `git submodule update --init --recursive`
 - [Optional] CUDA toolkit ≥ 12 (for `ENGINE_ENABLE_CUDA`)
+- [Recommended] [`gitleaks`](https://github.com/gitleaks/gitleaks) ≥ 8.21 — enables the pre-push secret scan (see [Secret handling](#secret-handling))
+
+### Secret handling
+
+Live tokens (HuggingFace, etc.) live in `config/secrets.env`, which is
+**gitignored**. A template is shipped at `config/secrets.env.example`:
+
+```bash
+cp config/secrets.env.example config/secrets.env
+# edit in your real HF_TOKEN
+```
+
+Every push is scanned for secrets two ways:
+
+1. **Locally** — install the pre-push hook once after cloning:
+   ```bash
+   ./scripts/install-git-hooks.sh
+   ```
+   The hook (`scripts/hooks/pre-push`) runs `gitleaks detect` over the
+   commits being pushed and fails closed. Bypass with `git push --no-verify`
+   (not recommended). Set `AUDIOCORE_REQUIRE_GITLEAKS=1` to fail-closed
+   even when gitleaks isn't installed.
+
+2. **On the remote** — `.github/workflows/gitleaks.yml` runs the same scan
+   on every push and pull request, so leaks slip through only if both the
+   hook is bypassed *and* the workflow is disabled.
+
+The gitleaks config (`.gitleaks.toml`) extends the default rule set with
+explicit HuggingFace rules and allowlists `third_party/`, build artifacts,
+and `*.env.example` templates.
 
 ### Build
 
@@ -235,7 +264,7 @@ Same JSON body and same dispatch as `/v1/audio/speech`, but the WAV is
 emitted via chunked transfer encoding in ~64 KiB chunks. Transport-level
 scaffold only — the family still renders the full PCM before the first
 byte ships. True incremental streaming (frames as the autoregressive
-loop produces them) is open; see `GAPS.md` §1.2 / §2.2.
+loop produces them) is open.
 
 ### `POST /v1/audio/music` (Music generation)
 
@@ -256,7 +285,7 @@ loop produces them) is open; see `GAPS.md` §1.2 / §2.2.
 
 `mode` defaults to `text_to_music`. The five other advertised modes
 (`cover`, `repaint`, `stem`, `lego`, `completion`) fail fast with a
-pointer at `GAPS.md` §3.2 instead of silently running text-to-music.
+pointer at the error string instead of silently running text-to-music.
 
 Returns `audio/wav` (48 kHz stereo, 16-bit PCM).
 
@@ -278,14 +307,14 @@ Returns `{"status": "ok"}`.
 |---|---|
 | **Source** | [OpenMOSS-Team/MOSS-TTS](https://huggingface.co/OpenMOSS-Team/MOSS-TTS), [pwilkin/openmoss](https://github.com/pwilkin/openmoss) |
 | **Backbone** | Qwen3-8B (GGUF, via the unified `qwen3::Runner` over llama.cpp) |
-| **Audio codec** | 32-RVQ delay-pattern sampling. **Stage 16:** codec-token → PCM decoder is a ggml port of `openmoss/src/codec.cpp` (Apache-2.0) at `src/models/moss_tts/codec.cpp`. Auto-activates when the GGUF carries `moss.codec.*` tensors (e.g. `smcleod/MOSS-TTS-v1.5-GGUF` sidecar); community backbone-only GGUFs fall back to 1 s silence. See `docs/CODEC_PORTS.md` §1. |
+| **Audio codec** | 32-RVQ delay-pattern sampling. **Stage 16:** codec-token → PCM decoder is a ggml port of `openmoss/src/codec.cpp` (Apache-2.0) at `src/models/moss_tts/codec.cpp`. Auto-activates when the GGUF carries `moss.codec.*` tensors (e.g. `smcleod/MOSS-TTS-v1.5-GGUF` sidecar); community backbone-only GGUFs fall back to 1 s silence.. |
 | **Sampling** | Delay-pattern autoregressive: top-k, top-p, temperature, repetition penalty (via `audiocore::sampler`) |
 | **Output** | 24 kHz mono PCM |
 | **Weight formats** | Single GGUF (community), sidecar pair (`X.gguf` + `X.extras.gguf`, smcleod/MOSS-TTS-v1.5-GGUF), or backbone GGUF + `.npy` embedding/lm_head dirs |
 | **Status** | ✅ Stage 16: generation + codec decode work end-to-end with codec-bearing weights. Silence fallback otherwise. |
 | **Reference** | `pwilkin/openmoss` (C++, Apache-2.0) — parity target for byte-identical audio; pre-built sidecar GGUFs at `smcleod/MOSS-TTS-v1.5-GGUF` |
 
-GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
+GGUF tensor map: see the family `loader.cpp` and `tools/inspect_gguf`.
 
 ### Qwen3-TTS (`qwen3_tts`)
 
@@ -293,7 +322,7 @@ GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 |---|---|
 | **Source** | [QwenLM/Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS) |
 | **Backbone** | Talker (qwen3tts arch) + Code Predictor (qwen3tts_cp), both via the unified `qwen3::Runner` with `load_extras(ExtraKind::Talker/Predictor)` |
-| **Audio codec** | 16-codebook matrix (1 coarse + 15 MTP fine). Codec-token → PCM decoder is `Qwen3TtsCodecGraphs` in `src/models/qwen3_tts/codec.cpp` (Stage 17, adapted from `CrispStrobe/CrispASR` MIT). Auto-binds when the codec sidecar GGUF is discovered (`extras["codec_path"]` or `tokenizer-{f16,q8_0}.gguf` next to the talker); silence fallback otherwise. Pre-built GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`. See `docs/CODEC_PORTS.md` §2. Speaker embedding via ECAPA-TDNN (`src/models/qwen3_tts/speaker_encoder.cpp`, Stage 17b) for Voice Clone — loaded from `speaker.*` tensors in the talker GGUF. |
+| **Audio codec** | 16-codebook matrix (1 coarse + 15 MTP fine). Codec-token → PCM decoder is `Qwen3TtsCodecGraphs` in `src/models/qwen3_tts/codec.cpp` (Stage 17, adapted from `CrispStrobe/CrispASR` MIT). Auto-binds when the codec sidecar GGUF is discovered (`extras["codec_path"]` or `tokenizer-{f16,q8_0}.gguf` next to the talker); silence fallback otherwise. Pre-built GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`.. Speaker embedding via ECAPA-TDNN (`src/models/qwen3_tts/speaker_encoder.cpp`, Stage 17b) for Voice Clone — loaded from `speaker.*` tensors in the talker GGUF. |
 | **Sampling** | Top-p / temperature via `audiocore::sampler`; MTP predictor uses the same sampler for fine-codebook draws |
 | **Output** | 24 kHz mono PCM |
 | **Weight formats** | Two GGUFs (talker + predictor) produced by `tools/convert_qwen3tts` from the official safetensors; pre-built codec GGUF from `cstr/qwen3-tts-tokenizer-12hz-GGUF` (no conversion) |
@@ -360,10 +389,6 @@ GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 ├── tools/
 │   ├── convert_acestep.cpp           # HF → llama.cpp tensor rename
 │   └── convert_qwen3tts.cpp          # Qwen3-TTS safetensors → GGUF
-├── docs/
-│   ├── ARCHITECTURE.md               # Two-seam deep-dive
-│   ├── GGUF_FORMAT.md                # Tensor maps for each family
-│   └── CODEC_PORTS.md                # Stage 15: references for the MOSS + Qwen3-TTS codec ports (Stages 16 & 17 wired)
 ├── examples/
 │   └── server.json                   # Reference server config
 ├── scripts/
@@ -381,14 +406,11 @@ GGUF tensor map: [`docs/GGUF_FORMAT.md`](docs/GGUF_FORMAT.md).
 1. Create `src/models/<family>/`.
 2. Write `loader.cpp` — reads weights via `WeightLoader`, builds tensor bindings.
 3. Write `session.cpp` — subclass `Session`, override `run_*` methods.
-   Document the family in a `README.md` in the same directory.
 4. Add `AUDIOCORE_REGISTER_FAMILY(<name>, factory)` to `loader.cpp`.
-5. Document the GGUF tensor map in `docs/GGUF_FORMAT.md`.
-6. Add an entry to `examples/server.json` for testing.
-7. (Optional) Add a parity test against a reference C++ implementation.
+5. Add an entry to `examples/server.json` for testing.
+6. (Optional) Add a parity test against a reference C++ implementation.
 
-See [`AGENTS.md`](AGENTS.md) for full conventions and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-for the design rationale.
+See [`CLAUDE.md`](CLAUDE.md) for full conventions and design rationale.
 
 ---
 
