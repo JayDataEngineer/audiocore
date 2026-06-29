@@ -47,7 +47,15 @@ using audiocore::qwen3::RunnerConfig;
 static std::string resolve_path(const std::string& base_dir,
                                  const std::string& explicit_path,
                                  const std::string& default_name) {
-    if (!explicit_path.empty()) return explicit_path;
+    if (!explicit_path.empty()) {
+        // If explicit_path is a relative path, join it with base_dir.
+        fs::path p(explicit_path);
+        if (p.is_relative() && !base_dir.empty() &&
+            fs::is_directory(base_dir)) {
+            return (fs::path(base_dir) / p).string();
+        }
+        return explicit_path;
+    }
     if (base_dir.empty()) return default_name;
     // Check if base_dir is itself a file
     if (fs::is_regular_file(base_dir)) return base_dir;
@@ -66,8 +74,16 @@ static std::string resolve_path(const std::string& base_dir,
 //   3. tokenizer-q8_0.gguf  (quantized fallback for limited-VRAM setups).
 //   4. "" — no codec sidecar; the caller keeps the silence fallback.
 static std::string resolve_codec_path(const std::string& base_dir,
-                                       const std::string& explicit_path) {
-    if (!explicit_path.empty()) return explicit_path;
+                                        const std::string& explicit_path) {
+    if (!explicit_path.empty()) {
+        // If explicit_path is a relative path, join it with base_dir.
+        fs::path p(explicit_path);
+        if (p.is_relative() && !base_dir.empty() &&
+            fs::is_directory(base_dir)) {
+            return (fs::path(base_dir) / p).string();
+        }
+        return explicit_path;
+    }
     if (base_dir.empty()) return {};
     // Probe the canonical sidecar names published in models/manifest.json.
     for (const char* name : {"tokenizer-f16.gguf", "tokenizer-q8_0.gguf"}) {
@@ -326,6 +342,33 @@ bool Qwen3TtsSession::load(const std::string& model_path,
                              "qwen3_tts: codec loaded from %s  (%uL d=%u/%u  rvq=%u)\n",
                              config_.codec_path.c_str(),
                              hp.n_layers, hp.d_model, hp.latent_dim, hp.n_q);
+
+                // Register weight data sources (GGUF mmap → backend device
+                // memory). The meta_ctx tensors have data==NULL
+                // (no_alloc=true); decode() uploads the actual weight data
+                // from these registered sources after galloc allocates.
+                {
+                    ggml_context* meta = codec_reader_->meta_ctx();
+                    if (meta) {
+                        int n_reg = 0;
+                        for (ggml_tensor* t = ggml_get_first_tensor(meta);
+                             t; t = ggml_get_next_tensor(meta, t)) {
+                            const char* name = ggml_get_name(t);
+                            if (!name || strncmp(name, "codec.dec.", 10) != 0)
+                                continue;
+                            const TensorStorage* ts = codec_reader_->find(name);
+                            if (!ts) continue;
+                            const void* mmap_ptr = codec_reader_->tensor_data_ptr(*ts);
+                            if (!mmap_ptr) continue;
+                            codec_graphs_.register_weight(t, mmap_ptr,
+                                                         size_t(ggml_nbytes(t)));
+                            n_reg++;
+                        }
+                        std::fprintf(stderr,
+                            "qwen3_tts: registered %d codec weight sources\n",
+                            n_reg);
+                    }
+                }
             }
         }
     } else {

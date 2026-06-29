@@ -43,22 +43,54 @@ namespace {
 // Look up `name` in `reader` and materialize it into a freshly-allocated
 // float[] that the caller owns (delete[]). Returns nullptr if the tensor is
 // absent or the read fails. *out_nfloats (if non-null) receives the element
-// count. The on-disk tensor is ASSUMED to be F32 — the Qwen3-TTS converter
-// (tools/convert_qwen3tts.cpp) writes these tensors as F32 by design.
+// count.
+//
+// Handles both F32 and quantized on-disk tensors: F32 is memcpy'd directly;
+// quantized types (Q5_K, Q8_0, ...) are dequantized via ggml's type-traits
+// to_float converter. This is needed because the Lunavox GGUFs store
+// output.weight / token_embd.weight as Q5_K while the converter-based GGUFs
+// store the extras as F32 — the function adapts transparently.
 float* materialize_f32(const GgufReader& reader, const char* name,
                        size_t* out_nfloats = nullptr) {
     const TensorStorage* t = reader.find(name);
     if (!t) return nullptr;
     const size_t n_floats = static_cast<size_t>(t->nelements());
     float* buf = new float[n_floats];
-    std::string err;
-    if (!reader.materialize(*t, buf, &err)) {
-        std::fprintf(stderr,
-                     "qwen3::Runner: materialize('%s') failed: %s\n",
-                     name, err.c_str());
-        delete[] buf;
-        return nullptr;
+
+    if (t->type == GGML_TYPE_F32) {
+        // Fast path: tensor is already F32 on disk — memcpy directly.
+        std::string err;
+        if (!reader.materialize(*t, buf, &err)) {
+            std::fprintf(stderr,
+                         "qwen3::Runner: materialize('%s') failed: %s\n",
+                         name, err.c_str());
+            delete[] buf;
+            return nullptr;
+        }
+    } else {
+        // Dequantization path: read raw quantized bytes, then dequantize
+        // to F32 via ggml's type-traits to_float converter.
+        const size_t raw_bytes = static_cast<size_t>(t->nbytes());
+        std::vector<uint8_t> raw(raw_bytes);
+        std::string err;
+        if (!reader.materialize(*t, raw.data(), &err)) {
+            std::fprintf(stderr,
+                         "qwen3::Runner: materialize('%s') failed: %s\n",
+                         name, err.c_str());
+            delete[] buf;
+            return nullptr;
+        }
+        const auto* traits = ggml_get_type_traits(t->type);
+        if (!traits || !traits->to_float) {
+            std::fprintf(stderr,
+                         "qwen3::Runner: no to_float converter for type %d "
+                         "('%s')\n", (int)t->type, name);
+            delete[] buf;
+            return nullptr;
+        }
+        traits->to_float(raw.data(), buf, static_cast<int64_t>(n_floats));
     }
+
     if (out_nfloats) *out_nfloats = n_floats;
     return buf;
 }
@@ -434,17 +466,23 @@ bool Runner::load_talker_extras(const std::string& gguf_path,
     text_proj_1_w_ = materialize_f32(reader, "text_proj.1.weight");
     text_proj_1_b_ = materialize_f32(reader, "text_proj.1.bias");
 
-    // codec_embedding = token_embd.weight [codec_vocab, 1024]
+    // codec_embedding = token_embd.weight [codec_vocab, codec_embd_dim]
+    // GGML stores ne[0]=innermost (n_embd), ne[1]=outermost (vocab).
     if (!codec_embd_) {
-        size_t ce_nf = 0;
-        if (float* ce = materialize_f32(reader, "token_embd.weight", &ce_nf)) {
-            codec_embd_     = ce;
-            codec_embd_dim_ = 1024;
-            codec_vocab_    = static_cast<int32_t>(ce_nf / 1024);
+        const TensorStorage* te = reader.find("token_embd.weight");
+        if (te) {
+            size_t ce_nf = 0;
+            if (float* ce = materialize_f32(reader, "token_embd.weight", &ce_nf)) {
+                codec_embd_ = ce;
+                codec_embd_dim_ = (te->n_dims >= 2)
+                    ? static_cast<int32_t>(te->ne[0])
+                    : 0;
+                codec_vocab_ = static_cast<int32_t>(ce_nf / codec_embd_dim_);
+            }
         }
     }
 
-    // codec_head = output.weight [codec_vocab, 1024]
+    // codec_head = output.weight [codec_vocab, codec_embd_dim]
     if (!codec_head_) {
         codec_head_ = materialize_f32(reader, "output.weight");
     }
@@ -482,20 +520,25 @@ bool Runner::load_predictor_extras(const std::string& gguf_path,
     fine_embd_ = new float*[static_cast<size_t>(n_fine_books_)]();
     fine_head_ = new float*[static_cast<size_t>(n_fine_books_)]();
 
-    // Infer fine_vocab_ from codec_embd.0.weight's element count. Tensor
-    // shape is [fine_vocab, 1024] so nelements / 1024 == fine_vocab.
+    // Infer fine_vocab_ and fine_embd_dim_ from codec_embd.0.weight's shape.
+    // GGML: ne[0]=innermost (n_embd), ne[1]=outermost (fine_vocab).
     if (const TensorStorage* t0 = reader.find("codec_embd.0.weight")) {
-        fine_vocab_ = static_cast<int32_t>(t0->nelements() / 1024);
+        fine_embd_dim_ = (t0->n_dims >= 2)
+            ? static_cast<int32_t>(t0->ne[0])
+            : 1024;
+        fine_vocab_ = static_cast<int32_t>(t0->nelements() / fine_embd_dim_);
+    } else {
+        fine_embd_dim_ = 1024;
     }
 
     for (int i = 0; i < n_fine_books_; i++) {
         char name[256];
 
-        // codec_embd.{i}.weight [fine_vocab, 1024]
+        // codec_embd.{i}.weight [fine_vocab, fine_embd_dim]
         std::snprintf(name, sizeof(name), "codec_embd.%d.weight", i);
         fine_embd_[i] = materialize_f32(reader, name);
 
-        // lm_head.{i}.weight [1024, fine_vocab]
+        // lm_head.{i}.weight [fine_embd_dim, fine_vocab]
         std::snprintf(name, sizeof(name), "lm_head.%d.weight", i);
         fine_head_[i] = materialize_f32(reader, name);
     }

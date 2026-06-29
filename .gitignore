@@ -1,4 +1,6 @@
 build/
+build-debug/
+cmake-build-*/
 *.o
 *.obj
 *.so

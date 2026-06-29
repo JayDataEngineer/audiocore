@@ -109,6 +109,10 @@ public:
 
     bool has_encoder() const { return enc_present_; }
 
+    // Register a weight tensor whose data must be uploaded from GGUF mmap
+    // to backend device memory. Called by the loader after bind().
+    void register_weight(ggml_tensor* t, const void* host_data, size_t nbytes);
+
 private:
     struct XfmrLayer {
         ggml_tensor* attn_norm_w = nullptr;
@@ -185,6 +189,21 @@ private:
     } enc_rvq_;
 
     bool enc_present_ = false;
+
+    // ── Weight source tracking ──────────────────────────────────────────
+    // The meta_ctx_ tensors have data==NULL (no_alloc=true). We register
+    // pointers into the GGUF mmap so decode() can upload actual weight data
+    // to backend device memory after ggml_gallocr_alloc_graph.
+    struct WeightSrc {
+        ggml_tensor* tensor;
+        const void*  data;    // host pointer into GGUF mmap
+        size_t       nbytes;
+    };
+    std::vector<WeightSrc> weight_srcs_;
+
+    // Upload all registered weight data to backend device memory.
+    // Called inside decode() after galloc allocates the graph.
+    void upload_weights_();
 
     // ── State ───────────────────────────────────────────────────────────
     bool            present_    = false;

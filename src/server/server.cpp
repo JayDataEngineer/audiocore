@@ -376,10 +376,20 @@ std::shared_ptr<httplib::Server> build_server(
         };
         auto sbuf = std::make_shared<StreamBuf>();
 
-        // Wire the streaming callback
-        const std::string fmt = tr.response_format;
-        AudioStreamCallbacks asc;
-        asc.on_audio = [sbuf, fmt](const float* pcm, size_t n) -> bool {
+        // ── Heap-allocated context for streaming ────────────────────────────
+        // Captures MUST be by value (shared_ptr) so they survive the route-
+        // handler return. Stack locals (tr, tresp, asc, slot-ref) would dangle
+        // once the detached worker thread starts running.
+        struct StreamCtx {
+            TtsRequest          tr;
+            TtsResponse         tresp;
+            AudioStreamCallbacks asc;
+        };
+        auto ctx = std::make_shared<StreamCtx>();
+        ctx->tr = std::move(tr);
+
+        const std::string fmt = ctx->tr.response_format;
+        ctx->asc.on_audio = [sbuf, fmt](const float* pcm, size_t n) -> bool {
             std::vector<float> chunk(pcm, pcm + n);
             std::string encoded;
             if (fmt == "mp3") {
@@ -398,14 +408,15 @@ std::shared_ptr<httplib::Server> build_server(
             sbuf->cv.notify_one();
             return true;
         };
-        tr.stream = &asc;
+        ctx->tr.stream = &ctx->asc;
 
         // Run inference on a background thread so the callback fires
         // concurrently with the HTTP chunked provider pump.
-        TtsResponse tresp;
-        std::thread worker([&slot, &tr, &tresp, sbuf]() {
+        // Capture slot by value (shared_ptr copy) so the slot stays alive.
+        auto slot_guard = sg->slot;
+        std::thread worker([slot = std::move(slot_guard), ctx, sbuf]() {
             std::string err;
-            bool ok = slot->session->run_tts(&tr, &tresp, &err);
+            bool ok = slot->session->run_tts(&ctx->tr, &ctx->tresp, &err);
             std::lock_guard<std::mutex> lk(sbuf->mtx);
             sbuf->done = true;
             sbuf->ok   = ok;
