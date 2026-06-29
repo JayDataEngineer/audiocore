@@ -1,0 +1,29 @@
+From: audiocore contributors
+Subject: [PATCH] qwen3: pass n_embd_k_gqa (not n_embd_gqa) for the K/V
+ weight dimension in create_tensor_qkv
+
+create_tensor_qkv's 5th argument is the per-head K/V dimension, which is
+n_embd_k_gqa (= n_embd_head_k * n_head). The current code passes
+n_embd_gqa (= n_embd / kv_head_count) which is only correct when
+n_embd_head_k happens to equal n_embd / n_head. For Qwen3-TTS Talker
+(heads=16, kv_heads=8) this is wrong and the loaded weight shape does
+not match the architecture.
+
+Upstream-Status: Pending
+---
+ src/models/qwen3.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -33,7 +33,7 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
+ 
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+ 
+-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_gqa, n_embd_gqa, 0);
++        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_gqa, 0);
+         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+ 
+         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+
