@@ -32,6 +32,14 @@ public:
     bool decode(const float* latents, int32_t n_frames,
                 std::vector<float>* pcm, std::string* error);
 
+    // Encode stereo PCM at 48kHz → latent frames [T, 64].
+    //   pcm_stereo: [n_samples * 2] float32 — interleaved L,R,L,R,…
+    //   n_samples:  number of stereo samples (must be multiple of 1920)
+    //   latents:    output — [T_latent * 64] float32 time-major
+    //   T_latent:   n_samples / 1920
+    bool encode(const float* pcm_stereo, int32_t n_samples,
+                std::vector<float>* latents, std::string* error);
+
     // Look up a VAE weight tensor (bound with vae. prefix).
     ggml_tensor* weight(const char* name) const;
 

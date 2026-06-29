@@ -3,11 +3,13 @@
 #include "audiocore/server/server.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
@@ -15,6 +17,9 @@
 #include "audiocore/models/moss_tts/family.h"
 #include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/framework/runtime/tasks.h"
+#ifdef AUDIOCORE_ENABLE_MP3
+#include "audiocore/framework/io/mp3_encoder.h"
+#endif
 
 namespace audiocore {
 
@@ -154,9 +159,18 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("seed"))           tr.seed           = body["seed"].get<int32_t>();
         if (body.contains("temperature"))    tr.temperature    = body["temperature"].get<float>();
         if (body.contains("top_p"))          tr.top_p          = body["top_p"].get<float>();
-        // Accept both max_tokens (OpenAI-ish) and max_new_tokens (HF-ish).
         if (body.contains("max_new_tokens")) tr.max_new_tokens = body["max_new_tokens"].get<int32_t>();
         if (body.contains("max_tokens"))     tr.max_new_tokens = body["max_tokens"].get<int32_t>();
+        // Parse multi-turn messages (OpenAI-compatible format)
+        if (body.contains("messages") && body["messages"].is_array()) {
+            for (const auto& m : body["messages"]) {
+                ChatMessage cm;
+                cm.role    = m.value("role", "");
+                cm.content = m.value("content", "");
+                if (!cm.role.empty() && !cm.content.empty())
+                    tr.messages.push_back(std::move(cm));
+            }
+        }
 
         TtsResponse tresp;
         std::string err;
@@ -164,8 +178,20 @@ std::shared_ptr<httplib::Server> build_server(
             fail_with(res, err);
             return;
         }
-        res.set_content(pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate),
-                        "audio/wav");
+        if (tr.response_format == "mp3") {
+#ifdef AUDIOCORE_ENABLE_MP3
+            auto mp3 = pcm_mono_to_mp3(tresp.pcm_mono.data(),
+                                        tresp.pcm_mono.size(),
+                                        tresp.sampling_rate);
+            res.set_content(reinterpret_cast<const char*>(mp3.data()),
+                            mp3.size(), "audio/mpeg");
+#else
+            fail_with(res, "MP3 output not compiled (enable ENGINE_ENABLE_MP3)");
+#endif
+        } else {
+            res.set_content(pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate),
+                            "audio/wav");
+        }
     });
 
     svr->Post("/v1/audio/music",
@@ -180,11 +206,94 @@ std::shared_ptr<httplib::Server> build_server(
         mr.lyrics   = body.value("lyrics", "");
         mr.duration = body.value("duration", 30.0f);
         mr.mode     = body.value("mode", "text_to_music");
+        mr.mask_start = body.value("mask_start", 0.0f);
+        mr.mask_end   = body.value("mask_end", 1.0f);
+        mr.response_format = body.value("response_format", "wav");
         if (body.contains("seed"))           mr.seed              = body["seed"].get<int32_t>();
         if (body.contains("guidance_scale")) mr.guidance_scale    = body["guidance_scale"].get<float>();
         if (body.contains("steps"))          mr.n_diffusion_steps = body["steps"].get<int32_t>();
         if (body.contains("temperature"))    mr.temperature       = body["temperature"].get<float>();
         if (body.contains("top_p"))          mr.top_p             = body["top_p"].get<float>();
+
+        // ── Parse input_audio from base64 WAV ─────────────────────────────
+        if (body.contains("input_audio") && body["input_audio"].is_string()) {
+            std::string b64 = body["input_audio"].get<std::string>();
+            if (!b64.empty()) {
+                // Simple base64 decode (RFC 4648)
+                static const char kDec[256] = {
+                    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+                    52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,
+                    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+                };
+                std::vector<uint8_t> raw;
+                raw.reserve(b64.size() * 3 / 4);
+                int pad = 0;
+                uint8_t buf[4];
+                int nbuf = 0;
+                for (char c : b64) {
+                    if (c == '=') { pad++; continue; }
+                    int v = kDec[static_cast<uint8_t>(c)];
+                    if (v < 0) continue;  // skip whitespace
+                    buf[nbuf++] = static_cast<uint8_t>(v);
+                    if (nbuf == 4) {
+                        raw.push_back((buf[0] << 2) | (buf[1] >> 4));
+                        raw.push_back((buf[1] << 4) | (buf[2] >> 2));
+                        raw.push_back((buf[2] << 6) | buf[3]);
+                        nbuf = 0;
+                    }
+                }
+                if (nbuf >= 2) raw.push_back((buf[0] << 2) | (buf[1] >> 4));
+                if (nbuf >= 3) raw.push_back((buf[1] << 4) | (buf[2] >> 2));
+
+                // Parse WAV: 44-byte header, PCM16 little-endian
+                if (raw.size() > 44) {
+                    const uint8_t* d = raw.data();
+                    uint16_t channels = d[22] | (static_cast<uint16_t>(d[23]) << 8);
+                    uint32_t sr = static_cast<uint32_t>(d[24]) |
+                                  (static_cast<uint32_t>(d[25]) << 8) |
+                                  (static_cast<uint32_t>(d[26]) << 16) |
+                                  (static_cast<uint32_t>(d[27]) << 24);
+                    // Find data chunk
+                    size_t data_off = 44;  // minimal header
+                    for (size_t p = 44; p + 8 <= raw.size(); p += 4) {
+                        if (raw[p] == 'd' && raw[p+1] == 'a' && raw[p+2] == 't' && raw[p+3] == 'a') {
+                            data_off = p + 8;
+                            break;
+                        }
+                        uint32_t chunk_size = static_cast<uint32_t>(raw[p+4]) |
+                                              (static_cast<uint32_t>(raw[p+5]) << 8) |
+                                              (static_cast<uint32_t>(raw[p+6]) << 16) |
+                                              (static_cast<uint32_t>(raw[p+7]) << 24);
+                        p += 4 + chunk_size;
+                    }
+                    size_t n_pcm_bytes = raw.size() - data_off;
+                    size_t n_samples = n_pcm_bytes / 2;
+                    if (channels == 0) channels = 1;
+                    size_t n_per_ch = n_samples / channels;
+                    mr.input_audio.resize(n_per_ch * 2);  // stereo interleaved
+                    for (size_t i = 0; i < n_per_ch * 2 && i < n_per_ch * channels; i++) {
+                        int16_t s = static_cast<int16_t>(raw[data_off + i * 2]) |
+                                    (static_cast<int16_t>(raw[data_off + i * 2 + 1]) << 8);
+                        mr.input_audio[i] = s / 32768.0f;
+                    }
+                    // If mono, duplicate to stereo
+                    if (channels == 1 && n_per_ch > 0) {
+                        mr.input_audio.resize(n_per_ch * 2);
+                        for (size_t i = n_per_ch; i > 0; i--) {
+                            mr.input_audio[i * 2 - 1] = mr.input_audio[i - 1];
+                            mr.input_audio[i * 2 - 2] = mr.input_audio[i - 1];
+                        }
+                    }
+                    // Resample if not 48kHz
+                    (void)sr;  // TODO: resample to 48kHz if needed
+                }
+            }
+        }
 
         acestep::MusicResponse mresp;
         std::string err;
@@ -192,23 +301,36 @@ std::shared_ptr<httplib::Server> build_server(
             fail_with(res, err);
             return;
         }
-        res.set_content(pcm_stereo_to_wav(mresp.pcm_stereo, mresp.sampling_rate),
-                        "audio/wav");
+        if (mr.response_format == "mp3") {
+#ifdef AUDIOCORE_ENABLE_MP3
+            auto mp3 = pcm_stereo_to_mp3(mresp.pcm_stereo.data(),
+                                          mresp.pcm_stereo.size(),
+                                          mresp.sampling_rate);
+            res.set_content(reinterpret_cast<const char*>(mp3.data()),
+                            mp3.size(), "audio/mpeg");
+#else
+            fail_with(res, "MP3 output not compiled (enable ENGINE_ENABLE_MP3)");
+#endif
+        } else {
+            res.set_content(pcm_stereo_to_wav(mresp.pcm_stereo, mresp.sampling_rate),
+                            "audio/wav");
+        }
     });
 
     // ── POST /v1/audio/speech/stream ────────────────────────────────────────
     //
-    // Chunked-transfer variant of /v1/audio/speech. Accepts the same JSON
-    // body, runs the same TtsRequest through the same family, then emits
-    // the resulting WAV in chunks rather than as a single buffered body.
+    // Chunked-transfer variant of /v1/audio/speech. Two modes:
     //
-    // This is a transport-level scaffold: the family still generates the
-    // entire PCM before we start streaming. True incremental streaming
-    // (audio frames emitted as the autoregressive loop produces them)
-    // requires per-family hooks into run_tts and is tracked in GAPS.md §1.2
-    // / §2.2. Until then, this endpoint proves the chunked plumbing works
-    // and lets a client observe progress incrementally instead of waiting
-    // for the full render before the first byte.
+    // 1. Streaming callback mode (preferred): the family calls
+    //    TtsRequest::stream::on_audio with PCM chunks as audio is produced.
+    //    Each chunk is WAV-encoded and emitted immediately via the chunked
+    //    content provider. This gives true progressive audio.
+    //
+    // 2. Fallback (no callback): the family generates the full PCM, then we
+    //    WAV-encode and chunk-emit the result.
+    //
+    // Mode 1 requires the session to run on a background thread so the
+    // callback can push data while the chunked content provider pumps it.
     svr->Post("/v1/audio/speech/stream",
               [slots_ref](const httplib::Request& req, httplib::Response& res) {
         auto sg = resolve_slot(req, *slots_ref, res);
@@ -227,35 +349,92 @@ std::shared_ptr<httplib::Server> build_server(
         tr.speaker_name    = body.value("speaker", "");
         tr.reference_audio = body.value("reference_audio", "");
         tr.reference_text  = body.value("reference_text", "");
+        tr.response_format = body.value("response_format", "wav");
         if (body.contains("seed"))           tr.seed           = body["seed"].get<int32_t>();
         if (body.contains("temperature"))    tr.temperature    = body["temperature"].get<float>();
         if (body.contains("top_p"))          tr.top_p          = body["top_p"].get<float>();
         if (body.contains("max_new_tokens")) tr.max_new_tokens = body["max_new_tokens"].get<int32_t>();
         if (body.contains("max_tokens"))     tr.max_new_tokens = body["max_tokens"].get<int32_t>();
-
-        TtsResponse tresp;
-        std::string err;
-        if (!slot->session->run_tts(&tr, &tresp, &err)) {
-            fail_with(res, err);
-            return;
+        if (body.contains("messages") && body["messages"].is_array()) {
+            for (const auto& m : body["messages"]) {
+                ChatMessage cm;
+                cm.role    = m.value("role", "");
+                cm.content = m.value("content", "");
+                if (!cm.role.empty() && !cm.content.empty())
+                    tr.messages.push_back(std::move(cm));
+            }
         }
 
-        // Render the full WAV once, then chunk-emit it. ~64 KiB per chunk
-        // keeps the latency-vs-overhead tradeoff reasonable for 24 kHz
-        // mono PCM (≈1.4 s of audio per chunk).
-        const std::string wav = pcm_mono_to_wav(tresp.pcm_mono, tresp.sampling_rate);
-        static constexpr size_t kChunkBytes = 64 * 1024;
-        std::shared_ptr<std::string> wav_ref = std::make_shared<std::string>(std::move(wav));
+        // ── Streaming state shared between generation thread and HTTP pump ──
+        struct StreamBuf {
+            std::mutex              mtx;
+            std::string             buffer;  // WAV bytes ready to send
+            bool                    done    = false;
+            bool                    ok      = true;
+            std::string             error;
+            std::condition_variable cv;
+        };
+        auto sbuf = std::make_shared<StreamBuf>();
 
+        // Wire the streaming callback
+        const std::string fmt = tr.response_format;
+        AudioStreamCallbacks asc;
+        asc.on_audio = [sbuf, fmt](const float* pcm, size_t n) -> bool {
+            std::vector<float> chunk(pcm, pcm + n);
+            std::string encoded;
+            if (fmt == "mp3") {
+#ifdef AUDIOCORE_ENABLE_MP3
+                auto mp3 = pcm_mono_to_mp3(chunk.data(), chunk.size(), 24000);
+                if (!mp3.empty())
+                    encoded.assign(reinterpret_cast<const char*>(mp3.data()), mp3.size());
+#else
+                (void)0;
+#endif
+            }
+            if (encoded.empty())
+                encoded = pcm_mono_to_wav(chunk, 24000);
+            std::lock_guard<std::mutex> lk(sbuf->mtx);
+            sbuf->buffer.append(encoded);
+            sbuf->cv.notify_one();
+            return true;
+        };
+        tr.stream = &asc;
+
+        // Run inference on a background thread so the callback fires
+        // concurrently with the HTTP chunked provider pump.
+        TtsResponse tresp;
+        std::thread worker([&slot, &tr, &tresp, sbuf]() {
+            std::string err;
+            bool ok = slot->session->run_tts(&tr, &tresp, &err);
+            std::lock_guard<std::mutex> lk(sbuf->mtx);
+            sbuf->done = true;
+            sbuf->ok   = ok;
+            if (!ok) sbuf->error = std::move(err);
+            sbuf->cv.notify_one();
+        });
+        worker.detach();
+
+        // Chunked content provider: pumps WAV/MP3 bytes from StreamBuf
+        const char* ct = (fmt == "mp3") ? "audio/mpeg" : "audio/wav";
         res.set_chunked_content_provider(
-            "audio/wav",
-            [wav_ref](size_t offset, httplib::DataSink& sink) {
-                if (offset >= wav_ref->size()) {
-                    sink.done();
-                    return true;
+            ct,
+            [sbuf](size_t /*offset*/, httplib::DataSink& sink) {
+                std::unique_lock<std::mutex> lk(sbuf->mtx);
+
+                sbuf->cv.wait(lk, [sbuf]() {
+                    return !sbuf->buffer.empty() || sbuf->done;
+                });
+
+                if (!sbuf->buffer.empty()) {
+                    if (!sink.write(sbuf->buffer.data(), sbuf->buffer.size()))
+                        return false;
+                    sbuf->buffer.clear();
                 }
-                const size_t n = std::min(kChunkBytes, wav_ref->size() - offset);
-                if (!sink.write(wav_ref->data() + offset, n)) return false;
+
+                if (sbuf->done) {
+                    sink.done();
+                    return sbuf->ok;
+                }
                 return true;
             });
     });
