@@ -7,11 +7,16 @@
 //   Code Predictor MTP loop (31 fine codebooks) ─→
 //   [32 × T] code matrix ─→ Speech Tokenizer ─→ PCM audio
 //
-// Stage 17 update: the codec decode step at the tail now runs the
+// Stage 17 update: the codec decode step at the tail runs the
 // Qwen3-TTS-Tokenizer-12Hz ggml port when the codec GGUF was discovered at
 // load time. The 32-codebook talker+predictor matrix is sliced to the first
 // 16 codebooks (the 12Hz codec's n_q) before decode. Silence fallback
 // retained for codec-less configurations (GAPS.md §2.3).
+//
+// Stage 19 update: per-frame streaming. When mode="streaming" and a non-null
+// stream callback is provided, newly generated codec frames are decoded
+// incrementally during the AR loop and emitted via callback. Response PCM is
+// empty in streaming mode — all audio goes through the callback.
 //
 // Stage 17b update: Voice Clone mode now runs the ECAPA-TDNN speaker encoder
 // (Qwen3TtsSpeakerEncoder) when the speaker encoder was loaded from the talker
@@ -28,6 +33,13 @@
 // prefill layout becomes:
 //   [syn_text_emb + codec_pad] [spk_emb] [ref_text_emb + codec_pad] [codec_bos]
 // Full ICL with ref-codes remains a follow-up (CODEC_PORTS.md §4.9).
+//
+// Stage 19 update: per-frame streaming for Qwen3-TTS. When mode="streaming"
+// and a non-null stream callback is provided (req.stream->on_audio), the AR
+// loop decodes newly generated frames through the codec incrementally and
+// emits PCM chunks via the callback. First frame emitted after ~80ms, then
+// one frame (1920 samples = 80ms at 24 kHz) per AR step. Response PCM is
+// empty in streaming mode — all audio flows through the callback.
 //
 // Both transformers (talker + predictor) run through the unified
 // qwen3::Runner — the same class MOSS and ACE-Step use. There is no longer
@@ -133,15 +145,23 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     // ── Mode routing ──────────────────────────────────────────────────────
     //
     // qwen3_tts understands four modes from the unified TtsRequest.mode
-    // field. streaming is NOT implemented and fails fast with a pointer at
-    // GAPS.md. voice_clone requires the ECAPA-TDNN speaker encoder (Stage
+    // field. voice_clone requires the ECAPA-TDNN speaker encoder (Stage
     // 17b); when present we compute the embedding from reference_audio and
     // inject it into the codec bridge.
+    //
+    // streaming mode requires a non-null stream callback for incremental
+    // codec decode. Without one we fail fast (GAPS.md §2.2).
     const Qwen3TtsMode mode = parse_mode(req.mode);
-    if (mode == Qwen3TtsMode::Streaming) {
+    const bool streaming = (req.stream && req.stream->on_audio);
+    if (mode == Qwen3TtsMode::Streaming && !streaming) {
         if (error) *error =
-            "qwen3_tts streaming requires chunked HTTP + Dual-Track "
-            "incremental decode (not implemented). See GAPS.md §2.2.";
+            "qwen3_tts streaming requires a non-null stream callback "
+            "(set stream.on_audio) for incremental codec decode. "
+            "See GAPS.md §2.2.";
+        return false;
+    }
+    if (streaming && !config_.codec_present) {
+        if (error) *error = "qwen3_tts streaming requires codec GGUF";
         return false;
     }
 
@@ -437,6 +457,10 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     // Current hidden state (starts as last_hidden from prefill)
     std::vector<float> cur_hidden(last_hidden, last_hidden + n_embd);
 
+    // Per-frame streaming: track how many frames have been decoded and
+    // emitted via the streaming callback. Incremental decode at each step.
+    int32_t decoded_frames = 0;
+
     for (int32_t step = 0; step < max_steps; step++) {
         // ── 3a. Sample codebook 0 via codec_head ───
         int32_t code_0 = 0;
@@ -509,7 +533,38 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         // Update prev_fine for next step
         prev_fine = fine_codes;
 
-        // ── 3c. Check for EOS ───
+        // ── 3c. Per-frame streaming: decode newly available frames ──────
+        if (streaming && codec_graphs_.is_present()) {
+            const int32_t n_available = step + 1;
+            const int32_t codec_n_q = (int32_t)codec_graphs_.hp.n_q;
+            if (n_available > decoded_frames) {
+                const int32_t n_new = n_available - decoded_frames;
+                std::vector<int32_t> stream_codes((size_t)codec_n_q * (size_t)n_new);
+                for (int32_t cb = 0; cb < codec_n_q; ++cb) {
+                    for (int32_t t = 0; t < n_new; ++t) {
+                        stream_codes[(size_t)cb * n_new + t] =
+                            code_matrix[(size_t)cb * max_steps + decoded_frames + t];
+                    }
+                }
+                try {
+                    auto pcm = codec_graphs_.decode(
+                        stream_codes.data(), codec_n_q, n_new);
+                    if (!pcm.empty()) {
+                        if (!req.stream->on_audio(pcm.data(), pcm.size())) {
+                            if (error) *error = "qwen3_tts: streaming aborted by client";
+                            return false;
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "qwen3_tts: streaming codec decode failed "
+                                         "at step %d (%s); continuing\n",
+                                 step, e.what());
+                }
+                decoded_frames = n_available;
+            }
+        }
+
+        // ── 3d. Check for EOS ───
         bool all_eos = true;
         for (int cb = 0; cb < n_total_books; cb++) {
             if (code_matrix[(size_t)cb * max_steps + step] != 0) {
@@ -577,6 +632,17 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     if (n_frames <= 0) {
         std::fprintf(stderr, "qwen3_tts: no frames generated\n");
         resp.pcm_mono.assign(48000, 0.0f);  // 1 second silence
+        resp.sampling_rate = 24000;
+        return true;
+    }
+
+    // ── Streaming: all frames already emitted via callback ───────────────
+    if (streaming && codec_graphs_.is_present()) {
+        // Any remaining frames (should be zero since we emit every step)
+        // were already decoded and emitted in the AR loop. Return empty PCM.
+        std::fprintf(stderr, "qwen3_tts: streaming done (%d frames emitted)\n",
+                     decoded_frames);
+        resp.pcm_mono.clear();
         resp.sampling_rate = 24000;
         return true;
     }

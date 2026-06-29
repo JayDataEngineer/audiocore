@@ -42,7 +42,7 @@ MOSS-Audio-Tokenizer-v2 / -Nano codec infrastructure.
 | `voice_clone` | ✅ Stage 16 | Wired; reads `voice_path` as pre-encoded `.codes`; same codec path |
 | `dialogue` (TTSD) | 🟡 | Stage 11: TTSD-style system prompt + dialogue sampling defaults. Multi-turn input surface still missing (single `text` field becomes the opening turn); true TTSD weights are a separate 8B variant. Codec wired (Stage 16). |
 | `voice_design` (VoiceGenerator) | 🟡 | Stage 11: routes voice description from `instruct` through the flagship backbone with a voice-design system prompt. Best-effort fallback — the dedicated 1.7B VoiceGenerator model produces better voice fidelity. Codec wired (Stage 16). |
-| `realtime` / streaming | ❌ | Stage 11: fails fast with a pointer at this section. Streaming endpoint scaffold is GAPS.md §4. |
+| `realtime` / streaming | ✅ Stage 18 | Per-frame incremental codec decode during AR loop. First frame after ~1.3s (N_VQ delay steps), then 80ms/frame. Response PCM empty in streaming mode — all audio through callback. |
 
 ### 1.3 Codec / tokenizer
 
@@ -97,7 +97,7 @@ multi-codebook codec.
 | TTS with style instructions | ✅ Stage 17: `instruct` tokenized + summed into text embedding; `speaker_name` resolves to a codec token (9 default speakers) and is injected as a dedicated codec-prefix slot before codec_bos. Codec decode wired (Stage 17). |
 | Voice Clone Mode | ✅ Stage 17b: ECAPA-TDNN speaker encoder ported (`Qwen3TtsSpeakerEncoder` in `src/models/qwen3_tts/speaker_encoder.cpp`, adapted from CrispASR MIT). Requires reference WAV at 24 kHz mono; speaker embedding is injected into the codec bridge. Silently skips if no `speaker.*` tensors in the talker GGUF (Base variant — Voice Clone still fails fast with a clear error). |
 | Voice Design Mode | 🟡 Stage 10: `instruct` is prefixed with the official "Generate a voice with the following characteristics:" template and routed through the talker. Best-effort on Base; true VoiceDesign fidelity needs the dedicated variant weights (🚧). Codec decode wired (Stage 17). Speaker encoder does NOT apply to VoiceDesign — that mode's voice description is a text-only instruct, not a reference-audio embedding. |
-| Streaming Mode | ❌ Stage 10: fails fast with a pointer at this section. Chunked transport scaffold exists at `/v1/audio/speech/stream` (Stage 12); per-family incremental decode does not. |
+| Streaming Mode | ✅ Stage 19 | Per-frame streaming: codec frames decoded incrementally during AR loop and emitted via callback. First frame after ~80ms, then 80ms/frame. Response PCM empty in streaming mode. |
 
 ### 2.3 Codec / speaker encoder
 
@@ -198,7 +198,7 @@ families.
 | Capability | Status | Notes |
 |---|---|---|
 | OpenAI-compatible HTTP API | ✅ `/v1/audio/speech`, `/v1/audio/speech/stream`, `/v1/audio/music`, `/v1/models`, `/health` |
-| Chunked / streaming HTTP for TTS | 🟡 Stage 12: `/v1/audio/speech/stream` emits the WAV in ~64 KiB chunks. Transport-level only — the family still renders the full PCM before streaming starts. True incremental streaming (frames as the AR loop produces them) needs per-family hooks (GAPS.md §1.2 / §2.2). |
+| Chunked / streaming HTTP for TTS | ✅ | `/v1/audio/speech/stream` with per-family incremental decode. MOSS (Stage 18) and Qwen3-TTS (Stage 19) both emit frames during the AR loop via stream callback. WAV/MP3 chunked response. |
 | Models manifest (`models/manifest.json`) | ✅ Stage 9: central record with HF repo/revision/modes for every family/variant |
 | Fetch tool (`scripts/fetch_models.sh`) | ✅ Stage 9: pure bash + curl downloader; reads the manifest, optional sha256 verify, invokes converters |
 | Unified `TtsRequest` (Stage 6) | ✅ Single struct, single server branch |
@@ -283,29 +283,24 @@ single session but are listed so the work is plan-able.
 ## 6. Coverage summary
 
 Of the **5 + 5 + 6 = 16 advertised user-facing modes** across the three
-families, after Stages 9–17b:
+families, after Stages 9–19:
 
-- ✅ fully wired end-to-end: **8** (ACE-Step Text-to-Music; MOSS tts /
-  sfx / voice_clone — when fed codec-bearing weights like
+- ✅ fully wired end-to-end: **10** (ACE-Step Text-to-Music; MOSS tts /
+  sfx / voice_clone / realtime — when fed codec-bearing weights like
   `smcleod/MOSS-TTS-v1.5-GGUF`; Qwen3-TTS batch TTS / TTS with style
-  instructions / voice_design / voice_clone — when fed a codec sidecar
-  like `cstr/qwen3-tts-tokenizer-12hz-GGUF` AND the talker GGUF carries
-  speaker encoder tensors; Voice Clone falls back to a clear fail-fast
-  error with a GAPS.md pointer when the speech encoder is absent)
-- 🟡 parse + run, partial elsewhere: **3** (MOSS dialogue / voice_design
-  — codec wired but mode-specific surface partial; ACE-Step mode field
-  rejects the rest with a clear error)
+  instructions / voice_design / voice_clone / streaming — when fed a codec
+  sidecar like `cstr/qwen3-tts-tokenizer-12hz-GGUF` AND the talker GGUF
+  carries speaker encoder tensors; Voice Clone falls back to a clear
+  fail-fast error with a GAPS.md pointer when the speech encoder is absent)
+- 🟡 parse + run, partial elsewhere: **2** (MOSS dialogue / voice_design
+  — codec wired but mode-specific surface partial)
 - ❌ not implemented, achievable without new weights: **3** (ACE-Step
   cover / repaint / completion — all need the DiT to accept an extra
   conditioning signal beyond text)
 - ❌ not implemented, separate model: **2** (ACE-Step stem extraction,
   layering — blocked on a new Demucs-class / stem-assembler family)
-- ✅ per-frame streaming: **1** (MOSS realtime — incremental codec decode
-  during AR loop, emit via stream callback; response PCM empty in streaming
-  mode)
-- ❌ not implemented, streaming infra: **1** (Qwen3-TTS
-  streaming — the chunked transport scaffold exists; per-family
-  incremental decode does not)
+- ✅ per-frame streaming: **2** (MOSS realtime + Qwen3-TTS streaming —
+  both emit frames during AR loop via callback; response PCM empty)
 - 🚧 blocked on major port: **1** (ACE-Step stem/lego — separate
   Demucs-class model)
 - 📋 reference impl identified, port scoped: **0** (all ported) — minor
@@ -321,7 +316,8 @@ silently running text-to-music. **Stage 15 identified production-quality
 GGML reference implementations (Apache-2.0 + MIT) for both blocked
 codecs, plus pre-built GGUFs that skip the converter step entirely.
 Stage 16 ported the MOSS-Audio-Tokenizer; Stage 17 ports the
-Qwen3-TTS-Tokenizer-12Hz.**
+Qwen3-TTS-Tokenizer-12Hz. Stages 18–19 added per-frame streaming for both
+MOSS and Qwen3-TTS.**
 
 The remaining work is concentrated in the following places:
 
@@ -333,7 +329,3 @@ The remaining work is concentrated in the following places:
    both ref-text AND ref-codes for improved clone fidelity, as CrispASR's
    `build_icl_prefill_embeds` implements. Requires the codec encoder to
    produce ref-codes locally from the reference WAV.
-
-Plus, smaller but unblocked items: MP3 streaming chunks (WAV fallback);
-Qwen3-TTS streaming (chunked transport exists; needs talker-side
-incremental decode — infrastructure ported from MOSS).
