@@ -3,6 +3,17 @@
 # submodule after a fresh checkout. Idempotent: skips patches that are
 # already applied. Safe to run repeatedly.
 #
+# Patches live at patches/<submodule>/<NN>-<slug>.patch and are applied in
+# lexical order. Each patch is a standard 'git diff' against the upstream
+# submodule HEAD recorded in .gitmodules.
+#
+# patches/llama.cpp/
+#   0001-ggml-max-name-128.patch      bump GGML_MAX_NAME 64 -> 128 (long
+#                                     Qwen3-TTS / MOSS tensor names)
+#   0002-qwen3-k-gqa-tensor-dim.patch pass n_embd_k_gqa (not n_embd_gqa)
+#                                     to create_tensor_qkv for Qwen3-TTS
+#                                     Talker (heads=16, kv_heads=8)
+#
 # Typical use:
 #   git submodule update --init --recursive
 #   ./scripts/apply-submodule-patches.sh
