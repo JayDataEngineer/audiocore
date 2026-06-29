@@ -1,35 +1,10 @@
 {
-  "_comment": "Container-friendly default audiocore server config. Mount real GGUF weights under /models and override the path fields (or replace this file entirely).",
+  "_comment": "Container-friendly default audiocore server config. Ships with NO models so 'docker run -e AUDIOCORE_ALLOW_EMPTY=1 audiocore' boots cleanly for smoke tests. To actually serve requests, mount real GGUF weights under /models and override this file with a populated server.json (see examples/server.json in the repo).",
 
   "host":   "0.0.0.0",
   "port":   8080,
   "device": 0,
   "threads": 4,
 
-  "models": [
-    {
-      "id":       "moss-tts",
-      "family":   "moss_tts",
-      "path":     "/models/moss-tts/moss-tts-q8_0.gguf",
-      "backend":  "ggml_cuda"
-    },
-    {
-      "id":       "qwen3-tts",
-      "family":   "qwen3_tts",
-      "path":     "/models/qwen3-tts/",
-      "backend":  "ggml_cuda",
-      "extras": {
-        "talker_path":    "talker.q5_k.gguf",
-        "predictor_path": "predictor.q8_0.gguf",
-        "codec_path":     "tokenizer-f16.gguf",
-        "n_gpu_layers":   "99"
-      }
-    },
-    {
-      "id":       "ace-step",
-      "family":   "ace_step",
-      "path":     "/models/ace-step/",
-      "backend":  "ggml_cuda"
-    }
-  ]
+  "models": []
 }

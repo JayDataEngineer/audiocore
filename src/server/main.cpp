@@ -175,8 +175,14 @@ int main(int argc, char** argv) {
                      m.id.c_str(), m.family.c_str());
     }
     if (slots->empty()) {
-        std::fprintf(stderr, "no models configured — exiting\n");
-        return 1;
+        // Boots anyway — /health and /v1/models work, /v1/audio/* will return
+        // 404 until a model is loaded. Matches the llama.cpp server pattern:
+        // listen first, reject per-request when no model is bound. Lets the
+        // container image start cleanly for smoke tests (AUDIOCORE_ALLOW_EMPTY)
+        // and for orchestrators that mount models after first boot.
+        std::fprintf(stderr,
+            "audiocore_server: WARNING — no models configured. "
+            "Booting anyway; /v1/audio/* will return 404 until a model is loaded.\n");
     }
 
     auto svr = audiocore::build_server(slots);
