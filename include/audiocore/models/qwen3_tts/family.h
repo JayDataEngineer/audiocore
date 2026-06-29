@@ -83,8 +83,8 @@ enum class Qwen3TtsVariant {
 enum class Qwen3TtsMode {
     TtsBatch = 0,    // default plain batch TTS (also covers instruct style)
     VoiceDesign,     // describe a voice → generate with that voice
-    VoiceClone,      // reference_audio → speaker embedding (NOT IMPLEMENTED)
-    Streaming,       // chunked output (NOT IMPLEMENTED)
+    VoiceClone,      // reference_audio → speaker embedding (ECAPA-TDNN, Stage 17b)
+    Streaming,       // per-frame streaming via stream callback (Stage 19)
 };
 
 struct Qwen3TtsConfig {
