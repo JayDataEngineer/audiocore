@@ -143,32 +143,61 @@ bool load_config(const std::string& path, ServerConfig& out) {
 int main(int argc, char** argv) {
     std::string config_path;
     std::string model_dir_override;
+    std::string model_override;      // --model: llama.cpp-style primary path
+    std::string family_override;     // --family: bypass family inference
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--config" && i + 1 < argc)        config_path        = argv[++i];
         else if (a == "--model-dir" && i + 1 < argc) model_dir_override = argv[++i];
+        else if (a == "--model" && i + 1 < argc)     model_override     = argv[++i];
+        else if (a == "--family" && i + 1 < argc)    family_override    = argv[++i];
     }
     if (config_path.empty()) {
         std::fprintf(stderr,
-            "usage: %s --config server.json [--model-dir /path]\n", argv[0]);
+            "usage: %s --config server.json [--model /path] [--family name] [--model-dir /path]\n",
+            argv[0]);
         return 1;
     }
 
     ServerConfig cfg;
     if (!load_config(config_path, cfg)) return 1;
 
-    // CLI override beats JSON. Lets operators point at a different models
+    // CLI overrides beat JSON. Lets operators point at a different models
     // root without editing the config (mirrors llama.cpp's flag precedence).
     if (!model_dir_override.empty()) cfg.model_dir = model_dir_override;
 
     register_all_families();   // pulls in moss_tts, ace_step, …
 
-    // Auto-discovery: only fires when no explicit models are configured.
-    // Preserves today's explicit-config behavior and only adds a new mode.
-    // The per-family loaders do their own file resolution within each
-    // discovered directory, so we only need to pick the right FAMILY per
-    // subdir (see discovery.cpp).
-    if (cfg.models.empty() && !cfg.model_dir.empty()) {
+    // ── Model resolution ────────────────────────────────────────────────
+    // llama.cpp contract: --model is the primary path. Exactly one model
+    // loads; to swap, restart the container with a different path. When set,
+    // --model overrides both the JSON models array and --model-dir.
+    if (!model_override.empty()) {
+        std::string err;
+        auto m = audiocore::from_single_path(model_override, family_override, &err);
+        if (!m) {
+            std::fprintf(stderr, "model: %s\n", err.c_str());
+            return 1;
+        }
+        ConfigModel cm;
+        cm.id      = std::move(m->id);
+        cm.family  = std::move(m->family);
+        cm.path    = std::move(m->path);
+        cm.backend = std::move(m->backend);
+        cm.load_options = std::move(m->load_options);
+        cfg.models.clear();
+        cfg.models.push_back(std::move(cm));
+        cfg.model_dir.clear();
+        std::fprintf(stderr,
+            "audiocore_server: --model %s (family=%s, id=%s)\n",
+            model_override.c_str(),
+            cfg.models.front().family.c_str(),
+            cfg.models.front().id.c_str());
+    }
+    // Auto-discovery fallback: walks --model-dir when no explicit --model
+    // and no JSON models array are configured. The per-family loaders do
+    // their own file resolution within each discovered directory.
+    else if (cfg.models.empty() && !cfg.model_dir.empty()) {
         std::string err;
         auto discovered = audiocore::discover_models(cfg.model_dir, &err);
         if (!err.empty()) {
