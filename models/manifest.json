@@ -326,12 +326,12 @@
           "files": [
             {
               "name": "dit",
-              "filename": "acestep-5Hz-lm-1.7B-turbo-Q8_0.gguf",
+              "filename": "acestep-v15-turbo-Q8_0.gguf",
               "source": {
                 "provider": "huggingface",
                 "repo": "Serveurperso/ACE-Step-1.5-GGUF",
                 "revision": "main",
-                "filename": "acestep-5Hz-lm-1.7B-turbo-Q8_0.gguf"
+                "filename": "acestep-v15-turbo-Q8_0.gguf"
               }
             },
             {
@@ -379,12 +379,12 @@
           "files": [
             {
               "name": "dit",
-              "filename": "acestep-5Hz-lm-1.7B-sft-Q8_0.gguf",
+              "filename": "acestep-v15-sft-Q8_0.gguf",
               "source": {
                 "provider": "huggingface",
                 "repo": "Serveurperso/ACE-Step-1.5-GGUF",
                 "revision": "main",
-                "filename": "acestep-5Hz-lm-1.7B-sft-Q8_0.gguf"
+                "filename": "acestep-v15-sft-Q8_0.gguf"
               }
             },
             {
@@ -432,12 +432,12 @@
           "files": [
             {
               "name": "dit",
-              "filename": "acestep-5Hz-lm-4B-turbo-Q8_0.gguf",
+              "filename": "acestep-v15-xl-turbo-Q8_0.gguf",
               "source": {
                 "provider": "huggingface",
                 "repo": "Serveurperso/ACE-Step-1.5-GGUF",
                 "revision": "main",
-                "filename": "acestep-5Hz-lm-4B-turbo-Q8_0.gguf"
+                "filename": "acestep-v15-xl-turbo-Q8_0.gguf"
               }
             },
             {

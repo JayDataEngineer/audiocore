@@ -22,6 +22,19 @@
 
 #include <cstdio>   // stderr diagnostic
 
+// Debug: crash handler for SIGSEGV
+#include <csignal>
+#include <execinfo.h>
+static void sigsegv_handler(int sig) {
+    (void)sig;
+    std::fprintf(stderr, "\n[ace_step] SIGSEGV! Backtrace:\n");
+    void* bt[32];
+    int n = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, n, 2); // stderr
+    std::_Exit(139);
+}
+struct SigSegvInstaller { SigSegvInstaller() { std::signal(SIGSEGV, sigsegv_handler); } } sigsegv_installer_;
+
 namespace audiocore::acestep {
 
 using audiocore::sampler::Params;
@@ -96,52 +109,161 @@ static FlowSchedule build_schedule(const std::string& variant, int override_step
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Helper: manual MatMul + bias for a 2D weight tensor in ggml layout
+//  Conv1D(k=2, s=1, p=0) — temporal mixing of 2 adjacent frames
 // ═════════════════════════════════════════════════════════════════════════════
 //
-// ggml stores weights column-major: ne[0] = out_features, ne[1] = in_features.
-// This computes  y[t, o] = sum_i x[t, i] · W[o, i] + b[o].
+// Used by proj_in (192 → 2048) and proj_out (2048 → 64).  The weight is stored
+// as a 3D tensor ne=[K=2, OC, IC] in row-major memory (k varies fastest).
+// Each output frame blends two adjacent input frames:
+//
+//   y[t, o] = sum_i (x[t, i] · w[0, o, i] + x[t+1, i] · w[1, o, i]) + b[o]
+//
+// Output has T_out = T_in − 1 frames (no padding).
 
-static void manual_linear(const float* x, int32_t T, int32_t in_dim,
-                          const ggml_tensor* w, const float* b,
-                          int32_t out_dim, float* y) {
-    if (!w) {
-        // Identity-like: copy first min(in_dim, out_dim) channels
-        const int32_t copy = std::min(in_dim, out_dim);
-        for (int32_t t = 0; t < T; t++) {
-            std::memcpy(&y[static_cast<size_t>(t) * out_dim],
-                        &x[static_cast<size_t>(t) * in_dim],
-                        static_cast<size_t>(copy) * sizeof(float));
-            // Zero the rest
-            if (out_dim > copy) {
-                std::memset(&y[static_cast<size_t>(t) * out_dim + copy],
-                            0, static_cast<size_t>(out_dim - copy) * sizeof(float));
+static void conv1d_k2_s1_p0(const float* x, int32_t T, int32_t IC, int32_t OC,
+                             const float* w, const float* bias, float* y) {
+    // w in ggml ne=[2, OC, IC] order → w[k, o, i] at offset k + o·2 + i·2·OC
+    const int32_t T_out = T - 1;
+    for (int32_t t = 0; t < T_out; t++) {
+        const float* x0 = x + static_cast<size_t>(t)     * IC;
+        const float* x1 = x + static_cast<size_t>(t + 1) * IC;
+        float*       yt = y + static_cast<size_t>(t)     * OC;
+        for (int32_t o = 0; o < OC; o++) {
+            float sum = bias ? bias[o] : 0.0f;
+            for (int32_t i = 0; i < IC; i++) {
+                size_t w_base = static_cast<size_t>(o + i * OC) * 2;
+                sum += x0[i] * w[w_base] + x1[i] * w[w_base + 1];
             }
+            yt[o] = sum;
         }
-        return;
     }
+}
 
-    const float* wd = static_cast<const float*>(w->data);
-    const int32_t w_out = static_cast<int32_t>(w->ne[0]);  // ne[0] = out_features
-    const int32_t w_in  = static_cast<int32_t>(w->ne[1]);  // ne[1] = in_features
-    const int32_t eff_in  = std::min(in_dim, w_in);
-    const int32_t eff_out = std::min(out_dim, w_out);
-
-    for (int32_t t = 0; t < T; t++) {
-        for (int32_t o = 0; o < eff_out; o++) {
-            float sum = 0.0f;
-            for (int32_t i = 0; i < eff_in; i++) {
-                // column-major: W[o, i] = wd[o + i * w_out]
-                sum += x[static_cast<size_t>(t) * in_dim + i] *
-                       wd[static_cast<size_t>(o) + static_cast<size_t>(i) * w_out];
+// ── Patchify proj_in: stride=P non-overlapping patch + linear ──────────
+// Ported from HOT-Step engine/src/dit-graph.h:583-592.
+// Input  x: [T, IC]     raw context (192 channels per frame)
+// Weight w: ne=[P, IC, H], element [p, ic, h] at offset p + ic*P + h*P*IC
+// Output y: [T/P, H]    hidden state patches
+// T must be divisible by P.
+static void patchify_proj_in(const float* x, int32_t T, int32_t IC, int32_t P,
+                              int32_t H, const float* w, const float* bias,
+                              float* y) {
+    const int32_t S = T / P;
+    const int32_t PIC = P * IC;  // patch input dim (e.g. 384)
+    for (int32_t s = 0; s < S; s++) {
+        float* ys = y + static_cast<size_t>(s) * H;
+        for (int32_t h = 0; h < H; h++) ys[h] = bias ? bias[h] : 0.0f;
+        for (int32_t p = 0; p < P; p++) {
+            const float* xp = x + static_cast<size_t>(s * P + p) * IC;
+            for (int32_t ic = 0; ic < IC; ic++) {
+                float xv = xp[ic];
+                // w[p, ic, h] at offset p + ic*P + h*P*IC
+                const float* wp = w + static_cast<size_t>(p + ic * P);
+                for (int32_t h = 0; h < H; h++) {
+                    ys[h] += xv * wp[static_cast<size_t>(h) * PIC];
+                }
             }
-            y[static_cast<size_t>(t) * out_dim + o] = sum + (b ? b[o] : 0.0f);
         }
-        // Zero remaining output dims
-        if (eff_out < out_dim) {
-            std::memset(&y[static_cast<size_t>(t) * out_dim + eff_out],
-                        0, static_cast<size_t>(out_dim - eff_out) * sizeof(float));
+    }
+}
+
+// ── Un-patchify proj_out: linear + reshape (ConvTranspose1d equivalent) ─
+// Ported from HOT-Step engine/src/dit-graph.h:637-638.
+// Input  x: [S, H]      hidden state patches (S = T/P)
+// Weight w: ne=[P, OC, H], element [p, oc, h] at offset p + oc*P + h*P*OC
+// Output y: [S*P, OC]   latent frames (un-patchified to T = S*P)
+static void unpatchify_proj_out(const float* x, int32_t S, int32_t H, int32_t P,
+                                 int32_t OC, const float* w, const float* bias,
+                                 float* y) {
+    const int32_t T = S * P;
+    const int32_t POC = P * OC;  // 128
+    for (int32_t t = 0; t < T; t++) {
+        const int32_t s = t / P;
+        const int32_t p = t % P;
+        const float* xs = x + static_cast<size_t>(s) * H;
+        float* yt = y + static_cast<size_t>(t) * OC;
+        for (int32_t oc = 0; oc < OC; oc++) {
+            float sum = bias ? bias[oc] : 0.0f;
+            // w[p, oc, h] at offset p + oc*P + h*P*OC
+            const float* wp = w + static_cast<size_t>(p + oc * P);
+            for (int32_t h = 0; h < H; h++) {
+                sum += xs[h] * wp[static_cast<size_t>(h) * POC];
+            }
+            yt[oc] = sum;
         }
+    }
+}
+
+// ── Repaint injection: replace preserved regions with noised source ──────
+// Verbatim port of HOT-Step engine/src/sampler-repaint.h:sampler_repaint_inject.
+// For frames OUTSIDE [repaint_t0, repaint_t1): xt = t_next*noise + (1-t_next)*src
+// Only runs for the first `injection_ratio * num_steps` steps.
+static void sampler_repaint_inject(
+    float* xt, const float* noise, const float* repaint_src,
+    int N, int T, int Oc,
+    int repaint_t0, int repaint_t1,
+    float repaint_injection_ratio,
+    int step, int num_steps, float t_next)
+{
+    if (!repaint_src || repaint_t1 <= repaint_t0) return;
+    int injection_cutoff = static_cast<int>(repaint_injection_ratio *
+                                            static_cast<float>(num_steps) + 0.5f);
+    if (step >= injection_cutoff) return;
+    const int n_per = T * Oc;
+    for (int b = 0; b < N; b++) {
+        for (int t = 0; t < T; t++) {
+            if (t < repaint_t0 || t >= repaint_t1) {
+                for (int ch = 0; ch < Oc; ch++) {
+                    int idx = b * n_per + t * Oc + ch;
+                    xt[idx] = t_next * noise[idx] +
+                              (1.0f - t_next) * repaint_src[t * Oc + ch];
+                }
+            }
+        }
+    }
+}
+
+// ── Post-loop boundary blend: smooth repaint zone edges ─────────────────
+// Verbatim port of HOT-Step engine/src/sampler-repaint.h:sampler_repaint_blend.
+static void sampler_repaint_blend(
+    float* output, const float* repaint_src,
+    int N, int T, int Oc,
+    int repaint_t0, int repaint_t1,
+    int repaint_crossfade_frames)
+{
+    if (!repaint_src || repaint_t1 <= repaint_t0 || repaint_crossfade_frames <= 0) return;
+    const int n_per = T * Oc;
+    int cf = repaint_crossfade_frames;
+    int fade_start = repaint_t0 - cf > 0 ? repaint_t0 - cf : 0;
+    int fade_end = repaint_t1 + cf < T ? repaint_t1 + cf : T;
+    for (int t = fade_start; t < fade_end; t++) {
+        if (t >= repaint_t0 && t < repaint_t1) continue;
+        float m;
+        if (t < repaint_t0) {
+            int rl = repaint_t0 - fade_start;
+            m = static_cast<float>(t - fade_start + 1) / static_cast<float>(rl + 1);
+        } else {
+            int rl = fade_end - repaint_t1;
+            m = static_cast<float>(fade_end - t) / static_cast<float>(rl + 1);
+        }
+        for (int b = 0; b < N; b++) {
+            for (int ch = 0; ch < Oc; ch++) {
+                int idx = b * n_per + t * Oc + ch;
+                output[idx] = m * output[idx] + (1.0f - m) * repaint_src[t * Oc + ch];
+            }
+        }
+    }
+}
+
+// ── BF16 → f32 buffer (bit-level, no vae_runner dependency) ────────────
+static void bf16_to_f32_buf_local(const void* src, float* dst, int32_t n) {
+    const uint16_t* s = static_cast<const uint16_t*>(src);
+    for (int32_t i = 0; i < n; i++) {
+        // BF16 is F32 truncated to top 16 bits — just zero-extend.
+        uint32_t f32_bits = static_cast<uint32_t>(s[i]) << 16;
+        float f;
+        std::memcpy(&f, &f32_bits, sizeof(f));
+        dst[i] = f;
     }
 }
 
@@ -165,7 +287,7 @@ bool AceStepSession::run_lm(const MusicRequest& req,
         prompt += "\nLyrics: " + req.lyrics;
     }
 
-    // (2) Tokenize for TE and LM
+    fprintf(stderr, "[ace_step] run_lm: tokenizing...\n");
     std::vector<int32_t> te_tokens;
     if (!te_->tokenize(prompt, /*add_special=*/true, /*parse_special=*/true,
                        &te_tokens, nullptr, error))
@@ -182,15 +304,18 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     }
 
     // (3) TE encode → hidden states cached for run_dit_and_vae
+    fprintf(stderr, "[ace_step] run_lm: TE forward_get_embeddings (n_tok=%zu)...\n", te_tokens.size());
     const int32_t te_hs = cfg_.encoder_hidden_size;
     te_cond_len_ = static_cast<int32_t>(te_tokens.size());
     te_cond_.resize(static_cast<size_t>(te_cond_len_) * te_hs);
     if (!te_->forward_get_embeddings(te_tokens.data(), te_cond_len_, 0,
                                      te_cond_.data(), error))
         return false;
+    fprintf(stderr, "[ace_step] run_lm: TE forward_get_embeddings done\n");
 
     // (4) Null-text TE embedding for CFG (DiT side)
     {
+        fprintf(stderr, "[ace_step] run_lm: null-text TE...\n");
         std::vector<int32_t> null_tok;
         if (!te_->tokenize("", true, true, &null_tok, nullptr, error))
             return false;
@@ -203,12 +328,15 @@ bool AceStepSession::run_lm(const MusicRequest& req,
         } else {
             te_uncond_.clear();  // triggers null_condition_emb fallback in DiT
         }
+        fprintf(stderr, "[ace_step] run_lm: null-text TE done\n");
     }
 
     // (5) LM prefill with text tokens (populates KV cache for positions 0..N-1)
+    fprintf(stderr, "[ace_step] run_lm: LM forward_tokens prefill (n_tok=%zu)...\n", lm_prompt.size());
     const int32_t prompt_len = static_cast<int32_t>(lm_prompt.size());
     if (!lm_->forward_tokens(lm_prompt.data(), prompt_len, 0, nullptr, error))
         return false;
+    fprintf(stderr, "[ace_step] run_lm: LM prefill done\n");
 
     // (6) Decode loop: generate N codes at 5 Hz
     const int32_t n_codes = std::max(1, static_cast<int32_t>(req.duration * 5.0f + 0.5f));
@@ -221,6 +349,9 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     // Start token: the last prompt token (typically EOS/BOS).  The LM will
     // predict the first code token from this context.
     int32_t prev_token = lm_prompt.back();
+
+    fprintf(stderr, "[ace_step] run_lm: starting decode loop (n_codes=%d, vs=%d, code_start=%d)...\n",
+            n_codes, lm_->vocab_size(), code_start);
 
     // RNG for stochastic sampling (seeded for reproducibility)
     std::mt19937 rng(static_cast<unsigned>(req.seed != 0 ? req.seed : 42));
@@ -249,7 +380,12 @@ bool AceStepSession::run_lm(const MusicRequest& req,
 
         music_codes->push_back(chosen);
         prev_token = code_start + chosen;
+        if (s < 3 || s == n_codes - 1) {
+            fprintf(stderr, "[ace_step] run_lm: code[%d/%d]=%d (tok=%d)\n",
+                    s, n_codes, chosen, prev_token);
+        }
     }
+    fprintf(stderr, "[ace_step] run_lm: decode loop done (%zu codes)\n", music_codes->size());
 
     return true;
 }
@@ -269,6 +405,7 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                                      const std::vector<int32_t>& music_codes,
                                      std::vector<float>* pcm_stereo,
                                      std::string* error) {
+    fprintf(stderr, "[ace_step] run_dit_and_vae: enter (codes=%zu)\n", music_codes.size());
     // ── Cover mode: use cover_latent_cond_ to determine frame count ────────
     const bool is_cover_mode = !cover_latent_cond_.empty();
     const int32_t out_ch     = cfg_.dit.out_channels; //   64 (acoustic latent)
@@ -436,135 +573,253 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                      static_cast<int32_t>(te_uncond_.size() / enc_hs);
     }
 
-    // ── 3. Initialize noise at [T, in_ch] and project to [T, H] ─────────────
+    // ════════════════════════════════════════════════════════════════════════
+    //  3. Build context buffer + initialize noise
+    //
+    //  Ported from HOT-Step engine/src/pipeline-synth-ops.cpp:ops_build_context
+    //  and engine/src/hot-step-sampler.h.
+    //
+    //  Channel layout (verified from dit-graph.h:462 + ops_build_context):
+    //    channels   0..63  = src   (source latent)
+    //    channels  64..127 = mask  (1.0 = generate fresh, 0.0 = keep source)
+    //    channels 128..191 = xt    (current noisy latent)
+    //
+    //  proj_in is stride=P=2 non-overlapping patchify (NOT stride=1 Conv1D).
+    //  The DiT graph includes proj_in internally; we re-run proj_in + DiT +
+    //  proj_out every step so the Euler step happens in latent space and
+    //  repaint injection can operate on xt directly.
+    // ════════════════════════════════════════════════════════════════════════
     std::mt19937_64 noise_rng(static_cast<uint64_t>(
         req.seed != 0 ? req.seed : 42));
     std::normal_distribution<float> ndist(0.0f, 1.0f);
+    const int32_t P = (cfg_.dit.patch_size > 0) ? cfg_.dit.patch_size : 2;
+    const bool is_repaint_mode = !repaint_latent_cond_.empty();
 
-    // Raw noise: [n_frames, in_channels]
-    // Channel layout: [0..63]=noise_latent [64..127]=conditioning [128..191]=mask
-    // For cover mode: channels 64-127 hold the cover source latent (at 25Hz),
-    // channels 128-191 are all 1.0 (mask=always-on). For non-cover: all noise.
-    std::vector<float> noise_raw(static_cast<size_t>(n_frames) * in_ch);
-    for (auto& v : noise_raw) v = ndist(noise_rng);
-    if (is_cover_mode) {
-        // Fill channels 64-127 with cover source latent (chunk at frame boundary)
-        const int32_t T_use = std::min(n_frames,
-            static_cast<int32_t>(cover_latent_cond_.size() / out_ch));
-        for (int32_t i = 0; i < T_use; i++) {
-            float* row = &noise_raw[static_cast<size_t>(i) * in_ch];
-            // Channels 64-127 = source latent
-            const float* src = &cover_latent_cond_[static_cast<size_t>(i) * out_ch];
-            std::memcpy(row + 64, src, static_cast<size_t>(out_ch) * sizeof(float));
-            // Channels 128-191 = all 1.0 (mask on)
-            for (int32_t c = 0; c < out_ch; c++) row[128 + c] = 1.0f;
-        }
-        if (T_use < n_frames) {
-            fprintf(stderr, "[ace_step] cover: truncating source latent "
-                    "%d → %d frames\n",
-                    static_cast<int32_t>(cover_latent_cond_.size() / out_ch),
-                    n_frames);
-        }
-    }
+    // Pad T_latent to be divisible by P (patchify requirement)
+    int32_t T_latent = n_frames;
+    if (T_latent % P != 0)
+        T_latent = (T_latent / P + 1) * P;
+    const int32_t S_patches = T_latent / P;
+    fprintf(stderr, "[ace_step] dit: T_latent=%d S_patches=%d P=%d H=%d "
+            "in_ch=%d out_ch=%d\n",
+            T_latent, S_patches, P, H, in_ch, out_ch);
 
-    // proj_in: [T, in_ch] → [T, H]
-    std::vector<float> x(static_cast<size_t>(n_frames) * H);
+    // Load silence latent (used as src for text2music and inside repaint zone)
+    const float* silence_ptr = nullptr;
+    int32_t silence_T = 0;
     {
-        ggml_tensor* pi_b = ggml_get_tensor(ext_ctx_, "decoder.proj_in.1.bias");
-        manual_linear(noise_raw.data(), n_frames, in_ch,
-                      dit_proj_in_,
-                      pi_b ? static_cast<const float*>(pi_b->data) : nullptr,
-                      H, x.data());
+        ggml_tensor* st = ggml_get_tensor(ext_ctx_, "silence_latent");
+        if (st) {
+            silence_ptr = static_cast<const float*>(st->data);
+            silence_T = static_cast<int32_t>(st->ne[1]);
+        }
     }
+
+    // proj_in / proj_out biases
+    ggml_tensor* pi_b = ggml_get_tensor(ext_ctx_, "decoder.proj_in.1.bias");
+    ggml_tensor* po_b = ggml_get_tensor(ext_ctx_, "decoder.proj_out.1.bias");
+    const float* proj_in_bias  = pi_b ? static_cast<const float*>(pi_b->data) : nullptr;
+    const float* proj_out_bias = po_b ? static_cast<const float*>(po_b->data) : nullptr;
+
+    // Repaint zone in latent frames (mask_start/mask_end are normalized [0,1])
+    int32_t repaint_t0 = 0, repaint_t1 = 0;
+    if (is_repaint_mode) {
+        repaint_t0 = static_cast<int32_t>(req.mask_start * T_latent);
+        repaint_t1 = static_cast<int32_t>(req.mask_end * T_latent);
+        repaint_t0 = std::max(0, std::min(repaint_t0, T_latent));
+        repaint_t1 = std::max(0, std::min(repaint_t1, T_latent));
+        fprintf(stderr, "[ace_step] repaint zone: [%d, %d) / %d\n",
+                repaint_t0, repaint_t1, T_latent);
+    }
+
+    // ── Build context: [T_latent, 192] = src(64) | mask(64) | xt(64) ──
+    std::vector<float> context(static_cast<size_t>(T_latent) * in_ch, 0.0f);
+
+    // Initialize noise latent [T_latent, out_ch]
+    std::vector<float> noise_latent(static_cast<size_t>(T_latent) * out_ch);
+    for (auto& v : noise_latent) v = ndist(noise_rng);
+
+    const int32_t T_cover =
+        is_cover_mode
+            ? std::min(T_latent, static_cast<int32_t>(cover_latent_cond_.size() / out_ch))
+            : 0;
+    const int32_t T_repaint_src =
+        is_repaint_mode
+            ? std::min(T_latent, static_cast<int32_t>(repaint_latent_cond_.size() / out_ch))
+            : 0;
+
+    for (int32_t t = 0; t < T_latent; t++) {
+        float* row = &context[static_cast<size_t>(t) * in_ch];
+
+        // ── src (channels 0–63) ──
+        // Matches ops_build_context (pipeline-synth-ops.cpp:965–974):
+        //   text2music: silence
+        //   cover:      cover_latent (or silence if past T_cover)
+        //   repaint:    silence inside zone, actual latent outside
+        if (is_repaint_mode) {
+            bool in_region = (t >= repaint_t0 && t < repaint_t1);
+            if (in_region) {
+                if (silence_ptr && t < silence_T)
+                    std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
+                                static_cast<size_t>(out_ch) * sizeof(float));
+            } else {
+                if (t < T_repaint_src)
+                    std::memcpy(row,
+                                &repaint_latent_cond_[static_cast<size_t>(t) * out_ch],
+                                static_cast<size_t>(out_ch) * sizeof(float));
+                else if (silence_ptr && t < silence_T)
+                    std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
+                                static_cast<size_t>(out_ch) * sizeof(float));
+            }
+        } else if (is_cover_mode) {
+            if (t < T_cover)
+                std::memcpy(row,
+                            &cover_latent_cond_[static_cast<size_t>(t) * out_ch],
+                            static_cast<size_t>(out_ch) * sizeof(float));
+            else if (silence_ptr && t < silence_T)
+                std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
+                            static_cast<size_t>(out_ch) * sizeof(float));
+        } else {
+            if (silence_ptr && t < silence_T)
+                std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
+                            static_cast<size_t>(out_ch) * sizeof(float));
+        }
+
+        // ── mask (channels 64–127) ──
+        // Matches ops_build_context:976–981.
+        //   repaint: 1.0 inside zone, 0.0 outside
+        //   else:    1.0 everywhere (training distribution)
+        float mask_val = 1.0f;
+        if (is_repaint_mode) {
+            bool in_region = (t >= repaint_t0 && t < repaint_t1);
+            mask_val = in_region ? 1.0f : 0.0f;
+        }
+        for (int32_t c = 0; c < out_ch; c++) row[64 + c] = mask_val;
+
+        // ── xt (channels 128–191) = noise ──
+        std::memcpy(row + 128,
+                    &noise_latent[static_cast<size_t>(t) * out_ch],
+                    static_cast<size_t>(out_ch) * sizeof(float));
+    }
+
+    // xt_current tracks the denoised latent across steps [T_latent, out_ch]
+    std::vector<float> xt_current = noise_latent;
 
     // ── 4. DiT flow-matching Euler loop ─────────────────────────────────────
+    //  Ported from HOT-Step engine/src/hot-step-sampler.h.
+    //  Per step:
+    //    1. Write xt into context channels 128–191
+    //    2. proj_in: context [T, 192] → hidden [S, H]  (patchify stride=P)
+    //    3. DiT forward: hidden → v_hidden
+    //    4. proj_out: v_hidden → v_latent [T, 64]  (un-patchify)
+    //    5. Euler: xt += dt · v_latent  (latent space)
+    //    6. Repaint inject on xt (outside zone → noised source)
     const FlowSchedule sched = build_schedule(cfg_.variant, req.n_diffusion_steps);
-    std::vector<float> dit_out(static_cast<size_t>(n_frames) * H);
+    fprintf(stderr, "[ace_step] dit: schedule n_steps=%d variant='%s'\n",
+            sched.n_steps, cfg_.variant.c_str());
 
-    // ── Repaint: save initial noise and project latent_cond ───────────────
-    std::vector<float> init_noise;
-    std::vector<float> cond_h;
-    if (!repaint_latent_cond_.empty()) {
-        init_noise = x;  // noise-only state [T, H]
-
-        // Project repaint latent_cond [T_latent, 64] → [T_latent, H] via proj_in
-        const int32_t T_cond_lat = static_cast<int32_t>(
-            repaint_latent_cond_.size() / out_ch);
-        const int32_t T_use = std::min(T_cond_lat, n_frames);
-        cond_h.resize(static_cast<size_t>(T_use) * H, 0.0f);
-        manual_linear(repaint_latent_cond_.data(), T_use, out_ch,
-                      dit_proj_in_, nullptr, H, cond_h.data());
-
-        // Truncate if longer
-        if (T_cond_lat > n_frames) {
-            fprintf(stderr, "[ace_step] repaint: truncating latent_cond "
-                    "%d → %d frames\n", T_cond_lat, n_frames);
-        }
-        // Pad if shorter (silent fill)
-        if (T_cond_lat < n_frames) {
-            fprintf(stderr, "[ace_step] repaint: padding latent_cond "
-                    "%d → %d frames with silence\n", T_cond_lat, n_frames);
-        }
-    }
+    std::vector<float> hidden(static_cast<size_t>(S_patches) * H);
+    std::vector<float> v_hidden(static_cast<size_t>(S_patches) * H);
+    std::vector<float> v_latent(static_cast<size_t>(T_latent) * out_ch);
 
     for (int step = 0; step < sched.n_steps; step++) {
         const float t  = sched.timesteps[static_cast<size_t>(step)];
         const float dt = (step + 1 < sched.n_steps)
                              ? t - sched.timesteps[static_cast<size_t>(step + 1)]
                              : t;  // last step → go to 0
+        const float t_next = (step + 1 < sched.n_steps)
+                                 ? sched.timesteps[static_cast<size_t>(step + 1)]
+                                 : 0.0f;
 
-        if (!dit_runner_->forward(x.data(), t,
+        fprintf(stderr, "[ace_step] dit: step %d/%d t=%.3f dt=%.3f\n",
+                step, sched.n_steps, t, dt);
+
+        // Write current xt into context channels 128–191
+        for (int32_t i = 0; i < T_latent; i++) {
+            std::memcpy(&context[static_cast<size_t>(i) * in_ch + 128],
+                        &xt_current[static_cast<size_t>(i) * out_ch],
+                        static_cast<size_t>(out_ch) * sizeof(float));
+        }
+
+        // proj_in: context [T, 192] → hidden [S, H]  (patchify stride=P)
+        patchify_proj_in(context.data(), T_latent, in_ch, P, H,
+                         proj_in_w_f32_.data(), proj_in_bias,
+                         hidden.data());
+
+        // DiT forward: hidden [S, H] → v_hidden [S, H]
+        if (!dit_runner_->forward(hidden.data(), t,
                                   cond_ptr, T_cond, enc_hs,
                                   uncond_ptr, T_uncond,
                                   req.guidance_scale,
-                                  n_frames,  // n_patches = n_frames
-                                  dit_out.data(), error))
+                                  S_patches,
+                                  v_hidden.data(), error))
             return false;
+        fprintf(stderr, "[ace_step] dit: step %d forward done\n", step);
 
-        // Euler step: x_{t-dt} = x_t + dt · v(x_t, t)
-        for (size_t i = 0; i < x.size(); i++) {
-            x[i] += dt * dit_out[i];
-        }
+        // proj_out: v_hidden [S, H] → v_latent [T, 64]  (un-patchify)
+        unpatchify_proj_out(v_hidden.data(), S_patches, H, P, out_ch,
+                            proj_out_w_f32_.data(), proj_out_bias,
+                            v_latent.data());
 
-        // ── Repaint / completion: blend known region ─────────────────────
-        if (!repaint_latent_cond_.empty()) {
-            const float t_next = (step + 1 < sched.n_steps)
-                ? sched.timesteps[static_cast<size_t>(step + 1)]
-                : 0.0f;
-            const int32_t T_use = static_cast<int32_t>(cond_h.size() / H);
-            const int32_t T_blend = std::min(T_use, n_frames);
-            const float ms = req.mask_start;
-            const float me = req.mask_end;
-
-            for (int32_t i = 0; i < T_blend; i++) {
-                float pos = static_cast<float>(i) / n_frames;
-                float mask_val = (pos >= ms && pos < me) ? 1.0f : 0.0f;
-                if (mask_val < 1.0f) {
-                    for (int32_t j = 0; j < H; j++) {
-                        size_t idx = static_cast<size_t>(i) * H + j;
-                        float xk = (1.0f - t_next) * cond_h[idx] +
-                                    t_next * init_noise[idx];
-                        x[idx] = mask_val * x[idx] +
-                                 (1.0f - mask_val) * xk;
-                    }
-                }
+        // NaN check on v_latent
+        {
+            int nan_cnt = 0; float mx = 0, mn = 0;
+            for (size_t i = 0; i < v_latent.size(); i++) {
+                if (std::isnan(v_latent[i])) nan_cnt++;
+                else { if (v_latent[i] > mx) mx = v_latent[i]; if (v_latent[i] < mn) mn = v_latent[i]; }
             }
+            fprintf(stderr, "[ace_step] dit: step %d v_latent NaN=%d/%zu range=[%.3f,%.3f]\n",
+                    step, nan_cnt, v_latent.size(), mn, mx);
+        }
+
+        // Euler step in LATENT space: xt += dt · v_latent
+        for (size_t i = 0; i < xt_current.size(); i++) {
+            xt_current[i] += dt * v_latent[i];
+        }
+
+        // Repaint injection (outside zone → noised source)
+        if (is_repaint_mode) {
+            sampler_repaint_inject(
+                xt_current.data(),
+                noise_latent.data(),
+                repaint_latent_cond_.data(),
+                /*N=*/1, T_latent, out_ch,
+                repaint_t0, repaint_t1,
+                /*repaint_injection_ratio=*/0.5f,  // HOT-Step default
+                step, sched.n_steps, t_next);
         }
     }
 
-    // ── 5. proj_out: [T, H] → [T, out_ch] ──────────────────────────────────
-    std::vector<float> latents(static_cast<size_t>(n_frames) * out_ch);
-    {
-        ggml_tensor* po_b = ggml_get_tensor(ext_ctx_, "decoder.proj_out.1.bias");
-        manual_linear(x.data(), n_frames, H,
-                      dit_proj_out_,
-                      po_b ? static_cast<const float*>(po_b->data) : nullptr,
-                      out_ch, latents.data());
+    // Post-loop repaint boundary blend (HOT-Step default: crossfade=0, no-op)
+    if (is_repaint_mode) {
+        sampler_repaint_blend(
+            xt_current.data(),
+            repaint_latent_cond_.data(),
+            /*N=*/1, T_latent, out_ch,
+            repaint_t0, repaint_t1,
+            /*repaint_crossfade_frames=*/0);  // HOT-Step default
     }
 
-    // ── 6. VAE decode: [T, 64] → PCM stereo ────────────────────────────────
-    if (!vae_runner_->decode(latents.data(), n_frames, pcm_stereo, error))
+    // ── 5. VAE decode: xt_current [T, 64] → PCM stereo ─────────────────────
+    fprintf(stderr, "[ace_step] dit: all steps done, VAE decode (T=%d)\n", T_latent);
+    {
+        int nan_l = 0;
+        for (size_t i = 0; i < xt_current.size(); i++)
+            if (std::isnan(xt_current[i])) nan_l++;
+        fprintf(stderr, "[ace_step] NaN check: latents=%d/%zu\n",
+                nan_l, xt_current.size());
+    }
+    if (!vae_runner_->decode(xt_current.data(), T_latent, pcm_stereo, error))
         return false;
+    {
+        int nan_pcm = 0; float mx = -1e30f, mn = 1e30f;
+        for (size_t i = 0; i < pcm_stereo->size(); i++) {
+            if (std::isnan((*pcm_stereo)[i])) nan_pcm++;
+            else { if ((*pcm_stereo)[i] > mx) mx = (*pcm_stereo)[i]; if ((*pcm_stereo)[i] < mn) mn = (*pcm_stereo)[i]; }
+        }
+        fprintf(stderr, "[ace_step] dit: VAE decode done (pcm=%zu NaN=%d range=[%.6f,%.6f])\n",
+                pcm_stereo->size(), nan_pcm, mn, mx);
+    }
 
     return true;
 }

@@ -117,14 +117,14 @@ Qwen3TtsMode parse_mode(const std::string& s) {
     return Qwen3TtsMode::TtsBatch;
 }
 
-// Voice Design mode system prompt. The official VoiceDesign variant trains
-// the model to accept a natural-language voice description in the instruct
-// slot, prefixed with a "Generate a voice with the following characteristics"
-// template. We use the same template on the Base / CustomVoice backbones as
-// a best-effort fallback — output will be intelligible but less polished
-// than the dedicated VoiceDesign weights.
-static const char* kVoiceDesignInstructPrefix =
-    "Generate a voice with the following characteristics: ";
+// Voice Design mode is only valid when the loaded talker GGUF is the
+// `Qwen3-TTS-12Hz-1.7B-VoiceDesign` variant. The official VoiceDesign model
+// is fine-tuned to accept a natural-language voice description in the
+// instruct slot; running the same prompt through the Base / CustomVoice
+// backbone was the FRAUD #7 documented in Testing/GAP_TRACKER.md §3.1
+// ("best-effort fallback" that returned non-voice-designed speech). The
+// fraud is deleted: voice_design mode on a non-VoiceDesign checkpoint now
+// fails fast with an error naming the missing model.
 
 // ── Sampling ────────────────────────────────────────────────────────────
 // qwen3_tts uses the unified audiocore::sampler. A small lambda below at
@@ -236,22 +236,27 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         }
     }
 
-    // Voice Design mode: the instruct field carries the voice description.
-    // We prefix it with the VoiceDesign template so the model knows to
-    // synthesize the voice before speaking. If instruct is empty we still
-    // proceed (the dedicated VoiceDesign variant will produce a generic
-    // voice; the Base variant will just do plain TTS).
-    std::string effective_instruct = req.instruct;
+    // Voice Design mode requires the dedicated VoiceDesign variant. We do NOT
+    // impersonate it by prepending a template string to the Base backbone's
+    // instruct slot — that was FRAUD #7 (Testing/GAP_TRACKER.md §3.1).
     if (mode == Qwen3TtsMode::VoiceDesign) {
-        if (effective_instruct.empty()) {
-            std::fprintf(stderr,
-                "qwen3_tts: voice_design mode with empty instruct — "
-                "no voice description provided; proceeding with defaults\n");
-        } else {
-            effective_instruct = std::string(kVoiceDesignInstructPrefix)
-                                 + effective_instruct;
+        if (config_.variant != Qwen3TtsVariant::VoiceDesign) {
+            if (error) *error =
+                "qwen3_tts voice_design mode requires the dedicated "
+                "`Qwen3-TTS-12Hz-1.7B-VoiceDesign` checkpoint. The loaded "
+                "talker is variant=";
+            *error += variant_name(config_.variant);
+            *error += ". See Testing/GAP_TRACKER.md §3.1.";
+            return false;
+        }
+        if (req.instruct.empty()) {
+            if (error) *error =
+                "voice_design mode requires a non-empty 'instruct' field "
+                "(natural-language description of the voice to design).";
+            return false;
         }
     }
+    const std::string& effective_instruct = req.instruct;
 
     const int32_t codec_vocab = talker_->codec_vocab();
     const int32_t n_embd = talker_->n_embd();
@@ -705,10 +710,11 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     }
 
     if (n_frames <= 0) {
-        std::fprintf(stderr, "qwen3_tts: no frames generated\n");
-        resp.pcm_mono.assign(48000, 0.0f);  // 1 second silence
-        resp.sampling_rate = 24000;
-        return true;
+        if (error) *error =
+            "qwen3_tts: no audio frames generated — AR loop produced only "
+            "stop-token frames. Check that the talker + predictor weights "
+            "match the request language and that the prefill was non-empty.";
+        return false;
     }
 
     // ── Streaming: all frames already emitted via callback ───────────────
@@ -725,33 +731,31 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     std::fprintf(stderr, "qwen3_tts: %d frames generated\n", n_frames);
 
     // ── Codec decode → PCM (Stage 17) ─────────────────────────────────────
-    // When the Qwen3-TTS-Tokenizer-12Hz codec GGUF was discovered at load
-    // time, run the real ggml decode graph. Otherwise emit 1 s of silence
-    // (GAPS.md §2.3 — pre-Stage-17 behavior).
+    // Missing codec tensors is now a hard error. The previous behavior
+    // (returning 1 s of silence with `return true`) masked broken/missing
+    // codec GGUFs and broke regression tests. The codec is required to
+    // produce audio.
     //
     // Codec/talker codebook count match-up: the talker + predictor emit a
     // 32-codebook matrix (QwenLM/Qwen3-TTS original architecture), but the
     // 12Hz codec consumes only the first `codec_graphs_.hp.n_q` codebooks
     // (typically 16). We pack the first codec_n_q codebooks × n_frames
     // columns into a contiguous row-major buffer before calling decode().
-    // A misconfigured setup where the codec wants MORE codebooks than the
-    // talker produces falls back to silence rather than crashing.
     if (!config_.codec_present || !codec_graphs_.is_present()) {
-        std::fprintf(stderr, "qwen3_tts: codec not bound (no codec GGUF "
-                             "discovered); emitting silence\n");
-        resp.pcm_mono.assign(24000, 0.0f);
-        resp.sampling_rate = 24000;
-        return true;
+        if (error) *error =
+            "qwen3_tts: codec GGUF is not bound (no Qwen-TTS-Tokenizer "
+            "discovered at load time). The codec is required to produce PCM. "
+            "Provide a tokenizer GGUF via the loader.";
+        return false;
     }
 
     const int32_t codec_n_q = (int32_t)codec_graphs_.hp.n_q;
     if (codec_n_q > n_total_books) {
-        std::fprintf(stderr, "qwen3_tts: codec expects %d codebooks but "
-                             "talker+predictor only produce %d; emitting silence\n",
-                     codec_n_q, n_total_books);
-        resp.pcm_mono.assign(24000, 0.0f);
-        resp.sampling_rate = 24000;
-        return true;
+        if (error) *error =
+            "qwen3_tts: codec expects " + std::to_string(codec_n_q) +
+            " codebooks but talker+predictor only produce " +
+            std::to_string(n_total_books) + ". Variant/codec mismatch.";
+        return false;
     }
 
     // Pack (codec_n_q, n_frames) row-major out of the (n_total_books, max_steps)
@@ -774,11 +778,8 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                      double(resp.pcm_mono.size()) / 24000.0);
         return true;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "qwen3_tts: codec decode failed (%s); "
-                             "emitting silence\n", e.what());
-        resp.pcm_mono.assign(24000, 0.0f);
-        resp.sampling_rate = 24000;
-        return true;
+        if (error) *error = std::string("qwen3_tts codec decode failed: ") + e.what();
+        return false;
     }
 }
 

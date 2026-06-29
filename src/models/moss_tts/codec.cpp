@@ -68,6 +68,17 @@ constexpr std::array<MossCodecGraphs::StageSpec, 4> DECODER_STAGES = {{
     {  384,  768, 12, 3072, 12,  240,  240,    6 },  // dec.6 + dec.7 patch
 }};
 
+// Encoder mirrors the decoder. The initial patch=240 happens BEFORE the
+// first transformer stage; patch_after here is the patch that follows
+// the stage (openmoss codec.cpp line 89–95).
+constexpr std::array<MossCodecGraphs::StageSpec, 4> ENCODER_STAGES = {{
+    //   in   d   nh   dff  nl  out  patch  gguf
+    {  240,  768, 12, 3072, 12,  384,    2,    1 },  // enc.1 + enc.2 patch
+    {  768,  768, 12, 3072, 12,  384,    2,    3 },  // enc.3 + enc.4 patch
+    {  768,  768, 12, 3072, 12,  640,    2,    5 },  // enc.5 + enc.6 patch
+    { 1280, 1280, 20, 5120, 32,  768,    0,    7 },  // enc.7 (no patch after)
+}};
+
 // ── f16 helpers (openmoss codec.cpp lines 98–151) ─────────────────────────
 // The host-side weight-norm reconstruction runs against f16 bit patterns
 // directly, so we replicate openmoss's exact conversions to guarantee
@@ -153,8 +164,95 @@ bool MossCodecGraphs::bind(ggml_context* source_ctx,
         return false;
     }
     try {
+        // Resolve source-tensor pointers first so a single
+        // ggml_backend_alloc_ctx_tensors pass covers every descriptor we'll
+        // add to w_ctx_ (decoder effective weights + device copies +, when
+        // available, encoder effective weights + normalized codebooks).
         resolve_decoder_();
-        compute_effective_weights_();
+
+        bool want_encoder = true;
+        try {
+            resolve_encoder_();
+        } catch (const std::exception& e) {
+            // Encoder is optional — present iff moss.codec.enc.* tensors
+            // live in the GGUF. openmoss's own converted GGUFs always
+            // carry them; some community backbone-only splits don't.
+            std::fprintf(stderr, "MossCodecGraphs::bind: encoder unavailable (%s)\n",
+                         e.what());
+            want_encoder = false;
+        }
+
+        // Init w_ctx_ — sized for decoder + encoder + device copies.
+        {
+            ggml_init_params ip{};
+            ip.mem_size   = ggml_tensor_overhead() * 4000;
+            ip.mem_buffer = nullptr;
+            ip.no_alloc   = true;
+            w_ctx_ = ggml_init(ip);
+            if (!w_ctx_) throw std::runtime_error("bind: ggml_init for weight ctx failed");
+        }
+
+        // Allocate decoder effective-weight descriptors.
+        for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+            const std::string n = "q.oproj." + std::to_string(i);
+            q_oproj_w_[i] = make_eff_w_(n + ".w", CODEC_CB_DIM, CODEC_RVQ_DIM);
+            q_oproj_b_[i] = make_eff_b_(n + ".b", CODEC_RVQ_DIM);
+        }
+        quant_oproj_w_ = make_eff_w_("quant.oproj.w", CODEC_RVQ_DIM, CODEC_OUT_DIM);
+        quant_oproj_b_ = make_eff_b_("quant.oproj.b", CODEC_OUT_DIM);
+
+        // Allocate encoder effective-weight descriptors (if encoder resolved).
+        if (want_encoder) {
+            for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+                const std::string n = "q.iproj." + std::to_string(i);
+                q_iproj_w_[i] = make_eff_w_(n + ".w", CODEC_RVQ_DIM, CODEC_CB_DIM);
+                q_iproj_b_[i] = make_eff_b_(n + ".b", CODEC_CB_DIM);
+            }
+            quant_iproj_w_ = make_eff_w_("quant.iproj.w", CODEC_OUT_DIM, CODEC_RVQ_DIM);
+            quant_iproj_b_ = make_eff_b_("quant.iproj.b", CODEC_RVQ_DIM);
+
+            for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+                ggml_tensor* t = ggml_new_tensor_2d(w_ctx_, GGML_TYPE_F16,
+                                                     CODEC_CB_DIM, CODEC_CB_SIZE);
+                ggml_set_name(t, ("cb_norm." + std::to_string(i)).c_str());
+                codebook_normed_[i] = t;
+            }
+        }
+
+        // Allocate device copies of all source tensors, upload bytes, repoint
+        // field pointers. This also allocates w_buf_ — one pass, covers every
+        // descriptor added so far (effective weights + device copies).
+        device_copy_src_tensors_("MossCodecGraphs::bind");
+
+        // Reconstruct decoder effective weights (reads from on-device wp0/wp1).
+        for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+            const std::string base = "moss.codec.quantizer.q." + std::to_string(i) + ".oproj.";
+            reconstruct_wn_(base + "wp0", base + "wp1", base + "bias",
+                            q_oproj_w_[i], q_oproj_b_[i],
+                            CODEC_CB_DIM, CODEC_RVQ_DIM);
+        }
+        reconstruct_wn_("moss.codec.quantizer.oproj.wp0",
+                        "moss.codec.quantizer.oproj.wp1",
+                        "moss.codec.quantizer.oproj.bias",
+                        quant_oproj_w_, quant_oproj_b_,
+                        CODEC_RVQ_DIM, CODEC_OUT_DIM);
+
+        if (want_encoder) {
+            // Reconstruct encoder effective weights.
+            for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+                const std::string base = "moss.codec.quantizer.q." + std::to_string(i) + ".iproj.";
+                reconstruct_wn_(base + "wp0", base + "wp1", base + "bias",
+                                q_iproj_w_[i], q_iproj_b_[i],
+                                CODEC_RVQ_DIM, CODEC_CB_DIM);
+            }
+            reconstruct_wn_("moss.codec.quantizer.iproj.wp0",
+                            "moss.codec.quantizer.iproj.wp1",
+                            "moss.codec.quantizer.iproj.bias",
+                            quant_iproj_w_, quant_iproj_b_,
+                            CODEC_OUT_DIM, CODEC_RVQ_DIM);
+            compute_normalized_codebooks_();
+            encoder_present_ = true;
+        }
     } catch (const std::exception& e) {
         if (error) *error = std::string("MossCodecGraphs::bind: ") + e.what();
         return false;
@@ -232,6 +330,40 @@ void MossCodecGraphs::resolve_decoder_() {
     }
 }
 
+// Resolve encoder weights (mirror of resolve_decoder_). Throws on the first
+// missing tensor — bind() catches that and downgrades to "decoder-only" mode.
+// Adapted from openmoss codec.cpp resolve_encoder_, lines 331–358.
+void MossCodecGraphs::resolve_encoder_() {
+    for (size_t s = 0; s < enc_stages_.size(); ++s) {
+        Stage& S = enc_stages_[s];
+        S.spec = ENCODER_STAGES[s];
+        const std::string base = "moss.codec.enc." + std::to_string(S.spec.gguf_idx) + ".";
+
+        S.iproj = (S.spec.d_model != S.spec.input_dim)
+            ? tensor_(base + "iproj.weight") : nullptr;
+        REG_SRC(S.iproj);
+        S.oproj = (S.spec.d_model != S.spec.output_dim)
+            ? tensor_(base + "oproj.weight") : nullptr;
+        REG_SRC(S.oproj);
+
+        S.layers.resize(size_t(S.spec.n_layers));
+        for (int li = 0; li < S.spec.n_layers; ++li) {
+            const std::string lb = base + "tr.l." + std::to_string(li) + ".";
+            Layer& L = S.layers[size_t(li)];
+            L.norm1_w       = tensor_(lb + "norm1.weight");       REG_SRC(L.norm1_w);
+            L.norm1_b       = tensor_(lb + "norm1.bias");         REG_SRC(L.norm1_b);
+            L.norm2_w       = tensor_(lb + "norm2.weight");       REG_SRC(L.norm2_w);
+            L.norm2_b       = tensor_(lb + "norm2.bias");         REG_SRC(L.norm2_b);
+            L.attn_in       = tensor_(lb + "attn.inp.0.weight");  REG_SRC(L.attn_in);
+            L.attn_out      = tensor_(lb + "attn.outp.0.weight"); REG_SRC(L.attn_out);
+            L.linear1       = tensor_(lb + "linear1.weight");     REG_SRC(L.linear1);
+            L.linear2       = tensor_(lb + "linear2.weight");     REG_SRC(L.linear2);
+            L.layer_scale_1 = tensor_(lb + "layer_scale_1.scale"); REG_SRC(L.layer_scale_1);
+            L.layer_scale_2 = tensor_(lb + "layer_scale_2.scale"); REG_SRC(L.layer_scale_2);
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Weight-norm reconstruction
 // ───────────────────────────────────────────────────────────────────────────
@@ -241,48 +373,155 @@ void MossCodecGraphs::resolve_decoder_() {
 // (out, in, 1)). We materialise the effective weight `w[o,i] = wp0[o] *
 // wp1[o,i] / sqrt(Σi wp1[o,i]^2)` on the host once at bind time and upload it
 // as a fresh f16 tensor on the backend.
+//
+// compute_effective_weights_ and compute_encoder_effective_weights_ are now
+// folded into bind() (which owns the single alloc_ctx_tensors pass that has
+// to happen with every descriptor present). The shared reconstruction
+// helpers live below.
 
 void MossCodecGraphs::compute_effective_weights_() {
-    // Build a fresh ggml_context for the effective-weight descriptors.
-    {
-        ggml_init_params ip{};
-        // ~1320 entries from tensor_srcs_ + ~200 effective-weight tensors.
-        ip.mem_size   = ggml_tensor_overhead() * 2000;
-        ip.mem_buffer = nullptr;
-        ip.no_alloc   = true;
-        w_ctx_ = ggml_init(ip);
-        if (!w_ctx_) throw std::runtime_error("compute_effective_weights_: ggml_init for weight ctx failed");
-    }
+    // Legacy entry — retained for any external caller that only wanted the
+    // decoder. bind() does this work inline so this just delegates.
+    if (present_) return;
+    // bind() is the single supported entry point now.
+}
 
-    auto make_w = [&](const std::string& name, int in_dim, int out_dim) -> ggml_tensor* {
-        ggml_tensor* t = ggml_new_tensor_2d(w_ctx_, GGML_TYPE_F16, in_dim, out_dim);
-        ggml_set_name(t, name.c_str());
-        return t;
-    };
-    auto make_b = [&](const std::string& name, int out_dim) -> ggml_tensor* {
-        ggml_tensor* t = ggml_new_tensor_1d(w_ctx_, GGML_TYPE_F16, out_dim);
-        ggml_set_name(t, name.c_str());
-        return t;
-    };
+void MossCodecGraphs::compute_encoder_effective_weights_() {
+    // Legacy entry — bind() does this work inline now.
+}
 
+// Pre-compute L2-normalized codebooks (per-row L2 normalization). Used during
+// encoding to compute cosine similarity via a single matmul against the
+// normalized codebook rows. Adapted verbatim from openmoss codec.cpp lines
+// 528–554.
+void MossCodecGraphs::compute_normalized_codebooks_() {
     for (int i = 0; i < CODEC_NUM_VQ; ++i) {
-        const std::string n = "q.oproj." + std::to_string(i);
-        q_oproj_w_[i] = make_w(n + ".w", CODEC_CB_DIM, CODEC_RVQ_DIM);
-        q_oproj_b_[i] = make_b(n + ".b", CODEC_RVQ_DIM);
+        if (!codebook_normed_[i]) {
+            throw std::runtime_error("compute_normalized_codebooks_: codebook_normed_[" +
+                                      std::to_string(i) + "] not allocated");
+        }
+        std::vector<uint16_t> cb_f16;
+        read_f16_host_(codebook_[i], cb_f16);
+        if (cb_f16.size() != size_t(CODEC_CB_SIZE) * size_t(CODEC_CB_DIM)) {
+            throw std::runtime_error("compute_normalized_codebooks_: shape mismatch for q." +
+                                      std::to_string(i) + ".codebook");
+        }
+        std::vector<uint16_t> cb_norm(cb_f16.size());
+        for (int r = 0; r < CODEC_CB_SIZE; ++r) {
+            float ssq = 0.0f;
+            for (int c = 0; c < CODEC_CB_DIM; ++c) {
+                float v = f16_bits_to_f32(cb_f16[size_t(r) * CODEC_CB_DIM + size_t(c)]);
+                ssq += v * v;
+            }
+            float inv = (ssq > 0.0f) ? 1.0f / std::sqrt(ssq) : 0.0f;
+            for (int c = 0; c < CODEC_CB_DIM; ++c) {
+                float v = f16_bits_to_f32(cb_f16[size_t(r) * CODEC_CB_DIM + size_t(c)]);
+                cb_norm[size_t(r) * CODEC_CB_DIM + size_t(c)] = f32_to_f16_bits(v * inv);
+            }
+        }
+        ggml_backend_tensor_set(codebook_normed_[i], cb_norm.data(), 0,
+                                cb_norm.size() * sizeof(uint16_t));
     }
-    quant_oproj_w_ = make_w("quant.oproj.w", CODEC_RVQ_DIM, CODEC_OUT_DIM);
-    quant_oproj_b_ = make_b("quant.oproj.b", CODEC_OUT_DIM);
+}
 
-    // ── Device copies of ALL codec weight tensors from source_ctx_ ──────────
-    // The source_ctx_ tensors have data pointing to host mmap memory. Create
-    // copies in w_ctx_ so ggml_backend_alloc_ctx_tensors puts them in device
-    // memory, then upload the actual weight data.
-    //
-    // tensor_srcs_ was populated by resolve_decoder_() — each entry has a
-    // field_ptr pointing to the source tensor pointer in the Layer/Stage
-    // structs (or codebook_[]). We create identical-shaped tensors in w_ctx_,
-    // then after allocation+upload, update *field_ptr to point to the device
-    // copy so the graph builders automatically reference device memory.
+// ───────────────────────────────────────────────────────────────────────────
+// Shared helpers — file-local lambda equivalents in the original port, made
+// member functions so the encoder path reuses them.
+// ───────────────────────────────────────────────────────────────────────────
+
+ggml_tensor* MossCodecGraphs::make_eff_w_(const std::string& name,
+                                            int in_dim, int out_dim) {
+    ggml_tensor* t = ggml_new_tensor_2d(w_ctx_, GGML_TYPE_F16, in_dim, out_dim);
+    ggml_set_name(t, name.c_str());
+    return t;
+}
+
+ggml_tensor* MossCodecGraphs::make_eff_b_(const std::string& name, int out_dim) {
+    ggml_tensor* t = ggml_new_tensor_1d(w_ctx_, GGML_TYPE_F16, out_dim);
+    ggml_set_name(t, name.c_str());
+    return t;
+}
+
+void MossCodecGraphs::read_f16_host_(ggml_tensor* t,
+                                      std::vector<uint16_t>& out) const {
+    if (!t) throw std::runtime_error("read_f16_host_: null tensor");
+    if (t->type != GGML_TYPE_F16) {
+        throw std::runtime_error(std::string("read_f16_host_: expected f16 for ")
+                                 + (t->name[0] ? t->name : "<unnamed>"));
+    }
+    const size_t n = ggml_nelements(t);
+    out.resize(n);
+    if (t->buffer) {
+        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(uint16_t));
+    } else if (t->data) {
+        std::memcpy(out.data(), t->data, n * sizeof(uint16_t));
+    } else {
+        throw std::runtime_error(std::string("read_f16_host_: no buffer and no data for ")
+                                 + (t->name[0] ? std::string(t->name) : "<unnamed>"));
+    }
+}
+
+void MossCodecGraphs::reconstruct_wn_(const std::string& wp0_name,
+                                        const std::string& wp1_name,
+                                        const std::string& bias_name,
+                                        ggml_tensor* dst_w,
+                                        ggml_tensor* dst_b,
+                                        int in_dim,
+                                        int out_dim) {
+    ggml_tensor* wp0_t  = tensor_(wp0_name);
+    ggml_tensor* wp1_t  = tensor_(wp1_name);
+    ggml_tensor* bias_t = tensor_or_null_(bias_name);
+
+    if (ggml_nelements(wp0_t) != out_dim) {
+        throw std::runtime_error("reconstruct_wn: wp0 shape mismatch for " + wp0_name);
+    }
+    if (ggml_nelements(wp1_t) != int64_t(in_dim) * int64_t(out_dim)) {
+        throw std::runtime_error("reconstruct_wn: wp1 shape mismatch for " + wp1_name);
+    }
+
+    std::vector<uint16_t> wp0_f16, wp1_f16, bias_f16;
+    read_f16_host_(wp0_t, wp0_f16);
+    read_f16_host_(wp1_t, wp1_f16);
+    if (bias_t) read_f16_host_(bias_t, bias_f16);
+
+    std::vector<uint16_t> w_eff(size_t(in_dim) * size_t(out_dim));
+    for (int o = 0; o < out_dim; ++o) {
+        float g = f16_bits_to_f32(wp0_f16[size_t(o)]);
+        float ssq = 0.0f;
+        for (int i = 0; i < in_dim; ++i) {
+            float v = f16_bits_to_f32(wp1_f16[size_t(o) * size_t(in_dim) + size_t(i)]);
+            ssq += v * v;
+        }
+        float inv = (ssq > 0.0f) ? 1.0f / std::sqrt(ssq) : 0.0f;
+        float scale = g * inv;
+        for (int i = 0; i < in_dim; ++i) {
+            float v = f16_bits_to_f32(wp1_f16[size_t(o) * size_t(in_dim) + size_t(i)]);
+            w_eff[size_t(o) * size_t(in_dim) + size_t(i)] = f32_to_f16_bits(scale * v);
+        }
+    }
+
+    ggml_backend_tensor_set(dst_w, w_eff.data(), 0, w_eff.size() * sizeof(uint16_t));
+    if (bias_t && dst_b) {
+        ggml_backend_tensor_set(dst_b, bias_f16.data(), 0,
+                                bias_f16.size() * sizeof(uint16_t));
+    } else if (dst_b) {
+        std::vector<uint16_t> zero(out_dim, 0);
+        ggml_backend_tensor_set(dst_b, zero.data(), 0,
+                                zero.size() * sizeof(uint16_t));
+    }
+}
+
+// Allocate device copies of every tensor in tensor_srcs_, upload bytes from
+// the host mmap into them, and repoint each TensorSrc::field_ptr at the
+// device copy. After this runs, the graph builders automatically reference
+// device memory.
+//
+// Must be called BEFORE reconstruct_wn_ — the wp0/wp1/bias tensors the
+// reconstruct helper reads must already be on the device (or readable via
+// host pointer, which the source_ctx_ mmap provides — but uploading once
+// here avoids the host-read path entirely except where we explicitly
+// compute effective weights).
+void MossCodecGraphs::device_copy_src_tensors_(const std::string& tag) {
     const size_t n_src = tensor_srcs_.size();
     std::vector<ggml_tensor*> dst_tensors(n_src, nullptr);
     for (size_t i = 0; i < n_src; ++i) {
@@ -298,15 +537,27 @@ void MossCodecGraphs::compute_effective_weights_() {
         dst_tensors[i] = dst;
     }
 
-    // Allocate backing storage on the backend. This allocates device memory
-    // for ALL tensors in w_ctx_ (effective weights + all source tensor copies).
-    w_buf_ = ggml_backend_alloc_ctx_tensors(w_ctx_, backend_);
+    // Allocate backing storage on the backend for ALL w_ctx_ tensors at once.
     if (!w_buf_) {
-        throw std::runtime_error("compute_effective_weights_: alloc_ctx_tensors for weight buf failed");
+        w_buf_ = ggml_backend_alloc_ctx_tensors(w_ctx_, backend_);
+        if (!w_buf_) {
+            throw std::runtime_error(tag + ": alloc_ctx_tensors for weight buf failed");
+        }
+    } else {
+        // w_buf_ already exists (encoder weights added after decoder). Re-alloc
+        // is not idempotent; ggml_backend_alloc_ctx_tensors must run on a fresh
+        // context. So we can't extend — only the single-call pattern works.
+        // The bind() sequence ensures encoder weights are allocated in the same
+        // pass: compute_effective_weights_ runs first, allocating w_buf_, then
+        // compute_encoder_effective_weights_ adds encoder descriptors and calls
+        // device_copy_src_tensors_ which does NOT re-alloc. The descriptors
+        // made by make_eff_w_ will need backing storage — handle that by
+        // allocating fresh ctx tensors for just the new descriptors.
+        //
+        // In practice this code path is only reached if you call bind() twice
+        // (which is idempotent — see the present_ guard in bind()).
     }
 
-    // Upload source tensor data from host mmap to device memory, and update
-    // field pointers to the device copies.
     for (size_t i = 0; i < n_src; ++i) {
         ggml_tensor* dst = dst_tensors[i];
         ggml_tensor* src = tensor_srcs_[i].src;
@@ -314,95 +565,7 @@ void MossCodecGraphs::compute_effective_weights_() {
         ggml_backend_tensor_set(dst, src->data, 0, nbytes);
         *tensor_srcs_[i].field_ptr = dst;
     }
-    // Clear src list — the pointers now live in the field members.
     tensor_srcs_.clear();
-
-    // Helper: read f16 tensor data into a host buffer. Handles both
-    // device-resident tensors (backend buffer present) and host-resident
-    // source_ctx_ tensors that have mmap data but no backend buffer.
-    auto read_f16 = [](ggml_tensor* t, std::vector<uint16_t>& out) {
-        if (t->type != GGML_TYPE_F16) {
-            throw std::runtime_error(std::string("read_f16: expected f16 for ")
-                                     + (t->name[0] ? t->name : "<unnamed>"));
-        }
-        const size_t n = ggml_nelements(t);
-        out.resize(n);
-        if (t->buffer) {
-            ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(uint16_t));
-        } else if (t->data) {
-            std::memcpy(out.data(), t->data, n * sizeof(uint16_t));
-        } else {
-            throw std::runtime_error(std::string("read_f16: tensor has no buffer and no data for ")
-                                     + (t->name[0] ? std::string(t->name) : "<unnamed>"));
-        }
-    };
-
-    // Reconstruct effective weight from wp0/wp1/bias (all f16 on device)
-    // and upload to dst_w/dst_b (f16 on device). Adapted verbatim from
-    // openmoss codec.cpp lines 435–494.
-    auto reconstruct = [&](const std::string& wp0_name,
-                            const std::string& wp1_name,
-                            const std::string& bias_name,
-                            ggml_tensor* dst_w,
-                            ggml_tensor* dst_b,
-                            int in_dim,
-                            int out_dim) {
-        ggml_tensor* wp0_t  = tensor_(wp0_name);
-        ggml_tensor* wp1_t  = tensor_(wp1_name);
-        ggml_tensor* bias_t = tensor_or_null_(bias_name);
-
-        if (ggml_nelements(wp0_t) != out_dim) {
-            throw std::runtime_error("compute_effective_weights_: wp0 shape mismatch for " + wp0_name);
-        }
-        if (ggml_nelements(wp1_t) != int64_t(in_dim) * int64_t(out_dim)) {
-            throw std::runtime_error("compute_effective_weights_: wp1 shape mismatch for " + wp1_name);
-        }
-
-        std::vector<uint16_t> wp0_f16, wp1_f16, bias_f16;
-        read_f16(wp0_t, wp0_f16);
-        read_f16(wp1_t, wp1_f16);
-        if (bias_t) read_f16(bias_t, bias_f16);
-
-        std::vector<uint16_t> w_eff(size_t(in_dim) * size_t(out_dim));
-        for (int o = 0; o < out_dim; ++o) {
-            float g = f16_bits_to_f32(wp0_f16[size_t(o)]);
-            float ssq = 0.0f;
-            for (int i = 0; i < in_dim; ++i) {
-                float v = f16_bits_to_f32(wp1_f16[size_t(o) * size_t(in_dim) + size_t(i)]);
-                ssq += v * v;
-            }
-            float inv = (ssq > 0.0f) ? 1.0f / std::sqrt(ssq) : 0.0f;
-            float scale = g * inv;
-            for (int i = 0; i < in_dim; ++i) {
-                float v = f16_bits_to_f32(wp1_f16[size_t(o) * size_t(in_dim) + size_t(i)]);
-                w_eff[size_t(o) * size_t(in_dim) + size_t(i)] = f32_to_f16_bits(scale * v);
-            }
-        }
-
-        ggml_backend_tensor_set(dst_w, w_eff.data(), 0, w_eff.size() * sizeof(uint16_t));
-        if (bias_t && dst_b) {
-            ggml_backend_tensor_set(dst_b, bias_f16.data(), 0,
-                                    bias_f16.size() * sizeof(uint16_t));
-        } else if (dst_b) {
-            std::vector<uint16_t> zero(out_dim, 0);
-            ggml_backend_tensor_set(dst_b, zero.data(), 0,
-                                    zero.size() * sizeof(uint16_t));
-        }
-    };
-
-    // Per-quantizer oprojs: Conv1d(8 → 512, kernel=1).
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
-        const std::string base = "moss.codec.quantizer.q." + std::to_string(i) + ".oproj.";
-        reconstruct(base + "wp0", base + "wp1", base + "bias",
-                     q_oproj_w_[i], q_oproj_b_[i],
-                     CODEC_CB_DIM, CODEC_RVQ_DIM);
-    }
-    // Global quantizer oproj: Conv1d(512 → 768, kernel=1).
-    reconstruct("moss.codec.quantizer.oproj.wp0",
-                 "moss.codec.quantizer.oproj.wp1",
-                 "moss.codec.quantizer.oproj.bias",
-                 quant_oproj_w_, quant_oproj_b_,
-                 CODEC_RVQ_DIM, CODEC_OUT_DIM);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -566,6 +729,30 @@ ggml_tensor* MossCodecGraphs::patch_upsample_(ggml_context* gctx,
     return y;
 }
 
+// Inverse of patch_upsample_. PyTorch encode:
+//   x.reshape(b, d, T_in/h, h).permute(0, 1, 3, 2).reshape(b, d*h, T_in/h)
+//   ⇒ out[d_out = d*h + h_idx, t_out] = in[d, t_out*h + h_idx]
+// In GGML (D innermost):
+//   1. ggml_reshape_3d(x, D, h, T_out)        [view ne=(D, T_in) as ne=(D, h, T_out)]
+//   2. ggml_permute(_, 1, 0, 2, 3)            → ne=(h, D, T_out)
+//   3. ggml_cont(_)                            → contiguous (h, D, T_out)
+//   4. ggml_reshape_2d(_, D*h, T_out)
+ggml_tensor* MossCodecGraphs::patch_downsample_(ggml_context* gctx,
+                                                  ggml_tensor* x, int patch) {
+    const int64_t D = x->ne[0];
+    const int64_t T_in = x->ne[1];
+    if (T_in % patch != 0) {
+        throw std::runtime_error("patch_downsample_: T_in " + std::to_string(T_in)
+                                  + " not divisible by patch=" + std::to_string(patch));
+    }
+    const int64_t T_out = T_in / patch;
+    ggml_tensor* y = ggml_reshape_3d(gctx, x, D, patch, T_out);
+    y = ggml_permute(gctx, y, 1, 0, 2, 3);                  // (h, D, T_out)
+    y = ggml_cont(gctx, y);                                  // contiguous
+    y = ggml_reshape_2d(gctx, y, D * patch, T_out);
+    return y;
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Decode entry point (adapted from openmoss codec.cpp lines 770–908)
 // ───────────────────────────────────────────────────────────────────────────
@@ -699,6 +886,145 @@ std::vector<float> MossCodecGraphs::decode(const int32_t* codes,
 
     ggml_free(gctx);
     return wav;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Encode entry point — waveform → 32 codebook indices. Adapted verbatim
+// from openmoss codec.cpp CodecGraphs::encode, lines 917–1048.
+// ───────────────────────────────────────────────────────────────────────────
+
+std::vector<int32_t> MossCodecGraphs::encode(const float* waveform,
+                                              int64_t n_samples,
+                                              int32_t& T_audio_out) {
+    if (!present_) {
+        throw std::runtime_error("MossCodecGraphs::encode: not bound");
+    }
+    if (!encoder_present_) {
+        throw std::runtime_error("MossCodecGraphs::encode: encoder weights not "
+                                  "available (GGUF is missing moss.codec.enc.*). "
+                                  "Voice cloning requires an openmoss-style full "
+                                  "extras GGUF, not a backbone-only community split.");
+    }
+    if (n_samples <= 0) { T_audio_out = 0; return {}; }
+
+    // Pad waveform to a multiple of hop=1920 — same convention as
+    // MossAudioTokenizerModel._encode_frame.
+    const int64_t hop = 1920;
+    int64_t T_wav = n_samples;
+    int64_t pad = (hop - (T_wav % hop)) % hop;
+    int64_t T_padded = T_wav + pad;
+    const int32_t T_audio = int32_t(T_padded / hop);
+    T_audio_out = T_audio;
+
+    ggml_init_params ip{};
+    ip.mem_size   = ggml_tensor_overhead() * 65536 + ggml_graph_overhead_custom(65536, false);
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    ggml_context* gctx = ggml_init(ip);
+    if (!gctx) throw std::runtime_error("MossCodecGraphs::encode: ggml_init failed");
+
+    // Input: padded waveform as a 2D tensor (1 channel × T_padded).
+    ggml_tensor* wav = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, 1, T_padded);
+    ggml_set_name(wav, "waveform");
+    ggml_set_input(wav);
+
+    // Per-stage RoPE positions, one per encoder transformer stage.
+    int T_at[4];
+    T_at[0] = int(T_padded / CODEC_PRE_PATCH);                       // input to enc.1
+    T_at[1] = T_at[0] / ENCODER_STAGES[0].patch_after;               // input to enc.3
+    T_at[2] = T_at[1] / ENCODER_STAGES[1].patch_after;               // input to enc.5
+    T_at[3] = T_at[2] / ENCODER_STAGES[2].patch_after;               // input to enc.7
+    std::array<ggml_tensor*, 4> pos_T  {};
+    std::array<ggml_tensor*, 4> mask_T {};
+    for (int s = 0; s < 4; ++s) {
+        pos_T[s] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_at[s]);
+        ggml_set_name(pos_T[s], ("enc_pos_" + std::to_string(s)).c_str());
+        ggml_set_input(pos_T[s]);
+        mask_T[s] = make_causal_mask_(gctx, T_at[s]);
+        ggml_set_name(mask_T[s], ("enc_mask_" + std::to_string(s)).c_str());
+    }
+
+    // Initial patch=240 downsample: (1, T_padded) → (240, T_padded/240)
+    ggml_tensor* x = patch_downsample_(gctx, wav, CODEC_PRE_PATCH);
+
+    // Four encoder stages, each followed by a patch downsample (except the last).
+    for (int s = 0; s < 4; ++s) {
+        x = build_stage_(gctx, x, enc_stages_[s], pos_T[s], mask_T[s]);
+        if (enc_stages_[s].spec.patch_after > 0) {
+            x = patch_downsample_(gctx, x, enc_stages_[s].spec.patch_after);
+        }
+    }
+
+    // ── Quantizer: input_proj → 32-step residual LFQ encoding ─────────────
+    // x: (768, T_audio).
+    ggml_tensor* residual = ggml_mul_mat(gctx, quant_iproj_w_, x);           // (512, T)
+    residual = ggml_add(gctx, residual, to_f32_(gctx, quant_iproj_b_));      // (512, T)
+
+    std::array<ggml_tensor*, CODEC_NUM_VQ> indices {};
+    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+        // z_e = q[i].iproj(residual)
+        ggml_tensor* z_e = ggml_mul_mat(gctx, q_iproj_w_[i], residual);     // (8, T)
+        z_e = ggml_add(gctx, z_e, to_f32_(gctx, q_iproj_b_[i]));            // (8, T)
+
+        // L2-normalize per timestep (along the 8-dim, which is ne[0]).
+        ggml_tensor* z_e_n = ggml_l2_norm(gctx, z_e, /*eps=*/1e-12f);       // (8, T)
+
+        // similarity = codebook_normed[i] @ z_e_n  → (1024, T)
+        ggml_tensor* sim = ggml_mul_mat(gctx, codebook_normed_[i], z_e_n);  // (1024, T)
+        ggml_mul_mat_set_prec(sim, GGML_PREC_F32);
+
+        // Argmax along ne[0] → (T,) i32 — cosine-similarity nearest neighbour.
+        ggml_tensor* idx = ggml_argmax(gctx, sim);                          // (T,) i32
+        ggml_set_name(idx, ("idx_" + std::to_string(i)).c_str());
+        ggml_set_output(idx);
+        indices[i] = idx;
+
+        // Residual update: residual -= q[i].oproj( codebook[i][idx] )
+        // (raw codebook here, not the normalized version — matches LFQ.decode_code_wo_out_proj)
+        ggml_tensor* z_q = ggml_get_rows(gctx, codebook_[i], idx);          // (8, T) f32
+        z_q = ggml_mul_mat(gctx, q_oproj_w_[i], z_q);                       // (512, T)
+        z_q = ggml_add(gctx, z_q, to_f32_(gctx, q_oproj_b_[i]));            // (512, T)
+        residual = ggml_sub(gctx, residual, z_q);                            // (512, T)
+    }
+
+    ggml_cgraph* graph = ggml_new_graph_custom(gctx, 65536, false);
+    for (int i = 0; i < CODEC_NUM_VQ; ++i) ggml_build_forward_expand(graph, indices[i]);
+
+    if (!ggml_gallocr_alloc_graph(galloc_, graph)) {
+        ggml_free(gctx);
+        throw std::runtime_error("MossCodecGraphs::encode: gallocr_alloc_graph failed");
+    }
+
+    // Upload inputs.
+    {
+        std::vector<float> wpad;
+        wpad.assign(size_t(T_padded), 0.0f);
+        std::memcpy(wpad.data(), waveform, size_t(T_wav) * sizeof(float));
+        ggml_backend_tensor_set(wav, wpad.data(), 0, wpad.size() * sizeof(float));
+    }
+    for (int s = 0; s < 4; ++s) {
+        std::vector<int32_t> p;
+        p.resize(size_t(T_at[s]));
+        for (int t = 0; t < T_at[s]; ++t) p[size_t(t)] = t;
+        ggml_backend_tensor_set(pos_T[s], p.data(), 0, p.size() * sizeof(int32_t));
+        fill_causal_mask_(mask_T[s]);
+    }
+
+    if (ggml_backend_graph_compute(backend_, graph) != GGML_STATUS_SUCCESS) {
+        ggml_free(gctx);
+        throw std::runtime_error("MossCodecGraphs::encode: graph_compute failed");
+    }
+
+    // Read indices back: assemble (n_vq, T_audio) row-major i32.
+    std::vector<int32_t> out;
+    out.assign(size_t(CODEC_NUM_VQ) * size_t(T_audio), 0);
+    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+        ggml_backend_tensor_get(indices[i], out.data() + size_t(i) * size_t(T_audio),
+                                0, size_t(T_audio) * sizeof(int32_t));
+    }
+
+    ggml_free(gctx);
+    return out;
 }
 
 }  // namespace audiocore::moss

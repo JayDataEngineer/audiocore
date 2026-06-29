@@ -106,14 +106,11 @@ int main() {
     for (float s : resp.pcm_mono) sum_sq += static_cast<double>(s) * s;
     double rms = std::sqrt(sum_sq / resp.pcm_mono.size());
     std::fprintf(stderr, "[INFO] RMS level: %.6f\n", rms);
-    // With the weight-upload fix (TensorSrc device copies), the codec decode
-    // produces real audio from properly-formed extras GGUFs.
-    if (rms > 1e-6) {
-        std::fprintf(stderr, "[PASS] non-silent output — full codec path works\n");
-    } else {
-        std::fprintf(stderr, "[WARN] silent output — AR pipeline verified, "
-                             "codec tensors may be truncated in extras GGUF\n");
-    }
+    // Upstream-honest pipeline (§1.3 of the gap tracker has been ported);
+    // there is no longer a silence fallback to hide behind. If the codec
+    // produced silent output, that is a regression.
+    CHECK(rms > 1e-6, "output is silent — regression in AR or codec path");
+    std::fprintf(stderr, "[PASS] non-silent output — full codec path works\n");
 
     CHECK(write_wav("test_moss_output.wav", resp.pcm_mono.data(),
                     resp.pcm_mono.size(), resp.sampling_rate) == 0,

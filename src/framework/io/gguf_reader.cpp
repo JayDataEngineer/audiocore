@@ -179,9 +179,16 @@ bool GgufReader::get_kv_i32(const char* key, int32_t* out) const {
     if (!ctx_) return false;
     const int64_t k = gguf_find_key(ctx_, key);
     if (k < 0) return false;
-    if (gguf_get_kv_type(ctx_, k) != GGUF_TYPE_INT32) return false;
-    *out = gguf_get_val_i32(ctx_, k);
-    return true;
+    int t = gguf_get_kv_type(ctx_, k);
+    if (t == GGUF_TYPE_INT32) {
+        *out = gguf_get_val_i32(ctx_, k);
+        return true;
+    }
+    if (t == GGUF_TYPE_UINT32) {
+        *out = static_cast<int32_t>(gguf_get_val_u32(ctx_, k));
+        return true;
+    }
+    return false;
 }
 
 bool GgufReader::get_kv_i64(const char* key, int64_t* out) const {

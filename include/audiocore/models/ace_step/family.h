@@ -128,13 +128,17 @@ private:
     // Anchored hot tensors. DiT names are unprefixed; VAE names are
     // `vae.`-prefixed at bind time to dodge the `decoder.block.{i}.*`
     // collision with DiT (both upstream files use the same `decoder.*` tree).
-    ggml_tensor*   dit_proj_in_   = nullptr;   // decoder.proj_in.1.weight
-    ggml_tensor*   dit_proj_out_  = nullptr;   // decoder.proj_out.1.weight
+    ggml_tensor*   dit_proj_in_   = nullptr;   // decoder.proj_in.1.weight  (bf16 3D)
+    ggml_tensor*   dit_proj_out_  = nullptr;   // decoder.proj_out.1.weight (bf16 3D)
     ggml_tensor*   dit_time_embed_= nullptr;   // decoder.time_embed
     ggml_tensor*   vae_conv_in_   = nullptr;   // vae.decoder.conv1 (bound as vae.*)
     ggml_tensor*   vae_conv_out_  = nullptr;   // vae.decoder.conv2
     AceConfig      cfg_;
     bool           owns_ext_ctx_ = false;
+
+    // ── Pre-computed f32 Conv1D weights (bf16 → f32 at load time) ─────────
+    std::vector<float> proj_in_w_f32_;   // decoder.proj_in.1.weight  f32 [2, 2048, 192]
+    std::vector<float> proj_out_w_f32_;  // decoder.proj_out.1.weight f32 [2, 64, 2048]
 
     // ── Cached between run_lm() and run_dit_and_vae() ──────────────────────
     std::vector<float> te_cond_;       // TE hidden states: [T_text, encoder_hidden]
