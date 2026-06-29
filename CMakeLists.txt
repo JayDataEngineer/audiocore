@@ -130,6 +130,11 @@ target_link_libraries(convert_acestep PRIVATE audiocore_framework)
 add_executable(convert_qwen3tts tools/convert_qwen3tts.cpp)
 target_link_libraries(convert_qwen3tts PRIVATE audiocore_framework)
 
+# GGUF inspector — dump tensor names, shapes, and sizes. Useful for debugging
+# GGUF layout issues (e.g. truncated files, mismatched tensor counts).
+add_executable(inspect_gguf tools/inspect_gguf.cpp)
+target_link_libraries(inspect_gguf PRIVATE audiocore_framework)
+
 if(ENGINE_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
