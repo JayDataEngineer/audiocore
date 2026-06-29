@@ -40,7 +40,7 @@ MOSS-Audio-Tokenizer-v2 / -Nano codec infrastructure.
 | `tts` (zero-shot) | ✅ Stage 16 | Wired; codec decode via `MossCodecGraphs` when GGUF carries `moss.codec.*`, silence fallback otherwise |
 | `sfx` (sound effects) | ✅ Stage 16 | Wired; different system prompt + sampling defaults; same codec path |
 | `voice_clone` | ✅ Stage 16 | Wired; reads `voice_path` as pre-encoded `.codes`; same codec path |
-| `dialogue` (TTSD) | 🟡 | Stage 11: TTSD-style system prompt + dialogue sampling defaults. Multi-turn input surface still missing (single `text` field becomes the opening turn); true TTSD weights are a separate 8B variant. Codec wired (Stage 16). |
+| `dialogue` (TTSD) | ✅ | Stage 11: TTSD-style system prompt + dialogue sampling defaults. Multi-turn input via `messages` array (OpenAI-compatible: system/user/assistant roles). Single `text` field becomes the opening turn when `messages` is absent. True TTSD weights are a separate 8B variant (same code path). Codec wired (Stage 16). |
 | `voice_design` (VoiceGenerator) | 🟡 | Stage 11: routes voice description from `instruct` through the flagship backbone with a voice-design system prompt. Best-effort fallback — the dedicated 1.7B VoiceGenerator model produces better voice fidelity. Codec wired (Stage 16). |
 | `realtime` / streaming | ✅ Stage 18 | Per-frame incremental codec decode during AR loop. First frame after ~1.3s (N_VQ delay steps), then 80ms/frame. Response PCM empty in streaming mode — all audio through callback. |
 
@@ -232,7 +232,9 @@ single session but are listed so the work is plan-able.
 5. ✅ Stage 10 — **Qwen3-TTS `speaker_name` → token routing** — the 9 default
    speakers resolve to codec tokens, injected as a dedicated codec-prefix slot.
 6. ✅ Stage 11 — **MOSS `mode="dialogue"`** — TTSD-style system prompt + dialogue
-   sampling defaults. Multi-message input still pending.
+   sampling defaults. Multi-turn input via `messages` array (OpenAI-compatible
+   ChatMessage roles). Single `text` field becomes opening turn when `messages`
+   is absent.
 7. ✅ Stage 11 — **MOSS `mode="voice_design"`** — voice description in `instruct`
    routes through the flagship backbone with a voice-design system prompt.
 8. ✅ Stage 10 — **Qwen3-TTS `mode="voice_design"`** — same idea, on the
@@ -288,15 +290,15 @@ single session but are listed so the work is plan-able.
 Of the **5 + 5 + 6 = 16 advertised user-facing modes** across the three
 families, after Stages 9–19:
 
-- ✅ fully wired end-to-end: **13** (ACE-Step Text-to-Music / cover /
-  repaint / completion; MOSS tts / sfx / voice_clone / realtime — when
+- ✅ fully wired end-to-end: **14** (ACE-Step Text-to-Music / cover /
+  repaint / completion; MOSS tts / sfx / dialogue / voice_clone / realtime — when
   fed codec-bearing weights like `smcleod/MOSS-TTS-v1.5-GGUF`; Qwen3-TTS
   batch TTS / TTS with style instructions / voice_design / voice_clone /
   streaming — when fed a codec sidecar like
   `cstr/qwen3-tts-tokenizer-12hz-GGUF` AND the talker GGUF carries speaker
   encoder tensors; Voice Clone falls back to a clear fail-fast error with
   a GAPS.md pointer when the speech encoder is absent)
-- 🟡 parse + run, partial elsewhere: **2** (MOSS dialogue / voice_design
+- 🟡 parse + run, partial elsewhere: **1** (MOSS voice_design
   — codec wired but mode-specific surface partial)
 - ❌ not implemented, achievable without new weights: **0** — all closed
 - ❌ not implemented, separate model: **2** (ACE-Step stem extraction,
@@ -305,8 +307,7 @@ families, after Stages 9–19:
   both emit frames during AR loop via callback; response PCM empty)
 - 🚧 blocked on major port: **1** (ACE-Step stem/lego — separate
   Demucs-class model)
-- 📋 reference impl identified, port scoped: **0** (all ported) — minor
-  refinements remain: MOSS dialogue multi-turn input surface
+- 📋 reference impl identified, port scoped: **0** (all ported)
 
 Stage 9 closed the entire IaC bucket. Stages 10–12 flipped six
 modes from ❌ to 🟡 (Qwen3-TTS voice_design, MOSS dialogue, MOSS
@@ -318,9 +319,5 @@ skip the converter step entirely. Stage 16 ported the MOSS-Audio-Tokenizer;
 Stage 17 ports the Qwen3-TTS-Tokenizer-12Hz. Stages 18–19 added per-frame
 streaming for both MOSS and Qwen3-TTS.**
 
-The remaining work is concentrated in the following place:
-
-1. **Full ICL prefill builder** — ✅ Now supports both xvec_only (Stage 18)
-   and full ICL with ref-codes (Phase B). The codec encoder port (§4.8)
-   produces ref-codes from the reference WAV; `run_inference()` fuses them
-   into the talker prefill between ref_text and codec_bos.
+All previously achievable gaps are now closed. The only remaining items are
+blocked on separate model families (ACE-Step stem/lego — Demucs-class).
