@@ -65,6 +65,12 @@ private:
     ggml_context* ext_ctx_;   // weight tensors only (no_alloc=true, mmap'd)
     DitConfig cfg_;
 
+    // Pre-converted per-layer and global scale_shift_table (bf16 → f32).
+    // Applied as a learned bias to time_mod per layer (per-layer) and as
+    // final output scale/shift (global).
+    std::vector<std::vector<float>> ss_table_f32_;   // [n_layers][H * 6]
+    std::vector<float>              global_ss_f32_;  // [H * 2]
+
     // Cached max graph size — allocate once, reuse across steps
     size_t graph_mem_size_ = 0;
     char*  graph_mem_buf_  = nullptr;

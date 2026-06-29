@@ -1,46 +1,62 @@
-// session.cpp — MOSS-TTS full embedding-based generation pipeline.
+// session.cpp — MOSS-TTS end-to-end generation pipeline (upstream-honest port).
+//
+// Prompts and the codec-encode path are verbatim ports of
+// pwilkin/openmoss (Apache-2.0) src/pipeline.cpp + src/codec.cpp::encode().
+// The fraud surface documented in Testing/GAP_TRACKER.md §1 (system-prompt
+// impersonation of SFX/VoiceDesign/Dialogue/Realtime modes; .codes binary
+// voice cloning; per-mode fabricated sampling configs; silence fallbacks)
+// has been removed. Unsupported modes now fail fast; voice cloning now reads
+// a WAV and runs the real codec encoder; plain TTS now builds the upstream
+// `<user_inst>` template the model was trained on.
 //
 // Pipeline:
-//   1. Tokenize text via Qwen3 chat template + append <|audio_start|>
-//   2. Build summed text+audio embeddings for the prompt
-//   3. Prefill: forward embeddings through Qwen3 backbone
+//   1. Build the upstream chat prompt:
+//        <|im_start|>user\n<user_inst>\n- Reference(s):\n[S1]:\n
+//          <audio_start><|audio_user_slot|>×T_ref<|audio_user_slot|>×(n_vq-1)
+//          <audio_end>\n- Instruction:\n…\n- Tokens:\n…\n- Quality:\n…
+//          \n- Sound Event:\nNone\n- Ambient Sound:\nNone\n
+//          \n- Language:\n…\n- Text:\n<text>\n</user_inst><|im_end|>
+//          \n<|im_start|>assistant\n<audio_start>
+//      — or the same body without the Reference(s)/[S1]: block when no
+//      reference audio is supplied.
+//   2. Tokenize the prompt and build the (S, 1+n_vq) grid of int32 tokens:
+//      text ids in column 0, AUDIO_PAD_CODE elsewhere; the delay-pattern-
+//      shifted reference codes are spliced into the rows that fall between
+//      the <audio_start>/<audio_end> markers inside the user block.
+//   3. Compute summed text+audio input embeddings and prefill the backbone.
 //   4. Autoregressive loop:
-//      a. Get last hidden state from backbone
-//      b. Project through audio_head.{i}.weight -> per-stream codec logits
-//      c. Get text logits from backbone output
-//      d. delay_step -> sample next (1+N_VQ) token vector
-//      e. Embed the token vector (text_embed + sum audio_embed[i])
-//      f. Forward single embedding through backbone (incremental KV)
-//   5. Apply de-delay pattern to audio channels
-//   6. (Stage 16) Decode codec tokens -> PCM via MossCodecGraphs (ggml port
-//      of openmoss/src/codec.cpp). Falls back to 1 s silence when the GGUF
-//      carries no moss.codec.* tensors.
-//   7. Write PCM into response
+//      a. Pull text logits + hidden state from backbone
+//      b. Project through audio_head.{i}.weight → per-stream codec logits
+//      c. delay_step → sample next (1+n_vq) token vector
+//      d. Embed the token vector (text_embed + Σ audio_embed[i])
+//      e. Forward single embedding through backbone (incremental KV)
+//   5. Apply de-delay pattern to audio channels.
+//   6. Decode codec tokens → PCM via MossCodecGraphs (the same ggml port
+//      openmoss uses). Missing codec tensors is a hard error.
+//   7. Write PCM into response.
 //
-// Per-frame streaming: when mode="realtime"/"streaming" and a non-null
-// stream callback is provided, the AR loop decodes newly available codec
-// frames incrementally (via apply_de_delay_pattern on the growing delay
-// buffer) and emits PCM through the callback in real-time. The first frame
-// becomes available after N_VQ delay steps (~1.3s at 80ms/frame); subsequent
-// frames emit at the codec frame rate (80ms). Response PCM is empty in
-// streaming mode — all audio flows through the callback. Non-streaming use
-// with a callback still works via post-hoc chunked emission (Stage 18).
-//
-// Everything transformer-shaped goes through qwen3::Runner (libllama). This
-// file is everything that ISN'T the transformer: the audio-head projection,
-// the sampler, the delay state machine, and the codec decode.
+// Per-frame streaming (mode="streaming" with a non-null req->stream callback):
+// the AR loop decodes newly available codec frames incrementally and emits
+// PCM through the callback. The first frame becomes available after N_VQ
+// delay steps (~1.3 s at 80 ms/frame) — this is the cold-start of the Delay
+// architecture. It is NOT the upstream MossTTSRealtime architecture, which
+// we do not ship (see GAP_TRACKER.md §1.1).
 
 #include "audiocore/models/moss_tts/family.h"
 #include "audiocore/models/moss_tts/projection.h"
 #include "audiocore/models/moss_tts/delay_state.h"
+#include "audiocore/framework/io/wav.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <random>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "ggml.h"
 
@@ -48,52 +64,177 @@ namespace audiocore::moss {
 
 namespace {
 
-// Loudness normalization: target -20 dBFS with +/- 3 dB gain range.
-// Matches upstream pipeline.py loudness_normalize().
-void loudness_normalize(std::vector<float>& wav) {
-    if (wav.empty()) return;
-    double sum_sq = 0.0;
-    for (float s : wav) sum_sq += static_cast<double>(s) * s;
-    double rms = std::sqrt(sum_sq / wav.size() + 1e-9);
-    double current_dbfs = 20.0 * std::log10(rms);
-    double gain = std::clamp(-20.0 - current_dbfs, -3.0, 3.0);
-    float factor = static_cast<float>(std::pow(10.0, gain / 20.0));
-    for (float& s : wav) s *= factor;
+// ── Upstream prompt builder (verbatim port of openmoss/src/pipeline.cpp) ─────
+
+// Convert a token id to its string form. Mirrors the Python helper.
+std::string id_to_token(qwen3::Runner* backbone, int32_t id) {
+    std::string piece;
+    std::string err;
+    if (!backbone->token_to_piece(id, &piece, &err) || piece.empty()) {
+        // Fall back to a printable sentinel so tokenization fails loudly
+        // rather than silently producing a different prompt.
+        return std::string("<UNKNOWN_TOKEN_") + std::to_string(id) + ">";
+    }
+    return piece;
 }
 
-// ── Load codec tokens from a .codes binary file ─────────────────────────────
-// Format: [n_frames: i32le] [codes: n_frames * N_VQ * i32le]
-// Returns empty vector on error.
-std::vector<std::vector<int32_t>> load_codec_tokens(const std::string& path,
-                                                     int32_t expected_n_vq,
-                                                     std::string* error) {
-    FILE* fp = fopen(path.c_str(), "rb");
-    if (!fp) {
-        if (error) *error = "voice_clone: cannot open " + path;
-        return {};
-    }
-    int32_t n_frames = 0;
-    if (fread(&n_frames, sizeof(int32_t), 1, fp) != 1) {
-        if (error) *error = "voice_clone: " + path + " too short (n_frames)";
-        fclose(fp); return {};
-    }
-    const int32_t n_vq = expected_n_vq;
-    std::vector<std::vector<int32_t>> result;
-    result.reserve(static_cast<size_t>(n_frames));
-    for (int32_t i = 0; i < n_frames; i++) {
-        std::vector<int32_t> frame(static_cast<size_t>(n_vq));
-        size_t nread = fread(frame.data(), sizeof(int32_t),
-                             static_cast<size_t>(n_vq), fp);
-        if (static_cast<int32_t>(nread) != n_vq) {
-            if (error)
-                *error = "voice_clone: " + path + " truncated at frame " +
-                         std::to_string(i);
-            fclose(fp); return {};
+std::string default_or_none(const std::optional<std::string>& s) {
+    return s ? *s : "None";
+}
+
+std::string default_or_none(const std::optional<int>& v) {
+    return v ? std::to_string(*v) : "None";
+}
+
+// Build the literal token-string form of the reference-audio block:
+//   <audio_start><user_slot>…<user_slot>…<audio_end>
+// — exactly what `_replace_audio_placeholders` produces upstream when the
+// reference is for a `user` role. The block has length T_ref + n_vq + 1.
+std::string build_reference_audio_block(qwen3::Runner* backbone,
+                                         const MossConfig& d,
+                                         int32_t T_ref) {
+    const std::string audio_start = id_to_token(backbone, d.tok_audio_start);
+    const std::string audio_end   = id_to_token(backbone, d.tok_audio_end);
+    const std::string user_slot   = id_to_token(backbone, d.tok_user_slot);
+    std::string s;
+    s += audio_start;
+    for (int t = 0; t < T_ref; ++t) s += user_slot;
+    for (int i = 0; i < d.n_vq - 1; ++i) s += user_slot;
+    s += audio_end;
+    return s;
+}
+
+// Build the user-instruction body that wraps the synthesis target.
+//   reference_block: literal token string for the encoded reference audio,
+//                    or empty when no reference is supplied.
+std::string build_user_inst(const std::optional<std::string>& instruction,
+                             const std::optional<int>&        tokens,
+                             const std::optional<std::string>& quality,
+                             const std::optional<std::string>& language,
+                             const std::string& text,
+                             const std::string& reference_block) {
+    std::string s;
+    s += "<user_inst>\n";
+    s += "- Reference(s):\n";
+    if (reference_block.empty()) s += "None\n";
+    else                          s += "[S1]:\n" + reference_block + "\n";
+    s += "- Instruction:\n" + default_or_none(instruction) + "\n";
+    s += "- Tokens:\n"      + default_or_none(tokens)      + "\n";
+    s += "- Quality:\n"     + default_or_none(quality)     + "\n";
+    s += "- Sound Event:\nNone\n";
+    s += "- Ambient Sound:\nNone\n";
+    s += "- Language:\n"    + default_or_none(language)    + "\n";
+    s += "- Text:\n"        + text                         + "\n";
+    s += "</user_inst>";
+    return s;
+}
+
+// Build the full assistant-prompt string:
+//   <im_start>user\n…<im_end>\n<im_start>assistant\n<audio_start>
+std::string build_prompt_text(qwen3::Runner* backbone,
+                               const MossConfig& d,
+                               const std::optional<std::string>& instruction,
+                               const std::optional<int>&        tokens,
+                               const std::optional<std::string>& quality,
+                               const std::optional<std::string>& language,
+                               const std::string& text,
+                               const std::string& reference_block) {
+    const std::string im_start    = id_to_token(backbone, d.tok_im_start);
+    const std::string im_end      = id_to_token(backbone, d.tok_im_end);
+    const std::string audio_start = id_to_token(backbone, d.tok_audio_start);
+
+    std::string body = build_user_inst(instruction, tokens, quality, language,
+                                        text, reference_block);
+    std::string out;
+    out += im_start + "user\n" + body + im_end + "\n"
+         + im_start + "assistant\n" + audio_start;
+    return out;
+}
+
+// Apply the delay-pattern shift to a (n_vq, T_ref) row-major code matrix.
+//   Output: (T_ref + n_vq - 1, n_vq) row-major, where row r col i =
+//     codes[i, r - i]   if 0 <= r - i < T_ref
+//     pad_code          otherwise
+// — equivalent to MossTTSDelayProcessor.apply_delay_pattern.
+std::vector<int32_t> apply_delay_pattern(const int32_t* codes,
+                                          int32_t n_vq, int32_t T_ref,
+                                          int32_t pad_code) {
+    const int64_t T = int64_t(T_ref) + int64_t(n_vq) - 1;
+    std::vector<int32_t> out(size_t(T) * size_t(n_vq), pad_code);
+    for (int32_t i = 0; i < n_vq; ++i) {
+        for (int32_t t = 0; t < T_ref; ++t) {
+            out[size_t(i + t) * size_t(n_vq) + size_t(i)] = codes[i * T_ref + t];
         }
-        result.push_back(std::move(frame));
     }
-    fclose(fp);
-    return result;
+    return out;
+}
+
+// Build the (S, 1+n_vq) prompt grid: text ids in column 0, audio_pad_code
+// elsewhere — except for the reference-audio rows where we splice in the
+// delay-pattern-shifted codes from the encoded reference.
+std::vector<int32_t> build_prompt_grid(qwen3::Runner* backbone,
+                                        const MossConfig& d,
+                                        const std::optional<std::string>& instruction,
+                                        const std::optional<int>&        tokens,
+                                        const std::optional<std::string>& quality,
+                                        const std::optional<std::string>& language,
+                                        const std::string& text,
+                                        const std::string& reference_block,
+                                        const std::vector<int32_t>* ref_codes,
+                                        int32_t T_ref,
+                                        int32_t& n_pos_out) {
+    const std::string prompt = build_prompt_text(backbone, d,
+                                                  instruction, tokens, quality,
+                                                  language, text, reference_block);
+    std::vector<int32_t> ids;
+    std::string tok_err;
+    if (!backbone->tokenize(prompt, /*add_special=*/false,
+                             /*parse_special=*/true, &ids, nullptr, &tok_err)
+        || ids.empty()) {
+        throw std::runtime_error("build_prompt_grid: tokenize failed: " + tok_err);
+    }
+    n_pos_out = int32_t(ids.size());
+    const int32_t cols = 1 + d.n_vq;
+
+    std::vector<int32_t> grid(size_t(n_pos_out) * size_t(cols), d.audio_pad_code);
+    for (int32_t r = 0; r < n_pos_out; ++r) {
+        grid[size_t(r) * size_t(cols) + 0] = ids[size_t(r)];
+    }
+
+    if (!ref_codes || T_ref <= 0) return grid;
+
+    // Locate the (single) audio_start / audio_end pair that bounds the user
+    // reference. The trailing audio_start the assistant turn ends with does
+    // NOT have a matching audio_end and is therefore skipped naturally.
+    int32_t a_start = -1, a_end = -1;
+    for (int32_t r = 0; r < n_pos_out; ++r) {
+        if (a_start < 0 && ids[size_t(r)] == d.tok_audio_start) {
+            a_start = r;
+        } else if (a_start >= 0 && ids[size_t(r)] == d.tok_audio_end) {
+            a_end = r;
+            break;
+        }
+    }
+    if (a_start < 0 || a_end < 0) {
+        throw std::runtime_error("build_prompt_grid: reference audio markers not found in tokenized prompt");
+    }
+
+    const int32_t span = a_end - a_start - 1;        // tokens strictly between markers
+    const int32_t expected = T_ref + d.n_vq - 1;
+    if (span != expected) {
+        throw std::runtime_error("build_prompt_grid: reference audio span mismatch (got " +
+                                  std::to_string(span) + ", expected " + std::to_string(expected) + ")");
+    }
+
+    const auto delayed = apply_delay_pattern(ref_codes->data(), d.n_vq, T_ref, d.audio_pad_code);
+    for (int32_t k = 0; k < span; ++k) {
+        const int32_t r = a_start + 1 + k;
+        for (int32_t i = 0; i < d.n_vq; ++i) {
+            grid[size_t(r) * size_t(cols) + 1 + i] =
+                delayed[size_t(k) * size_t(d.n_vq) + size_t(i)];
+        }
+    }
+    return grid;
 }
 
 }  // anonymous namespace
@@ -155,7 +296,17 @@ bool MossSession::embed_one_step(const int32_t* tokens,
 }
 
 // ---------------------------------------------------------------------------
-// run_tts
+// run_tts — upstream-honest MOSS-TTS pipeline.
+//
+// Accepts exactly two modes:
+//   • mode="tts"         — plain text-to-speech using the flagship backbone.
+//   • mode="voice_clone" — read req->reference_audio WAV, run the real codec
+//                          encoder, splice the delay-pattern-shifted codes
+//                          into the user-side audio block.
+//
+// Any other mode (sfx / dialogue / voice_design / realtime) is a request for
+// a model we do not ship. We fail fast with an error that names the missing
+// checkpoint — see Testing/GAP_TRACKER.md §1.2 for the full list.
 // ---------------------------------------------------------------------------
 bool MossSession::run_tts(const void* request, void* response,
                           std::string* error) {
@@ -176,170 +327,155 @@ bool MossSession::run_tts(const void* request, void* response,
         return false;
     }
 
+    // ── Mode dispatch — no fraud system-prompt impersonation ────────────────
+    const bool is_clone = (req->mode == "voice_clone");
+    const bool is_stream = (req->mode == "streaming");
+
+    if (req->mode != "tts" && !is_clone && !is_stream) {
+        if (error) *error =
+            std::string("moss_tts: mode '") + req->mode + "' is not supported. "
+            "This build only ships the flagship MOSS-TTS backbone, which "
+            "implements tts / voice_clone / streaming. The requested mode "
+            "needs a dedicated checkpoint that is not loaded — see "
+            "Testing/GAP_TRACKER.md §1.2 for the mapping (sfx→MOSS-SoundEffect, "
+            "dialogue→MOSS-TTSD, voice_design→MOSS-VoiceGenerator, "
+            "realtime→MOSS-TTS-Realtime).";
+        return false;
+    }
+
+    // Streaming mode requires the user to wire req->stream->on_audio.
+    if (is_stream && (!req->stream || !req->stream->on_audio)) {
+        if (error) *error =
+            "moss_tts streaming requires a non-null stream callback "
+            "(set stream.on_audio) for incremental codec decode.";
+        return false;
+    }
+
+    // Voice-clone mode requires a reference WAV and the codec encoder.
+    if (is_clone) {
+        if (req->reference_audio.empty() && !req->voice_path.empty()) {
+            // Back-compat: older API used voice_path for the same purpose.
+        } else if (req->reference_audio.empty()) {
+            if (error) *error =
+                "voice_clone mode requires reference_audio (path to a WAV file, "
+                "any sample rate; the loader resamples to the codec rate).";
+            return false;
+        }
+        if (!codec_graphs_.is_present() || !codec_graphs_.encoder_present()) {
+            if (error) *error =
+                "voice_clone mode requires the codec encoder "
+                "(moss.codec.enc.* tensors). This GGUF does not carry them.";
+            return false;
+        }
+    }
+
     const int32_t hs = backbone_->hidden_size();
     const int32_t text_vocab = backbone_->vocab_size();
     const int32_t audio_vocab = cfg_.audio_vocab_size + 1;  // +1 for pad code
 
-    // Validate mode
-    const bool is_sfx          = (req->mode == "sfx");
-    const bool is_clone        = (req->mode == "voice_clone");
-    const bool is_dialogue     = (req->mode == "dialogue");
-    const bool is_voice_design = (req->mode == "voice_design");
-    const bool is_realtime     = (req->mode == "realtime" ||
-                                  req->mode == "streaming");
+    // ── 0. Encode reference audio via the real codec encoder ───────────────
+    std::vector<int32_t> ref_codes;        // (n_vq, T_ref) row-major
+    int32_t T_ref = 0;
+    std::string reference_block;
 
-    // ── Realtime / streaming modes ───────────────────────────────────────────
-    // Per-frame streaming: when req->stream is provided (with on_audio
-    // callback), the AR loop decodes codec frames incrementally and emits
-    // PCM through the callback as they become available. The response PCM
-    // is empty in streaming mode — all audio goes through the callback.
-    // When req->stream is null, the fail-fast is preserved so callers know
-    // to enable streaming in their request.
-    if (is_realtime && (!req->stream || !req->stream->on_audio)) {
-        if (error) *error =
-            "moss_tts realtime / streaming requires a non-null stream "
-            "callback (set stream.on_audio) for incremental codec decode. "
-            "See GAPS.md §1.2.";
-        return false;
-    }
-
-    // ── Voice Design (a.k.a. VoiceGenerator) mode ────────────────────────────
-    // The dedicated VoiceGenerator model (1.7B) isn't loaded here. As a
-    // best-effort fallback we route the voice description through the
-    // flagship backbone's instruct slot with a voice-design system prompt.
-    // Output is intelligible TTS with the requested voice characteristics
-    // when the flagship can produce them; for parity with the upstream
-    // VoiceGenerator you'd point this same request at a VoiceGenerator
-    // GGUF instead.
-    if (is_voice_design && req->instruct.empty()) {
-        if (error) *error =
-            "moss_tts voice_design mode requires a voice description in "
-            "the 'instruct' field (e.g. 'a calm, deep female voice')";
-        return false;
-    }
-
-    // ── System prompt by mode ────────────────────────────────────────────────
-    std::string system_prompt;
-    if (is_sfx) {
-        system_prompt = "You are a sound effects generator.";
-    } else if (is_dialogue) {
-        // Default dialogue system prompt. Used when no messages array (single
-        // `text` becomes the opening turn) OR when messages are provided but
-        // the first message is not a system prompt (the multi-turn branch at
-        // line 245 prepends this as the system message in that case).
-        system_prompt =
-            "You are a spoken-dialogue assistant. Continue the conversation "
-            "the user begins, alternating between speakers with natural "
-            "conversational pacing.";
-    } else if (is_voice_design) {
-        system_prompt =
-            "You are a voice cloning assistant. Speak the user's text in "
-            "a voice matching this description: " + req->instruct + ".";
-    } else {
-        system_prompt = "You are a helpful voice assistant.";
-    }
-
-    // ======================================================================
-    // (1) Tokenize text prompt
-    // ======================================================================
-    std::string templated;
-
-    if (!req->messages.empty()) {
-        // Multi-turn: use the messages array directly. The first message may
-        // be a system prompt; if not, prepend the mode's default system prompt.
-        std::vector<std::pair<std::string, std::string>> msgs;
-        if (req->messages[0].role != "system") {
-            msgs.emplace_back("system", system_prompt);
-        }
-        for (const auto& m : req->messages) {
-            msgs.emplace_back(m.role, m.content);
-        }
-        if (!backbone_->apply_chat_template(msgs, /*add_assistant_prompt=*/true,
-                                             &templated, error))
-            return false;
-    } else {
-        if (req->text.empty()) {
-            if (error) *error = "empty text";
-            return false;
-        }
-        std::vector<std::pair<std::string, std::string>> msgs;
-        msgs.emplace_back("system", system_prompt);
-        msgs.emplace_back("user", req->text);
-        if (!backbone_->apply_chat_template(msgs, /*add_assistant_prompt=*/true,
-                                             &templated, error))
-            return false;
-    }
-
-    // Append <|audio_start|> (signals the model to begin audio)
-    std::string audio_start_str;
-    if (!backbone_->token_to_piece(AUDIO_START_TOKEN_ID, &audio_start_str, error))
-        return false;
-    templated += audio_start_str;
-
-    std::vector<int32_t> text_tokens;
-    if (!backbone_->tokenize(templated, /*add_special=*/false,
-                             /*parse_special=*/true, &text_tokens,
-                             nullptr, error)) {
-        return false;
-    }
-    if (text_tokens.empty()) {
-        if (error) *error = "tokenize returned zero tokens";
-        return false;
-    }
-    const int32_t n_text = static_cast<int32_t>(text_tokens.size());
-
-    // ======================================================================
-    // (1b) Voice cloning: load reference audio codec tokens
-    // ======================================================================
-    std::vector<std::vector<int32_t>> ref_audio;
     if (is_clone) {
-        if (req->voice_path.empty()) {
-            if (error) *error = "voice_clone mode requires voice_path";
+        const std::string& ref_path = !req->reference_audio.empty()
+            ? req->reference_audio : req->voice_path;
+        std::vector<float> ref_wav;
+        try {
+            ref_wav = io::read_wav_mono(ref_path, cfg_.sampling_rate);
+        } catch (const std::exception& e) {
+            if (error) *error = std::string("voice_clone: ") + e.what();
             return false;
         }
-        ref_audio = load_codec_tokens(req->voice_path, cfg_.n_vq, error);
-        if (ref_audio.empty()) {
-            // error already set by load_codec_tokens
-            if (error && error->empty())
-                *error = "voice_clone: failed to load " + req->voice_path;
+        if (ref_wav.empty()) {
+            if (error) *error = "voice_clone: reference WAV is empty";
             return false;
+        }
+        try {
+            ref_codes = codec_graphs_.encode(ref_wav.data(),
+                                              static_cast<int64_t>(ref_wav.size()),
+                                              T_ref);
+        } catch (const std::exception& e) {
+            if (error) *error = std::string("voice_clone: codec encode failed: ") + e.what();
+            return false;
+        }
+        if (T_ref <= 0 || ref_codes.size() != size_t(cfg_.n_vq) * size_t(T_ref)) {
+            if (error) *error =
+                "voice_clone: codec encode returned unexpected shape (T_ref=" +
+                std::to_string(T_ref) + ", n_vq=" + std::to_string(cfg_.n_vq) + ")";
+            return false;
+        }
+        std::fprintf(stderr, "[moss_tts] encoded reference: %d frames (%.2fs)\n",
+                     T_ref, T_ref * 1920.0 / double(cfg_.sampling_rate));
+        reference_block = build_reference_audio_block(backbone_.get(), cfg_, T_ref);
+    }
+
+    // ── 1. Build the upstream prompt grid ───────────────────────────────────
+    // The upstream MOSS template uses single-turn user/assistant tags; it is
+    // NOT the chat template. We ignore req->messages for prompt construction
+    // (the flagship Delay backbone is single-turn), but allow callers to pass
+    // multi-turn text via req->text. Multi-turn dialogue requires MOSS-TTSD.
+    const std::string text_to_speak = req->text.empty() && !req->messages.empty()
+        ? req->messages.back().content : req->text;
+    if (text_to_speak.empty()) {
+        if (error) *error = "empty text";
+        return false;
+    }
+
+    // Map the unified TtsRequest fields onto the upstream optional slots.
+    //   req->instruct → Instruction slot
+    //   req->language → Language slot (empty → "None"; upstream default)
+    //   req->quality  → Quality slot — not exposed yet, defaults to None
+    //   req->tokens   → Tokens slot — not exposed yet, defaults to None
+    // The Quality / Tokens fields are family-specific knobs that would belong
+    // on TtsRequest if we extend it; for now they use upstream defaults.
+    std::optional<std::string> opt_instruction;
+    if (!req->instruct.empty()) opt_instruction = req->instruct;
+    std::optional<std::string> opt_language;
+    if (!req->language.empty()) opt_language = req->language;
+
+    int32_t n_text = 0;
+    std::vector<int32_t> grid;
+    try {
+        grid = build_prompt_grid(backbone_.get(), cfg_,
+                                  opt_instruction,
+                                  /*tokens=*/std::nullopt,
+                                  /*quality=*/std::nullopt,
+                                  opt_language,
+                                  text_to_speak,
+                                  reference_block,
+                                  T_ref > 0 ? &ref_codes : nullptr,
+                                  T_ref,
+                                  n_text);
+    } catch (const std::exception& e) {
+        if (error) *error = std::string("moss_tts: ") + e.what();
+        return false;
+    }
+    if (n_text <= 0) {
+        if (error) *error = "moss_tts: prompt grid is empty";
+        return false;
+    }
+
+    // Re-pack grid into the (S, 1+N_VQ) vector-of-vectors that init_delay_state
+    // expects.
+    const int32_t total_S = n_text;
+    std::vector<std::vector<int32_t>> all_ids(static_cast<size_t>(total_S),
+        std::vector<int32_t>(1 + N_VQ, AUDIO_PAD_CODE));
+    const int32_t cols = 1 + cfg_.n_vq;
+    for (int32_t r = 0; r < total_S; ++r) {
+        for (int32_t c = 0; c < cols; ++c) {
+            all_ids[size_t(r)][size_t(c)] =
+                grid[size_t(r) * size_t(cols) + size_t(c)];
         }
     }
 
-    // ======================================================================
-    // (2) Build multi-channel prompt: all token positions
-    //     Each row = [text_token, code_0, code_1, ..., code_31]
-    //     Text-only rows have AUDIO_PAD_CODE in audio channels.
-    //     Audio-reference rows have GEN_SLOT as text + codec tokens in audio.
-    // ======================================================================
-    const int32_t n_audio_ref = is_clone ? static_cast<int32_t>(ref_audio.size()) : 0;
-    const int32_t total_S = n_text + n_audio_ref;
-
-    std::vector<std::vector<int32_t>> all_ids(
-        static_cast<size_t>(total_S), std::vector<int32_t>(1 + N_VQ, AUDIO_PAD_CODE));
-
-    // Fill text token row-channel 0
-    for (int32_t i = 0; i < n_text; i++)
-        all_ids[static_cast<size_t>(i)][0] = text_tokens[i];
-
-    // Fill reference audio rows (after text)
-    for (int32_t i = 0; i < n_audio_ref; i++) {
-        const size_t row = static_cast<size_t>(n_text + i);
-        all_ids[row][0] = AUDIO_ASSISTANT_GEN_SLOT_TOKEN_ID;
-        for (int s = 0; s < N_VQ; s++)
-            all_ids[row][1 + s] = ref_audio[i][static_cast<size_t>(s)];
-    }
-
-    // ======================================================================
-    // (3) Build prompt embeddings
-    // ======================================================================
+    // ── 2. Build prompt embeddings ──────────────────────────────────────────
     std::vector<float> prompt_embeds(static_cast<size_t>(total_S) * hs, 0.0f);
-
     for (int32_t i = 0; i < total_S; i++) {
         float* row = prompt_embeds.data() + static_cast<size_t>(i) * hs;
-        const int32_t text_tok = all_ids[static_cast<size_t>(i)][0];
+        const int32_t text_tok = all_ids[size_t(i)][0];
 
-        // Gather text token embedding
         if (text_tok >= 0 && token_embd_) {
             const size_t row_bytes = static_cast<size_t>(hs) *
                 (token_embd_->type == GGML_TYPE_F32 ? sizeof(float)
@@ -357,10 +493,13 @@ bool MossSession::run_tts(const void* request, void* response,
             }
         }
 
-        // Sum audio embeddings for each stream (only if this is a ref audio frame)
-        for (int s = 0; s < cfg_.n_vq && i >= n_text; ++s) {
-            int32_t code = all_ids[static_cast<size_t>(i)][1 + s];
-            if (code < 0) continue;
+        // Sum audio embeddings for each stream (reference-audio rows only).
+        // The text rows have AUDIO_PAD_CODE in channels 1..N_VQ.
+        const bool is_ref_row = (text_tok == cfg_.tok_user_slot);
+        if (!is_ref_row) continue;
+        for (int s = 0; s < cfg_.n_vq; ++s) {
+            int32_t code = all_ids[size_t(i)][1 + s];
+            if (code < 0 || code == cfg_.audio_pad_code) continue;
             ggml_tensor* W = audio_embed_[s];
             if (!W) continue;
             if (W->ne[0] != hs) continue;
@@ -380,74 +519,26 @@ bool MossSession::run_tts(const void* request, void* response,
         }
     }
 
-    // ======================================================================
-    // (4) Prefill through backbone
-    // ======================================================================
+    // ── 3. Prefill through backbone ─────────────────────────────────────────
     std::vector<float> hidden_buf(static_cast<size_t>(total_S) * hs);
     if (!backbone_->forward_embeddings(prompt_embeds.data(), total_S, 0,
                                         hidden_buf.data(), error)) {
         return false;
     }
 
-    // ======================================================================
-    // (5) Delay state from full multi-channel prompt
-    // ======================================================================
+    // ── 4. Delay state from full multi-channel prompt ──────────────────────
     DelayState state = init_delay_state(all_ids);
 
-    // ── Sampling parameters by mode ──────────────────────────────────────────
     SamplingConfig samp_cfg;
-    if (is_sfx) {
-        // Sound effects: lower temps, higher top-k
-        samp_cfg.text_temperature = 1.2f;
-        samp_cfg.text_top_p       = 1.0f;
-        samp_cfg.text_top_k       = 30;
-        samp_cfg.audio_temperature = req->temperature > 0.0f
-            ? req->temperature : 1.2f;
-        samp_cfg.audio_top_p       = req->top_p > 0.0f
-            ? req->top_p : 0.9f;
-        samp_cfg.audio_top_k       = 20;
-        samp_cfg.audio_repetition_penalty = 1.0f;
-    } else if (is_dialogue) {
-        // Dialogue (TTSD): higher text temperature for varied responses,
-        // tighter audio nucleus to keep voices distinct.
-        samp_cfg.text_temperature = 1.6f;
-        samp_cfg.text_top_p       = 0.95f;
-        samp_cfg.text_top_k       = 50;
-        samp_cfg.audio_temperature = req->temperature > 0.0f
-            ? req->temperature : 1.6f;
-        samp_cfg.audio_top_p       = req->top_p > 0.0f
-            ? req->top_p : 0.85f;
-        samp_cfg.audio_top_k       = 25;
-        samp_cfg.audio_repetition_penalty = 1.05f;  // dampen echo across turns
-    } else if (is_voice_design) {
-        // Voice Design: stay close to the standard TTS defaults so the
-        // backbone spends its degrees of freedom on the voice, not on
-        // sampling exploration.
-        samp_cfg.text_temperature = 1.4f;
-        samp_cfg.text_top_p       = 1.0f;
-        samp_cfg.text_top_k       = 50;
-        samp_cfg.audio_temperature = req->temperature > 0.0f
-            ? req->temperature : 1.5f;
-        samp_cfg.audio_top_p       = req->top_p > 0.0f
-            ? req->top_p : 0.85f;
-        samp_cfg.audio_top_k       = 30;
-        samp_cfg.audio_repetition_penalty = 1.0f;
-    } else {
-        // TTS defaults
-        samp_cfg.text_temperature = 1.5f;
-        samp_cfg.text_top_p       = 1.0f;
-        samp_cfg.text_top_k       = 50;
-        samp_cfg.audio_temperature = req->temperature > 0.0f
-            ? req->temperature : 1.7f;
-        samp_cfg.audio_top_p       = req->top_p > 0.0f
-            ? req->top_p : 0.8f;
-        samp_cfg.audio_top_k       = 25;
-        samp_cfg.audio_repetition_penalty = 1.0f;
-    }
+    samp_cfg.text_temperature  = 1.5f;
+    samp_cfg.text_top_p        = 1.0f;
+    samp_cfg.text_top_k        = 50;
+    samp_cfg.audio_temperature = req->temperature > 0.0f ? req->temperature : 1.7f;
+    samp_cfg.audio_top_p       = req->top_p > 0.0f ? req->top_p : 0.8f;
+    samp_cfg.audio_top_k       = 25;
+    samp_cfg.audio_repetition_penalty = 1.0f;
 
-    // ======================================================================
-    // (5) Autoregressive generation loop
-    // ======================================================================
+    // ── 5. Autoregressive generation loop ──────────────────────────────────
     const int32_t max_steps = req->max_new_tokens > 0
         ? req->max_new_tokens
         : cfg_.n_vq * 60 * 30;  // default: 60 fps * 30 s
@@ -459,12 +550,7 @@ bool MossSession::run_tts(const void* request, void* response,
 
     int32_t pos = total_S;
     bool generated = false;
-    bool streaming = is_realtime && req->stream && req->stream->on_audio;
-
-    // Per-frame streaming: track how many de-delayed frames have been
-    // decoded and emitted via the streaming callback.  Incremental decode
-    // starts after at least N_VQ delay-buffer frames are accumulated
-    // (the first de-delayed frame requires N_VQ delay steps).
+    const bool streaming = is_stream && req->stream && req->stream->on_audio;
     int32_t decoded_frames = 0;
 
     for (int32_t step = 0; step < max_steps; ++step) {
@@ -513,14 +599,13 @@ bool MossSession::run_tts(const void* request, void* response,
 
         if (state.is_stopping) break;
 
-        // ── Per-frame streaming: decode newly available frames ─────────────
+        // ── Per-frame streaming: decode newly available frames ────────────
         if (streaming && codec_graphs_.is_present()) {
             const int32_t n_delayed = static_cast<int32_t>(state.audio_buf.size());
             if (n_delayed >= N_VQ) {
                 auto dedelayed = apply_de_delay_pattern(state.audio_buf);
                 const int32_t n_available = static_cast<int32_t>(dedelayed.size());
                 if (n_available > decoded_frames) {
-                    // Clamp out-of-range codes
                     for (int32_t i = decoded_frames; i < n_available; i++) {
                         for (int32_t s = 0; s < N_VQ; s++) {
                             if (dedelayed[size_t(i)][size_t(s)] >= cfg_.audio_vocab_size)
@@ -560,13 +645,10 @@ bool MossSession::run_tts(const void* request, void* response,
         return false;
     }
 
-    // ======================================================================
-    // (6) Extract audio from generation output
-    // ======================================================================
+    // ── 6. Extract audio from generation output ────────────────────────────
     auto audio_channels = state.audio_buf;
     auto segments = extract_audio_segments(audio_channels);
 
-    // ── Streaming: flush any remaining frames ─────────────────────────────
     if (streaming && codec_graphs_.is_present() && !segments.empty()) {
         const int32_t n_remaining = static_cast<int32_t>(segments.size()) - decoded_frames;
         if (n_remaining > 0) {
@@ -597,7 +679,6 @@ bool MossSession::run_tts(const void* request, void* response,
                 std::fprintf(stderr, "moss_tts: streaming final codec decode failed (%s)\n", e.what());
             }
         }
-        // Streaming: response PCM is empty (all audio went through callback)
         res->pcm_mono.clear();
         res->sampling_rate = cfg_.sampling_rate;
         return true;
@@ -614,62 +695,56 @@ bool MossSession::run_tts(const void* request, void* response,
         }
     }
 
-    // ======================================================================
-    // (7) Decode codec -> PCM.
-    //
-    // Stage 16: if MossCodecGraphs is bound (the GGUF carries the
-    // moss.codec.* tensors), route the de-delayed codec tokens through the
-    // ggml port of openmoss/src/codec.cpp. Otherwise fall back to 1 s of
-    // silence — the documented behavior for community backbone-only GGUFs
-    // (see GAPS.md §1.3 and docs/CODEC_PORTS.md §1).
-    // ======================================================================
-    if (codec_graphs_.is_present()) {
-        const int32_t T_audio = static_cast<int32_t>(segments.size());
-        if (T_audio > 0) {
-            std::vector<int32_t> flat(
-                static_cast<size_t>(cfg_.n_vq) * static_cast<size_t>(T_audio));
-            for (int32_t t = 0; t < T_audio; ++t) {
-                const auto& frame = segments[size_t(t)];
-                for (int32_t v = 0; v < cfg_.n_vq; ++v) {
-                    flat[size_t(v) * size_t(T_audio) + size_t(t)] = frame[size_t(v)];
-                }
-            }
-            try {
-                res->pcm_mono = codec_graphs_.decode(flat.data(), cfg_.n_vq, T_audio);
-                res->sampling_rate = cfg_.sampling_rate;
-                // Non-streaming post-hoc: emit audio in 64 KiB chunks via callback
-                if (req->stream && req->stream->on_audio) {
-                    constexpr size_t kChunk = 32768;
-                    const float* pcm = res->pcm_mono.data();
-                    size_t total = res->pcm_mono.size();
-                    for (size_t off = 0; off < total; off += kChunk) {
-                        size_t n = std::min(kChunk, total - off);
-                        if (!req->stream->on_audio(pcm + off, n)) {
-                            if (error) *error = "moss_tts: streaming aborted by client";
-                            return false;
-                        }
-                    }
-                }
-                (void)loudness_normalize;
-                return true;
-            } catch (const std::exception& e) {
-                if (error) *error = std::string("moss_tts codec decode failed: ") + e.what();
+    // ── 7. Decode codec → PCM ──────────────────────────────────────────────
+    // Missing codec tensors is now a hard error. The flagship TTS backbone
+    // requires the codec decoder to produce audio; a community GGUF without
+    // moss.codec.* tensors cannot serve audio and should fail fast so callers
+    // know to convert the codec alongside the backbone.
+    if (!codec_graphs_.is_present()) {
+        if (error) *error =
+            "moss_tts: codec tensors are not bound (no moss.codec.* tensors "
+            "in the GGUF). The MOSS-TTS flagship backbone requires the codec "
+            "decoder to produce PCM. Re-convert the GGUF with the codec "
+            "tensors included.";
+        return false;
+    }
+
+    const int32_t T_audio = static_cast<int32_t>(segments.size());
+    if (T_audio <= 0) {
+        if (error) *error = "no audio frames to decode";
+        return false;
+    }
+
+    std::vector<int32_t> flat(
+        static_cast<size_t>(cfg_.n_vq) * static_cast<size_t>(T_audio));
+    for (int32_t t = 0; t < T_audio; ++t) {
+        const auto& frame = segments[size_t(t)];
+        for (int32_t v = 0; v < cfg_.n_vq; ++v) {
+            flat[size_t(v) * size_t(T_audio) + size_t(t)] = frame[size_t(v)];
+        }
+    }
+    try {
+        res->pcm_mono = codec_graphs_.decode(flat.data(), cfg_.n_vq, T_audio);
+    } catch (const std::exception& e) {
+        if (error) *error = std::string("moss_tts codec decode failed: ") + e.what();
+        return false;
+    }
+    res->sampling_rate = cfg_.sampling_rate;
+
+    // Non-streaming post-hoc: emit audio in chunks via the callback if one
+    // was supplied alongside mode="tts" / "voice_clone".
+    if (req->stream && req->stream->on_audio && !res->pcm_mono.empty()) {
+        constexpr size_t kChunk = 32768;
+        const float* pcm = res->pcm_mono.data();
+        size_t total = res->pcm_mono.size();
+        for (size_t off = 0; off < total; off += kChunk) {
+            size_t n = std::min(kChunk, total - off);
+            if (!req->stream->on_audio(pcm + off, n)) {
+                if (error) *error = "moss_tts: streaming aborted by client";
                 return false;
             }
         }
-        // Empty segment list — emit empty PCM, not silence.
-        res->pcm_mono.clear();
-        res->sampling_rate = cfg_.sampling_rate;
-        return true;
     }
-
-    // Silence fallback — codec tensors not present in this GGUF.
-    std::fprintf(stderr, "moss_tts: codec tensors not bound "
-                         "(no moss.codec.* in GGUF); emitting 1s silence\n");
-    (void)loudness_normalize;
-    (void)segments;
-    res->pcm_mono.assign(static_cast<size_t>(cfg_.sampling_rate), 0.0f);
-    res->sampling_rate = cfg_.sampling_rate;
     return true;
 }
 
@@ -697,10 +772,11 @@ bool MossSession::decode_codec(const int32_t* codec_tokens, int32_t n_tokens,
         }
     }
 
-    // Silence fallback — codec tensors not present in this GGUF.
-    (void)error;
-    pcm_out->assign(static_cast<size_t>(cfg_.sampling_rate), 0.0f);
-    return true;
+    // No silence fallback — surface the misconfiguration as an error so the
+    // caller knows to reconvert the GGUF with codec tensors included.
+    if (error) *error =
+        "moss_tts: codec tensors are not bound; cannot decode audio";
+    return false;
 }
 
 // ---------------------------------------------------------------------------

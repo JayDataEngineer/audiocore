@@ -1,4 +1,4 @@
-// codec.h — MOSS-Audio-Tokenizer decoder, ggml port.
+// codec.h — MOSS-Audio-Tokenizer encoder + decoder, ggml port.
 //
 // Adapted from pwilkin/openmoss (Apache-2.0) src/codec.cpp into audiocore's
 // Backend / TensorStorage / WeightLoader abstractions. Architecture overview
@@ -8,10 +8,12 @@
 // length T_audio * 1920. The four-stage ProjectedTransformer front-end
 // runs entirely in ggml on the same backend as the Qwen3 backbone.
 //
-// Encode is intentionally NOT ported: audiocore only consumes codes the
-// MOSS-TTS backbone already produced, and the VoiceClone path loads
-// pre-encoded .codes files. openmoss's encode() lives in codec.cpp for
-// future reference if we ever need it.
+// Encoder path (mirror): 24 kHz mono PCM → (32, T_audio) code matrix.
+// The encoder runs the same 4-stage ProjectedTransformer in reverse
+// (patch=240 downsample BEFORE the first stage, then patch=2 between
+// stages), then a 32-step residual LFQ quantizer. Used for voice cloning:
+// a reference WAV is encoded and spliced into the user-side audio block
+// of the chat prompt.
 
 #ifndef AUDIOCORE_MODELS_MOSS_TTS_CODEC_H
 #define AUDIOCORE_MODELS_MOSS_TTS_CODEC_H
@@ -72,6 +74,24 @@ public:
                               int32_t n_vq,
                               int32_t T_audio);
 
+    // Encode mono PCM float32 @ 24 kHz → (n_vq=32, T_audio) row-major codes.
+    //   waveform:  PCM samples, length n_samples (any positive length; padded
+    //              up to a multiple of hop=1920 internally).
+    //   returns:   (32 * T_audio) row-major int32, where T_audio_out is
+    //              ceil(n_samples / 1920). T_audio_out is also written to the
+    //              reference parameter.
+    //
+    // Throws std::runtime_error on shape / graph-compute failures, or if
+    // encoder weights were not bound (no moss.codec.enc.* tensors present
+    // in the GGUF).
+    std::vector<int32_t> encode(const float* waveform,
+                                int64_t n_samples,
+                                int32_t& T_audio_out);
+
+    // True if bind() resolved encoder tensors. decode() works without this;
+    // encode() requires it. Set by bind() after resolve_encoder_() succeeds.
+    bool encoder_present() const { return encoder_present_; }
+
     // Stage architecture spec — public so the constexpr DECODER_STAGES table
     // in codec.cpp can name the type. The matching `DECODER_STAGES` array is
     // file-scope in codec.cpp.
@@ -88,10 +108,12 @@ public:
 
 private:
     // ── Constants (matching openmoss/src/codec.cpp) ─────────────────────
-    static constexpr int CODEC_NUM_VQ  = 32;
-    static constexpr int CODEC_CB_DIM  = 8;
-    static constexpr int CODEC_RVQ_DIM = 512;
-    static constexpr int CODEC_OUT_DIM = 768;
+    static constexpr int CODEC_NUM_VQ    = 32;
+    static constexpr int CODEC_CB_DIM    = 8;
+    static constexpr int CODEC_RVQ_DIM   = 512;
+    static constexpr int CODEC_OUT_DIM   = 768;
+    static constexpr int CODEC_CB_SIZE   = 1024;
+    static constexpr int CODEC_PRE_PATCH = 240;   // encoder initial patch downsample
 
     struct Layer {
         ggml_tensor* norm1_w       = nullptr;
@@ -113,7 +135,8 @@ private:
     };
 
     // ── State ───────────────────────────────────────────────────────────
-    bool                 present_   = false;
+    bool                 present_         = false;
+    bool                 encoder_present_ = false;
     ggml_context*        source_ctx_ = nullptr;  // not owned
     ggml_backend_t       backend_   = nullptr;   // not owned
     ggml_gallocr_t       galloc_    = nullptr;   // owned
@@ -139,12 +162,48 @@ private:
     ggml_tensor*                quant_oproj_b_ = nullptr;
     std::array<Stage, 4>        stages_        {};
 
+    // ── Encoder-only effective weights ───────────────────────────────────
+    // Per-quantizer iproj: 512 → 8 (Conv1d kernel=1, weight-normed).
+    // Global quantizer iproj: 768 → 512.
+    // Normalized codebooks: (8, 1024) L2-normalized rows for cosine-sim argmax.
+    std::array<ggml_tensor*, 32> q_iproj_w_        {};
+    std::array<ggml_tensor*, 32> q_iproj_b_        {};
+    ggml_tensor*                quant_iproj_w_     = nullptr;
+    ggml_tensor*                quant_iproj_b_     = nullptr;
+    std::array<ggml_tensor*, 32> codebook_normed_  {};
+    std::array<Stage, 4>        enc_stages_        {};
+
     // ── Helpers ─────────────────────────────────────────────────────────
     ggml_tensor* tensor_(const std::string& name) const;
     ggml_tensor* tensor_or_null_(const std::string& name) const;
 
     void resolve_decoder_();
+    void resolve_encoder_();
     void compute_effective_weights_();
+    void compute_encoder_effective_weights_();
+    void compute_normalized_codebooks_();
+
+    // Helpers shared by compute_effective_weights_ and the encoder variant:
+    //   read_f16_host_  — pull f16 bytes from a host mmap or device tensor
+    //   reconstruct_wn_ — build effective Conv1d weight from wp0/wp1/bias
+    void read_f16_host_(ggml_tensor* t, std::vector<uint16_t>& out) const;
+    void reconstruct_wn_(const std::string& wp0_name,
+                          const std::string& wp1_name,
+                          const std::string& bias_name,
+                          ggml_tensor* dst_w,
+                          ggml_tensor* dst_b,
+                          int in_dim,
+                          int out_dim);
+
+    // Allocate device-side copies of every tensor in tensor_srcs_, upload
+    // their bytes, and repoint each TensorSrc::field_ptr at the device copy.
+    // Called once after resolve_decoder_ + resolve_encoder_ have populated
+    // tensor_srcs_ (so a single alloc_ctx_tensors handles all weights).
+    void device_copy_src_tensors_(const std::string& tag);
+
+    // Allocate one effective-weight tensor (f16) in w_ctx_. No data yet.
+    ggml_tensor* make_eff_w_(const std::string& name, int in_dim, int out_dim);
+    ggml_tensor* make_eff_b_(const std::string& name, int out_dim);
 
     // Graph builders — adapted verbatim from openmoss.
     ggml_tensor* build_layer_norm_(ggml_context* gctx, ggml_tensor* x,
@@ -165,6 +224,8 @@ private:
     static void         fill_causal_mask_(ggml_tensor* mask);
     static ggml_tensor* patch_upsample_(ggml_context* gctx,
                                          ggml_tensor* x, int patch);
+    static ggml_tensor* patch_downsample_(ggml_context* gctx,
+                                          ggml_tensor* x, int patch);
 };
 
 }  // namespace audiocore::moss

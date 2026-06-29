@@ -36,15 +36,70 @@ namespace {
 // Find a file in `dir` whose name contains `pattern`. Returns empty path if
 // none match. Used to locate the 4 component GGUFs without hard-coding the
 // exact filenames (turbo vs sft, 1.7B vs 4B, etc.).
-std::string find_gguf(const std::string& dir, const std::string& pattern) {
+//
+// If `prefer` is non-empty, among all matching files the one whose
+// "variant tag" (the `-Q8_0`/`-BF16`-stripped segment after `pattern-`)
+// equals `prefer` exactly is returned. This matters because a naive
+// substring match would pick `acestep-v15-xl-turbo` when the caller asked
+// for `turbo`: both filenames contain the substring "turbo". By parsing
+// the variant tag out of the filename we get exact, unambiguous selection.
+//
+// Filenames follow the upstream convention:
+//   acestep-v15-{variant}-{quant}.gguf      (DiT)
+//   acestep-5Hz-lm-{variant}-{quant}.gguf   (LM)
+// So for pattern="acestep-v15" the variant tag of
+// "acestep-v15-xl-turbo-Q8_0.gguf" is "xl-turbo", and only a prefer of
+// "xl-turbo" (not "turbo") will select it.
+std::string find_gguf(const std::string& dir, const std::string& pattern,
+                      const std::string& prefer = "") {
     if (dir.empty()) return {};
+    // Extract the variant tag from a filename: the substring between the
+    // pattern+separator and the quant suffix (-Q8_0, -BF16, -F16, …).
+    auto variant_tag = [&pattern](const std::string& name) -> std::string {
+        size_t p = name.find(pattern);
+        if (p == std::string::npos) return {};
+        size_t start = p + pattern.size();
+        // Skip the separator (usually '-').
+        while (start < name.size() && name[start] == '-') ++start;
+        // Find the trailing quant suffix. We look for the last segment
+        // matching -Q[0-9]_[0-9], -BF16, -F16, -F32 after a '-'.
+        size_t end = name.size();
+        // Strip ".gguf"
+        if (end >= 5 && name.compare(end - 5, 5, ".gguf") == 0) end -= 5;
+        // Now walk back: find the last '-' that starts a quant token.
+        // Quant tokens: Q4_0, Q4_1, Q8_0, BF16, F16, F32, Q5_K_M, Q6_K, …
+        for (size_t i = end; i > start; ) {
+            --i;
+            if (name[i] == '-') {
+                std::string seg = name.substr(i + 1, end - (i + 1));
+                if (!seg.empty() &&
+                    (seg[0] == 'Q' || seg == "BF16" || seg == "F16" ||
+                     seg == "F32" || seg == "BF16" || seg == "fp16")) {
+                    end = i;
+                } else {
+                    break;
+                }
+            }
+        }
+        return name.substr(start, end - start);
+    };
+
+    std::string first_match;
+    std::string preferred_match;
     for (const auto& e : fs::directory_iterator(dir)) {
         if (!e.is_regular_file()) continue;
         const std::string name = e.path().filename().string();
         if (name.size() < 5 || name.compare(name.size() - 5, 5, ".gguf") != 0) continue;
-        if (name.find(pattern) != std::string::npos) return e.path().string();
+        if (name.find(pattern) == std::string::npos) continue;
+        if (first_match.empty()) first_match = e.path().string();
+        if (!prefer.empty()) {
+            const std::string tag = variant_tag(name);
+            if (tag == prefer) {
+                preferred_match = e.path().string();
+            }
+        }
     }
-    return {};
+    return !preferred_match.empty() ? preferred_match : first_match;
 }
 
 bool file_exists(const std::string& p) {
@@ -147,9 +202,15 @@ bool AceStepSession::load(const std::string& model_path,
                           std::string* error) {
     // (1) Locate the four component GGUFs by filename pattern. The model
     //     directory can be either the unpacked release or a flat folder.
+    //     LoadOptions::extras["dit_variant"] / ["lm_variant"] override the
+    //     default turbo / 1.7B preference when multiple variants coexist.
     const std::string dir = model_path;
-    const std::string dit_path = find_gguf(dir, "acestep-v15");
-    const std::string lm_path  = find_gguf(dir, "5Hz-lm");
+    const std::string dit_variant =
+        opts.extras.count("dit_variant") ? opts.extras.at("dit_variant") : "turbo";
+    const std::string lm_variant =
+        opts.extras.count("lm_variant") ? opts.extras.at("lm_variant") : "1.7B";
+    const std::string dit_path = find_gguf(dir, "acestep-v15", dit_variant);
+    const std::string lm_path  = find_gguf(dir, "5Hz-lm", lm_variant);
     const std::string te_path  = find_gguf(dir, "Qwen3-Embedding");
     const std::string vae_path = find_gguf(dir, "vae");
     if (!file_exists(dit_path) || !file_exists(lm_path) ||
@@ -184,11 +245,11 @@ bool AceStepSession::load(const std::string& model_path,
     //     We try multiple KV key formats (standard GGUF arch prefix, flat
     //     acestep.* keys) for robustness across converter versions.
     auto kv_i32 = [&](const char* key, int32_t* out) {
-        // Try standard GGUF arch prefix first, then flat key.
+        // Try the exact key first, then fall back to acestep.* prefix
+        // (e.g. "acestep-dit.embedding_length" → "acestep.embedding_length")
         if (dit_r->get_kv_i32(key, out)) return;
-        // Some converters store under acestep-dit.*, others as acestep.*
         std::string key_str(key);
-        size_t dot = key_str.find('.', key_str.find('.') + 1);  // second dot
+        size_t dot = key_str.find('.');
         if (dot != std::string::npos) {
             std::string alt = "acestep." + key_str.substr(dot + 1);
             dit_r->get_kv_i32(alt.c_str(), out);
@@ -232,7 +293,8 @@ bool AceStepSession::load(const std::string& model_path,
     // We'll do a second pass after bind_dit_and_vae().
     //
     // TE hidden size from the TE model (Qwen3-Embedding 0.6B = 1024).
-    if (te_->hidden_size() > 0) cfg_.encoder_hidden_size = te_->hidden_size();
+    // NOTE: te_ is loaded below in step (4) — we derive from the weight shapes
+    // in step (5b) instead.
 
     // (4) Verify the two Qwen3 GGUFs are in llama.cpp layout, then spin up
     //     the unified qwen3::Runner for each. Same Runner, same libllama,
@@ -256,17 +318,39 @@ bool AceStepSession::load(const std::string& model_path,
     // (5b) Post-bind: derive any zero-valued DitConfig fields from weight-
     //      tensor shapes.  The tensor shapes can't lie — they're the ground
     //      truth for the loaded model.
+    //      proj_in  shape: [K=2, in_channels=192, hidden_size=2048]
+    //      proj_out shape: [K=2, out_channels=64, hidden_size=2048]
     if (cfg_.dit.hidden_size == 0 && dit_proj_in_) {
-        cfg_.dit.hidden_size = dit_proj_in_->ne[0];
+        cfg_.dit.hidden_size = static_cast<int32_t>(dit_proj_in_->ne[2]);
     }
     if (cfg_.dit.in_channels == 0 && dit_proj_in_) {
-        cfg_.dit.in_channels = dit_proj_in_->ne[1];
+        cfg_.dit.in_channels = static_cast<int32_t>(dit_proj_in_->ne[1]);
     }
     if (cfg_.dit.out_channels == 0 && dit_proj_out_) {
-        cfg_.dit.out_channels = dit_proj_out_->ne[1];
+        cfg_.dit.out_channels = static_cast<int32_t>(dit_proj_out_->ne[1]);
     }
 
-    // (5c) Construct DiTRunner and VAERunner.
+    // (5c) Pre-compute proj_in/proj_out weights: bf16 → f32 Conv1D weights.
+    //      Both are 3D [K=2, OC, IC] bf16 in the GGUF and need bf16 decoding
+    //      before use. The actual Conv1D(k=2,s=1,p=0) replaces the old
+    //      manual_linear (which read bf16 data as f32 — wrong values).
+    auto bf16_to_f32_vec = [](const ggml_tensor* t) -> std::vector<float> {
+        if (!t) return {};
+        size_t n = static_cast<size_t>(t->ne[0]) * t->ne[1] * t->ne[2];
+        std::vector<float> out(n);
+        const uint16_t* src = static_cast<const uint16_t*>(t->data);
+        for (size_t i = 0; i < n; i++) {
+            // BF16 is F32 truncated to top 16 bits — just zero-extend.
+            uint32_t f32b = static_cast<uint32_t>(src[i]) << 16;
+            float f; std::memcpy(&f, &f32b, sizeof(f));
+            out[i] = f;
+        }
+        return out;
+    };
+    proj_in_w_f32_  = bf16_to_f32_vec(dit_proj_in_);
+    proj_out_w_f32_ = bf16_to_f32_vec(dit_proj_out_);
+
+    // (5d) Construct DiTRunner and VAERunner.
     dit_runner_ = std::make_unique<DiTRunner>(ext_ctx_, cfg_.dit);
     vae_runner_ = std::make_unique<VAERunner>(ext_ctx_);
 

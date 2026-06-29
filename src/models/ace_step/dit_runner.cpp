@@ -9,10 +9,27 @@
 // covers the core transformer (hidden_size → hidden_size).
 //
 // Architecture (24 layers, each with):
-//   1. RMS norm + AdaLN modulation  (scale/shift from time_mod rows)
-//   2. GQA self-attention + RoPE
-//   3. RMS norm + AdaLN + cross-attention to TE condition
-//   4. RMS norm + AdaLN + SwiGLU MLP
+//   1. RMS norm × learned weight + AdaLN modulation
+//   2. QK-norm + GQA self-attention + RoPE
+//   3. RMS norm × learned weight + AdaLN + QK-norm + cross-attention to TE cond
+//   4. RMS norm × learned weight + AdaLN + SwiGLU MLP
+//
+// Tensor names match the GGUF from Serveurperso/ACE-Step-1.5-GGUF:
+//   decoder.layers.{i}.self_attn.{q,k,v,o}_proj.weight  (separate Q/K/V)
+//   decoder.layers.{i}.self_attn_{q,k}_norm.weight       (QK-norm)
+//   decoder.layers.{i}.self_attn_norm.weight             (pre-SA RMS weight)
+//   decoder.layers.{i}.cross_attn.{q,k,v,o}_proj.weight
+//   decoder.layers.{i}.cross_attn_{q,k}_norm.weight
+//   decoder.layers.{i}.cross_attn_norm.weight
+//   decoder.layers.{i}.mlp.{gate,up,down}_proj.weight
+//   decoder.layers.{i}.mlp_norm.weight
+//   decoder.layers.{i}.scale_shift_table                 (bf16, [H, 6])
+//   decoder.time_embed.linear_{1,2}.weight/bias
+//   decoder.time_embed.time_proj.weight/bias
+//   decoder.norm_out.weight                              (final RMS weight)
+//   decoder.scale_shift_table                            (global, [H, 2])
+//   decoder.condition_embedder.weight/bias
+//   null_condition_emb
 //
 // CFG runs two separate graphs (cond / uncond) and blends outputs.
 
@@ -28,6 +45,20 @@
 #include <vector>
 
 namespace audiocore::acestep {
+
+// ── BF16 → F32 helpers ─────────────────────────────────────────────────────
+static float bf16_to_f32(uint16_t bits) {
+    // BF16 is F32 truncated to top 16 bits — just zero-extend.
+    uint32_t f32_bits = static_cast<uint32_t>(bits) << 16;
+    float f;
+    memcpy(&f, &f32_bits, sizeof(f));
+    return f;
+}
+
+static void bf16_buf_to_f32(const void* src, float* dst, int n) {
+    const uint16_t* s = static_cast<const uint16_t*>(src);
+    for (int i = 0; i < n; i++) dst[i] = bf16_to_f32(s[i]);
+}
 
 // ── AdaLN modulation ─────────────────────────────────────────────────────────
 // x' = x * (1 + scale) + shift   where scale/shift are rows of time_mod.
@@ -47,36 +78,61 @@ static ggml_tensor* adaln(ggml_context* ctx, ggml_tensor* x,
                ggml_repeat(ctx, h, x));
 }
 
-// ── Self-attention (GQA + RoPE) ──────────────────────────────────────────────
+// ── Apply QK-norm (RMS norm per-head + learned scale) ───────────────────────
+// Input:  [T, nh*hd]  in ggml ne: ne[0]=nh*hd, ne[1]=T
+// Output: [T, nh*hd]  same shape
+static ggml_tensor* apply_qk_norm(ggml_context* ctx, ggml_tensor* t,
+                                    int hd, int nh,
+                                    ggml_tensor* norm_w) {
+    if (!norm_w) return t;
+    // Compute T from total elements: input is [nh*hd, T]
+    int64_t T = ggml_nelements(t) / (static_cast<int64_t>(hd) * nh);
+    // Reshape to [hd, nh, T] for per-head norm
+    ggml_tensor* t3d = ggml_reshape_3d(ctx, t, hd, nh, T);
+    t3d = ggml_rms_norm(ctx, t3d, 1e-6f);
+    // norm_w is [hd] → expand to [hd, nh, T]
+    ggml_tensor* nw = ggml_reshape_3d(ctx, norm_w, hd, 1, 1);
+    nw = ggml_repeat(ctx, nw, t3d);
+    t3d = ggml_mul(ctx, t3d, nw);
+    return ggml_reshape_2d(ctx, t3d, nh * hd, T);
+}
+
+// ── Self-attention (GQA + QK-norm + RoPE) ───────────────────────────────────
 // Returns just the attention (or O-projected) output — NO residual added.
 static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
                                 int T, int H, int nh, int nk, int hd,
-                                ggml_tensor* qkv,
                                 ggml_tensor* q_w, ggml_tensor* k_w,
                                 ggml_tensor* v_w, ggml_tensor* o_w,
+                                ggml_tensor* q_norm_w, ggml_tensor* k_norm_w,
                                 float rope_theta) {
-    ggml_tensor *q, *k, *v;
+    if (!q_w || !k_w || !v_w) return nullptr;
 
-    if (qkv) {
-        int qd = nh * hd, kd = nk * hd;
-        int64_t row_b = qkv->ne[0];   // bytes per row
-        ggml_tensor* f = ggml_mul_mat(ctx, qkv, x);
-        q = ggml_view_2d(ctx, f, qd, T, f->nb[1], 0);
-        k = ggml_view_2d(ctx, f, kd, T, f->nb[1],
-                         static_cast<size_t>(qd) * sizeof(float));
-        v = ggml_view_2d(ctx, f, kd, T, f->nb[1],
-                         static_cast<size_t>(qd + kd) * sizeof(float));
-    } else if (q_w && k_w && v_w) {
-        q = ggml_mul_mat(ctx, q_w, x);
-        k = ggml_mul_mat(ctx, k_w, x);
-        v = ggml_mul_mat(ctx, v_w, x);
-    } else {
-        return nullptr;
+    auto q = ggml_mul_mat(ctx, q_w, x);
+    auto k = ggml_mul_mat(ctx, k_w, x);
+    auto v = ggml_mul_mat(ctx, v_w, x);
+
+    // QK-norm (per-head RMS norm before RoPE)
+    q = apply_qk_norm(ctx, q, hd, nh, q_norm_w);
+    k = apply_qk_norm(ctx, k, hd, nk, k_norm_w);
+
+    // Reshape to 3D [hd, n_heads, T] before RoPE (ggml_rope_ext requires 3D)
+    auto to_3d = [&](ggml_tensor* t, int n_h) {
+        return ggml_reshape_3d(ctx, t, hd, n_h, T);
+    };
+    q = to_3d(q, nh);
+    k = to_3d(k, nk);
+    v = to_3d(v, nk);
+
+    // Build position IDs [0, 1, 2, ..., T-1] for RoPE
+    ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+    {
+        int32_t* pd = static_cast<int32_t*>(pos->data);
+        for (int i = 0; i < T; i++) pd[i] = i;
     }
 
-    // RoPE (Neox-style: mode=2)
+    // RoPE (Neox-style: mode=2) on 3D tensors
     auto rope = [&](ggml_tensor* t) {
-        return ggml_rope_ext(ctx, t, nullptr, nullptr,
+        return ggml_rope_ext(ctx, t, pos, nullptr,
                               hd, 2, 0,
                               rope_theta, 1.0f, 0.0f, 1.0f,
                               0.0f, 0.0f);
@@ -84,14 +140,13 @@ static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
     q = rope(q);
     k = rope(k);
 
-    // Reshape for flash_attn_ext → [hd, n_heads, T]
-    auto rsh = [&](ggml_tensor* t, int n_h, int len) {
-        return ggml_cont(ctx, ggml_permute(ctx,
-            ggml_reshape_3d(ctx, t, hd, n_h, len), 0, 2, 1, 3));
+    // Permute for flash_attn_ext → [hd, T, n_heads]
+    auto rsh = [&](ggml_tensor* t, int n_h) {
+        return ggml_cont(ctx, ggml_permute(ctx, t, 0, 2, 1, 3));
     };
-    q = rsh(q, nh, T);
-    k = rsh(k, nk, T);
-    v = rsh(v, nk, T);
+    q = rsh(q, nh);
+    k = rsh(k, nk);
+    v = rsh(v, nk);
 
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
@@ -103,13 +158,14 @@ static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
     return a;
 }
 
-// ── Cross-attention (no RoPE) ────────────────────────────────────────────────
+// ── Cross-attention (QK-norm, no RoPE) ──────────────────────────────────────
 // Returns just the attention output — NO residual added.
 static ggml_tensor* cross_attn(ggml_context* ctx, ggml_tensor* x,
                                  ggml_tensor* cond, int T, int T_cond,
                                  int H, int nh, int nk, int hd,
                                  ggml_tensor* ca_q, ggml_tensor* ca_k,
-                                 ggml_tensor* ca_v, ggml_tensor* ca_o) {
+                                 ggml_tensor* ca_v, ggml_tensor* ca_o,
+                                 ggml_tensor* q_norm_w, ggml_tensor* k_norm_w) {
     if (!ca_q || !ca_k || !ca_v || !ca_o || !cond) return nullptr;
 
     auto rsh = [&](ggml_tensor* t, int n_h, int len) {
@@ -117,9 +173,17 @@ static ggml_tensor* cross_attn(ggml_context* ctx, ggml_tensor* x,
             ggml_reshape_3d(ctx, t, hd, n_h, len), 0, 2, 1, 3));
     };
 
-    auto q = rsh(ggml_mul_mat(ctx, ca_q, x), nh, T);
-    auto k = rsh(ggml_mul_mat(ctx, ca_k, cond), nk, T_cond);
-    auto v = rsh(ggml_mul_mat(ctx, ca_v, cond), nk, T_cond);
+    auto q_lin = ggml_mul_mat(ctx, ca_q, x);
+    auto k_lin = ggml_mul_mat(ctx, ca_k, cond);
+    auto v_lin = ggml_mul_mat(ctx, ca_v, cond);
+
+    // QK-norm on cross-attention Q and K
+    q_lin = apply_qk_norm(ctx, q_lin, hd, nh, q_norm_w);
+    k_lin = apply_qk_norm(ctx, k_lin, hd, nk, k_norm_w);
+
+    auto q = rsh(q_lin, nh, T);
+    auto k = rsh(k_lin, nk, T_cond);
+    auto v = rsh(v_lin, nk, T_cond);
 
     float s = 1.0f / std::sqrt(static_cast<float>(hd));
     auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, s, 0.0f, 0.0f);
@@ -145,7 +209,34 @@ static ggml_tensor* swiglu_mlp(ggml_context* ctx, ggml_tensor* x,
 // ══════════════════════════════════════════════════════════════════════════════
 
 DiTRunner::DiTRunner(ggml_context* ext_ctx, const DitConfig& cfg)
-    : ext_ctx_(ext_ctx), cfg_(cfg) {}
+    : ext_ctx_(ext_ctx), cfg_(cfg) {
+    // Pre-convert per-layer scale_shift_table (bf16 → f32) and store for
+    // use during graph construction. This avoids bf16 handling in the
+    // hot graph-build path.
+    if (cfg_.n_layers > 0) {
+        ss_table_f32_.resize(cfg_.n_layers);
+        for (int i = 0; i < cfg_.n_layers; i++) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.scale_shift_table", i);
+            ggml_tensor* sst = ggml_get_tensor(ext_ctx_, buf);
+            if (sst && sst->type == GGML_TYPE_BF16) {
+                int n = static_cast<int>(sst->ne[0] * sst->ne[1]);
+                ss_table_f32_[i].resize(n);
+                bf16_buf_to_f32(sst->data, ss_table_f32_[i].data(), n);
+            }
+        }
+    }
+    // Pre-convert global scale_shift_table (applied after final norm)
+    {
+        ggml_tensor* gsst = ggml_get_tensor(ext_ctx_, "decoder.scale_shift_table");
+        if (gsst && gsst->type == GGML_TYPE_BF16) {
+            int n = static_cast<int>(gsst->ne[0] * gsst->ne[1]);
+            global_ss_f32_.resize(n);
+            bf16_buf_to_f32(gsst->data, global_ss_f32_.data(), n);
+        }
+    }
+}
 
 DiTRunner::~DiTRunner() = default;
 
@@ -154,13 +245,19 @@ ggml_tensor* DiTRunner::weight(const char* name) const {
 }
 
 // ── Timestep sinusoidal embedding ────────────────────────────────────────────
+// Matches ggml_compute_forward_timestep_embedding_f32 (ops.cpp:8157):
+//   freq = exp(-log(max_period) * j / half)
+//   embed[j]      = cos(t * freq)   (first half = COS)
+//   embed[j+half] = sin(t * freq)   (second half = SIN)
 static void timestep_embed(float t, float* out, int dim) {
-    int half = dim / 2;
-    for (int i = 0; i < half; i++) {
-        float f = std::exp(-static_cast<float>(i) *
-                            std::log(10000.0f) / (half - 1));
-        out[i]        = std::sin(t * f);
-        out[half + i] = std::cos(t * f);
+    const int half = dim / 2;
+    const float log_period = std::log(10000.0f);
+    for (int j = 0; j < half; j++) {
+        float freq = std::exp(-log_period * static_cast<float>(j) /
+                              static_cast<float>(half));
+        float arg = t * freq;
+        out[j]        = std::cos(arg);
+        out[half + j] = std::sin(arg);
     }
 }
 
@@ -171,25 +268,38 @@ static bool run_one_forward(
     const float* temb, int temb_dim,
     const float* cond_data, int ct_len, int cond_hidden,
     float* result,
+    const std::vector<std::vector<float>>& ss_table_f32,
+    const std::vector<float>& global_ss_f32,
     std::string* error)
 {
+    // Input NaN diagnostics
+    {
+        int nx = 0, nt = 0, nc = 0;
+        for (int32_t i = 0; i < T * H; i++) if (std::isnan(x_t[i])) nx++;
+        for (int i = 0; i < temb_dim; i++) if (std::isnan(temb[i])) nt++;
+        if (cond_data && ct_len > 0) {
+            for (int i = 0; i < ct_len * cond_hidden; i++) if (std::isnan(cond_data[i])) nc++;
+        }
+        fprintf(stderr, "[dit] input NaN: x=%d/%d temb=%d/%d cond=%d/%d\n",
+                nx, T*H, nt, temb_dim, nc, cond_data ? ct_len*cond_hidden : 0);
+    }
     const int32_t nh      = cfg.n_heads     > 0 ? cfg.n_heads     : 24;
     const int32_t nk      = cfg.n_kv_heads  > 0 ? cfg.n_kv_heads  : 8;
     const int32_t hd      = cfg.head_dim    > 0 ? cfg.head_dim    : 128;
     const int32_t n_layer = cfg.n_layers    > 0 ? cfg.n_layers    : 24;
     const float   eps     = cfg.rms_norm_eps > 0 ? cfg.rms_norm_eps : 1e-6f;
-    const float   theta   = cfg.rope_theta  > 0 ? cfg.rope_theta  : 10000.0f;
+    const float   theta   = cfg.rope_theta  > 0 ? cfg.rope_theta  : 1000000.0f;
     const int     nthr    = 4;
 
-    // Context memory: 512 MB for T up to ~250 (10 s at 25 Hz).
-    // For longer sequences, switch to the ggml-alloc + backend API pattern.
-    const size_t mem = 512ULL * 1024 * 1024;
+    // Context memory: 6 GB for T up to ~375 (15 s at 25 Hz).
+    // For 30s+ durations, switch to the ggml-alloc + backend API pattern.
+    const size_t mem = 6144ULL * 1024 * 1024;
     char* ctx_buf = new (std::nothrow) char[mem];
     if (!ctx_buf) { if (error) *error = "DiT OOM"; return false; }
 
     ggml_init_params p = { mem, ctx_buf, /*no_alloc=*/false };
     ggml_context* ctx = ggml_init(p);
-    ggml_cgraph* gf  = ggml_new_graph(ctx);
+    ggml_cgraph* gf  = ggml_new_graph_custom(ctx, 4096, false);
     if (!ctx || !gf) {
         delete[] ctx_buf; if (error) *error = "DiT ggml_init"; return false;
     }
@@ -203,24 +313,28 @@ static bool run_one_forward(
     memcpy(tp->data, temb, static_cast<size_t>(temb_dim) * sizeof(float));
     tp = ggml_reshape_2d(ctx, tp, temb_dim, 1);   // [temb_dim, 1]
 
-    ggml_tensor* t1w = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_1_w");
-    ggml_tensor* t1b = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_1_b");
+    // MLP 1: linear_1 → SiLU → linear_2
+    ggml_tensor* t1w = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_1.weight");
+    ggml_tensor* t1b = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_1.bias");
     if (t1w) {
         tp = ggml_mul_mat(ctx, t1w, tp);
         if (t1b) tp = ggml_add(ctx, tp, ggml_repeat(ctx, t1b, tp));
     }
     tp = ggml_silu(ctx, tp);
-    ggml_tensor* t2w = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_2_w");
-    ggml_tensor* t2b = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_2_b");
+    ggml_tensor* t2w = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_2.weight");
+    ggml_tensor* t2b = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_2.bias");
     if (t2w) {
         tp = ggml_mul_mat(ctx, t2w, tp);
         if (t2b) tp = ggml_add(ctx, tp, ggml_repeat(ctx, t2b, tp));
     }
 
+    // Time projection → [H, 6] modulation
+    // HOT-Step dit-graph.h:144 applies SiLU before time_proj: h2 = silu(temb)
     ggml_tensor* time_mod = nullptr;
-    ggml_tensor* tpw = ggml_get_tensor(ext_ctx, "decoder.time_embed.time_proj_w");
-    ggml_tensor* tpb = ggml_get_tensor(ext_ctx, "decoder.time_embed.time_proj_b");
+    ggml_tensor* tpw = ggml_get_tensor(ext_ctx, "decoder.time_embed.time_proj.weight");
+    ggml_tensor* tpb = ggml_get_tensor(ext_ctx, "decoder.time_embed.time_proj.bias");
     if (tpw) {
+        tp = ggml_silu(ctx, tp);  // SiLU before time_proj (HOT-Step dit-graph.h:144)
         auto pj = ggml_mul_mat(ctx, tpw, tp);
         if (tpb) pj = ggml_add(ctx, pj, ggml_repeat(ctx, tpb, pj));
         time_mod = ggml_reshape_2d(ctx, pj, H, 6);   // ne0=H, ne1=6
@@ -231,82 +345,179 @@ static bool run_one_forward(
     }
 
     // ── Condition embedder ───────────────────────────────────────────────
+    // Pipeline: TE hidden (1024-dim) → encoder.text_projector (1024→2048)
+    //           → decoder.condition_embedder (2048→2048) → cross-attn
     ggml_tensor* cond_emb = nullptr;
+    ggml_tensor* tp_w = ggml_get_tensor(ext_ctx, "encoder.text_projector.weight");
     ggml_tensor* cew = ggml_get_tensor(ext_ctx, "decoder.condition_embedder.weight");
     ggml_tensor* ceb = ggml_get_tensor(ext_ctx, "decoder.condition_embedder.bias");
-    if (cew && ceb && cond_data && ct_len > 0) {
-        int64_t ch = (cond_hidden > 0) ? cond_hidden : 1024;
-        ggml_tensor* ct = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ch, ct_len);
+    if (tp_w && cew && ceb && cond_data && ct_len > 0) {
+        // (1) Load raw TE hidden states [te_hs, ct_len] (te_hs=1024)
+        int64_t te_hs = (cond_hidden > 0) ? cond_hidden : 1024;
+        ggml_tensor* ct = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, te_hs, ct_len);
         memcpy(ct->data, cond_data,
-               static_cast<size_t>(ct_len) * static_cast<size_t>(ch) *
+               static_cast<size_t>(ct_len) * static_cast<size_t>(te_hs) *
                sizeof(float));
-        cond_emb = ggml_add(ctx, ggml_mul_mat(ctx, cew, ct),
-                             ggml_repeat(ctx, ceb, ct));
+        // (2) Project TE hidden (1024) → encoder_hidden (2048) via
+        //     encoder.text_projector. Weight ne=[1024, 2048] → mul_mat
+        //     maps inner 1024 → outer 2048.
+        ggml_tensor* proj = ggml_mul_mat(ctx, tp_w, ct);
+        // (3) Apply condition_embedder: encoder_hidden (2048) → H.
+        //     The bias repeat target MUST be the mul_mat output (shape H),
+        //     not `proj` (shape 2048) — those only coincide when H==2048
+        //     (turbo). For xl-base H=2560, repeating ceb=[2560] against
+        //     proj=[2048,N] is a shape error.
+        ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, proj);
+        cond_emb = ggml_add(ctx, ce_out, ggml_repeat(ctx, ceb, ce_out));
     } else if (cew && ceb && (!cond_data || ct_len == 0)) {
-        // No input condition — use learned null_condition_emb
+        // No input condition — use learned null_condition_emb.
+        // null_condition_emb is encoder_hidden-dim (2048); condition_embedder
+        // maps it to H. Same bias-repeat fix as above.
         ggml_tensor* nce = ggml_get_tensor(ext_ctx, "null_condition_emb");
         if (nce) {
-            cond_emb = ggml_add(ctx, ggml_mul_mat(ctx, cew, nce),
-                                 ggml_repeat(ctx, ceb, nce));
+            ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, nce);
+            cond_emb = ggml_add(ctx, ce_out, ggml_repeat(ctx, ceb, ce_out));
         }
     }
 
     // ── DiT layers ───────────────────────────────────────────────────────
     for (int i = 0; i < n_layer && i < 48; i++) {
         char buf[128];
-        auto bn = [&](const char* sfx) -> const char* {
-            std::snprintf(buf, sizeof(buf), "decoder.block.%d.%s", i, sfx);
-            return buf;
-        };
 
-        // Self-attention block
+        // Build per-layer time_mod with scale_shift_table bias
+        ggml_tensor* layer_time_mod = time_mod;
+        if (i < (int)ss_table_f32.size() && !ss_table_f32[i].empty()) {
+            ggml_tensor* sst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 6);
+            memcpy(sst->data, ss_table_f32[i].data(),
+                   static_cast<size_t>(H) * 6 * sizeof(float));
+            layer_time_mod = ggml_add(ctx, time_mod, sst);
+        }
+
+        // ── Self-attention block ─────────────────────────────────────────
         {
             ggml_tensor* h = ggml_rms_norm(ctx, cur, eps);
-            h = adaln(ctx, h, time_mod, 0, 1, H);
+            // Learned norm weight
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.self_attn_norm.weight", i);
+            ggml_tensor* san_w = ggml_get_tensor(ext_ctx, buf);
+            if (san_w) {
+                h = ggml_mul(ctx, h, ggml_repeat(ctx, san_w, h));
+            }
+            h = adaln(ctx, h, layer_time_mod, 0, 1, H);
+
+            // Self-attention with separate Q/K/V + QK-norm
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.self_attn.q_proj.weight", i);
+            auto q_w = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.self_attn.k_proj.weight", i);
+            auto k_w = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.self_attn.v_proj.weight", i);
+            auto v_w = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.self_attn.o_proj.weight", i);
+            auto o_w = ggml_get_tensor(ext_ctx, buf);
+
+            // QK-norm weights
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.self_attn.q_norm.weight", i);
+            auto qn_w = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.self_attn.k_norm.weight", i);
+            auto kn_w = ggml_get_tensor(ext_ctx, buf);
+
             h = self_attn(ctx, h, T, H, nh, nk, hd,
-                           ggml_get_tensor(ext_ctx, bn("sa_qkv.weight")),
-                           ggml_get_tensor(ext_ctx, bn("sa_q_proj.weight")),
-                           ggml_get_tensor(ext_ctx, bn("sa_k_proj.weight")),
-                           ggml_get_tensor(ext_ctx, bn("sa_v_proj.weight")),
-                           ggml_get_tensor(ext_ctx, bn("sa_o_proj.weight")),
-                           theta);
+                          q_w, k_w, v_w, o_w,
+                          qn_w, kn_w, theta);
             if (h) cur = ggml_add(ctx, cur, h);
         }
 
-        // Cross-attention block (if condition available)
+        // ── Cross-attention block ────────────────────────────────────────
         if (cond_emb) {
             ggml_tensor* h = ggml_rms_norm(ctx, cur, eps);
-            h = adaln(ctx, h, time_mod, 2, 3, H);
+            // Learned norm weight
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.cross_attn_norm.weight", i);
+            ggml_tensor* can_w = ggml_get_tensor(ext_ctx, buf);
+            if (can_w) {
+                h = ggml_mul(ctx, h, ggml_repeat(ctx, can_w, h));
+            }
+            h = adaln(ctx, h, layer_time_mod, 2, 3, H);
+
             int c_len = static_cast<int>(cond_emb->ne[1]);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.cross_attn.q_proj.weight", i);
+            auto ca_q = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.cross_attn.k_proj.weight", i);
+            auto ca_k = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.cross_attn.v_proj.weight", i);
+            auto ca_v = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.cross_attn.o_proj.weight", i);
+            auto ca_o = ggml_get_tensor(ext_ctx, buf);
+
+            // Cross-attn QK-norm weights
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.cross_attn.q_norm.weight", i);
+            auto ca_qn = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.cross_attn.k_norm.weight", i);
+            auto ca_kn = ggml_get_tensor(ext_ctx, buf);
+
             h = cross_attn(ctx, h, cond_emb, T, c_len, H, nh, nk, hd,
-                           ggml_get_tensor(ext_ctx, bn("ca_q_proj.weight")),
-                           ggml_get_tensor(ext_ctx, bn("ca_k_proj.weight")),
-                           ggml_get_tensor(ext_ctx, bn("ca_v_proj.weight")),
-                           ggml_get_tensor(ext_ctx, bn("ca_o_proj.weight")));
+                           ca_q, ca_k, ca_v, ca_o,
+                           ca_qn, ca_kn);
             if (h) cur = ggml_add(ctx, cur, h);
         }
 
-        // MLP block
+        // ── MLP block ────────────────────────────────────────────────────
         {
             ggml_tensor* h = ggml_rms_norm(ctx, cur, eps);
-            h = adaln(ctx, h, time_mod, 4, 5, H);
-            h = swiglu_mlp(ctx, h,
-                           ggml_get_tensor(ext_ctx, bn("gate_proj.weight")),
-                           ggml_get_tensor(ext_ctx, bn("up_proj.weight")),
-                           ggml_get_tensor(ext_ctx, bn("down_proj.weight")));
+            // Learned norm weight
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.mlp_norm.weight", i);
+            ggml_tensor* mn_w = ggml_get_tensor(ext_ctx, buf);
+            if (mn_w) {
+                h = ggml_mul(ctx, h, ggml_repeat(ctx, mn_w, h));
+            }
+            h = adaln(ctx, h, layer_time_mod, 4, 5, H);
+
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.mlp.gate_proj.weight", i);
+            auto gw = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.mlp.up_proj.weight", i);
+            auto uw = ggml_get_tensor(ext_ctx, buf);
+            std::snprintf(buf, sizeof(buf),
+                          "decoder.layers.%d.mlp.down_proj.weight", i);
+            auto dw = ggml_get_tensor(ext_ctx, buf);
+
+            h = swiglu_mlp(ctx, h, gw, uw, dw);
             if (h) cur = ggml_add(ctx, cur, h);
         }
     }
 
     // ── Final norm + scale/shift ─────────────────────────────────────────
     {
+        // Learned output norm weight
+        ggml_tensor* norm_out_w = ggml_get_tensor(ext_ctx, "decoder.norm_out.weight");
         ggml_tensor* n_out = ggml_rms_norm(ctx, cur, eps);
-        ggml_tensor* oss = ggml_get_tensor(ext_ctx, "decoder.out_scale_shift");
-        if (oss) {
+        if (norm_out_w) {
+            n_out = ggml_mul(ctx, n_out, ggml_repeat(ctx, norm_out_w, n_out));
+        }
+
+        // Global scale/shift: decoder.scale_shift_table [H, 2] → ne0=H, ne1=2
+        if (!global_ss_f32.empty()) {
+            ggml_tensor* gss = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
+            memcpy(gss->data, global_ss_f32.data(),
+                   static_cast<size_t>(H) * 2 * sizeof(float));
             auto os = ggml_reshape_2d(ctx,
-                ggml_view_1d(ctx, oss, H, 0), H, 1);
+                ggml_view_1d(ctx, gss, H, 0), H, 1);
             auto oh = ggml_reshape_2d(ctx,
-                ggml_view_1d(ctx, oss, H,
+                ggml_view_1d(ctx, gss, H,
                              static_cast<size_t>(H) * sizeof(float)),
                 H, 1);
             n_out = ggml_add(ctx,
@@ -346,13 +557,16 @@ bool DiTRunner::forward(
 
     // Pre-compute timestep embedding (shared by cond + uncond)
     std::vector<float> temb(static_cast<size_t>(temb_dim));
-    timestep_embed(t, temb.data(), temb_dim);
+    // Scale timestep by 1000 (diffusion convention, matches HOT-Step
+    // dit-graph.h:118: ggml_scale(ctx, t_scalar, 1000.0f))
+    timestep_embed(t * 1000.0f, temb.data(), temb_dim);
 
     if (guidance_scale == 1.0f) {
         return run_one_forward(cfg_, ext_ctx_, x_t, T, H,
                                 temb.data(), temb_dim,
                                 cond, T_cond, cond_hidden,
-                                output, error);
+                                output,
+                                ss_table_f32_, global_ss_f32_, error);
     }
 
     // CFG: cond + uncond, then blend
@@ -362,7 +576,8 @@ bool DiTRunner::forward(
     if (!run_one_forward(cfg_, ext_ctx_, x_t, T, H,
                           temb.data(), temb_dim,
                           cond, T_cond, cond_hidden,
-                          c_out.data(), error)) {
+                          c_out.data(),
+                          ss_table_f32_, global_ss_f32_, error)) {
         if (error) *error = "DiT: cond forward failed";
         return false;
     }
@@ -372,7 +587,8 @@ bool DiTRunner::forward(
     if (!run_one_forward(cfg_, ext_ctx_, x_t, T, H,
                           temb.data(), temb_dim,
                           uc, uc_len, cond_hidden,
-                          u_out.data(), error)) {
+                          u_out.data(),
+                          ss_table_f32_, global_ss_f32_, error)) {
         if (error) *error = "DiT: uncond forward failed";
         return false;
     }

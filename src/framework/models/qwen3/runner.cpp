@@ -229,7 +229,9 @@ bool Runner::forward_tokens(const int32_t* tokens, int32_t n_tokens, int32_t n_p
     bool ok = (llama_decode(ctx_, b) == 0);
     if (!ok) {
         if (error) *error = "llama_decode failed";
-    } else {
+    } else if (logits) {
+        // Copy logits per token (skip when caller passes nullptr — only
+        // needs KV cache populated, e.g. LM prefill in ACE-Step).
         for (int32_t i = 0; i < n_tokens && ok; i++) {
             const float* row = llama_get_logits_ith(ctx_, i);
             if (!row) {

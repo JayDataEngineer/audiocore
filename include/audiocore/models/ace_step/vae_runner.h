@@ -1,8 +1,12 @@
-// vae_runner.h — VAE decoder graph builder + forward pass.
+// vae_runner.h — VAE encoder/decoder graph builder + forward pass.
 //
 // The VAE decoder takes 25Hz latent frames [T, 64] and produces 48kHz stereo
 // PCM audio. Total upsampling factor: 1920× across 5 decoder blocks with
 // Snake activations, ConvTranspose1d layers, and ResUnits.
+// The encoder mirrors this in reverse, striding 1920× down to 25Hz latent.
+//
+// All convolutional weights are WSConv (weight_g + weight_v in bf16 in GGUF).
+// precompute_weights() composes them into f32 at construction time.
 //
 // Architecture reference: ServeurpersoCom/acestep.cpp — vae.h / vae_ggml_decode
 
@@ -44,7 +48,59 @@ public:
     ggml_tensor* weight(const char* name) const;
 
 private:
-    ggml_context* ext_ctx_;   // weight tensors (no_alloc=true, mmap'd)
+    // ── Per-layer pre-computed weight structs ────────────────────────────
+    struct ResUnitWeights {
+        std::vector<float> s1a_;   // snake1 alpha [C]
+        std::vector<float> s1b_;   // snake1 beta  [C]
+        std::vector<float> c1w_;   // conv1 WSConv [K, C, C] f32
+        int32_t            c1K_ = 7;
+        std::vector<float> c1b_;   // conv1 bias [C] (empty if none)
+        std::vector<float> s2a_;   // snake2 alpha [C]
+        std::vector<float> s2b_;   // snake2 beta  [C]
+        std::vector<float> c2w_;   // conv2 WSConv [1, C, C] f32
+        int32_t            c2K_ = 1;
+        std::vector<float> c2b_;   // conv2 bias [C] (empty if none)
+    };
+
+    struct BlockWeights {
+        // Block-level snake (pre-stride for decoder, post-ResUnit for encoder)
+        std::vector<float> snake_a_;     // [in_ch]
+        std::vector<float> snake_b_;     // [in_ch]
+        // Strided conv (conv_t1d for decoder, conv1d for encoder)
+        std::vector<float> ct1_w_;       // decoder conv_t permuted 2D [IC, K*OC]
+        int32_t            ct1_K_ = 0;
+        std::vector<float> ct1_b_;       // [OC]
+        std::vector<float> conv_w_;      // encoder conv1 WSConv [K, OC, IC] f32
+        int32_t            conv_K_ = 0;
+        std::vector<float> conv_b_;      // [OC]
+        ResUnitWeights     res_[3];      // 3 ResUnits
+    };
+
+    // Pre-compute all weights from GGUF bf16/WSConv format
+    void precompute_weights(ggml_context* ext_ctx);
+
+    ggml_context* ext_ctx_;
+
+    // ── Decoder weights ──────────────────────────────────────────────────
+    std::vector<float> dec_conv1_w_;    // [7, 2048, 64] WSConv f32
+    int32_t            dec_conv1_K_ = 7;
+    std::vector<float> dec_conv1_b_;    // [2048]
+    std::vector<float> dec_conv2_w_;    // [7, 2, 128] WSConv f32
+    int32_t            dec_conv2_K_ = 7;
+    std::vector<float> dec_fn_exp_a_;   // final snake alpha [128]
+    std::vector<float> dec_fn_inv_b_;   // final snake beta  [128]
+    BlockWeights       dec_blk_[5];     // 5 decoder blocks
+
+    // ── Encoder weights ──────────────────────────────────────────────────
+    std::vector<float> enc_conv1_w_;    // [7, 128, 2] WSConv f32
+    int32_t            enc_conv1_K_ = 7;
+    std::vector<float> enc_conv1_b_;    // [128]
+    std::vector<float> enc_conv2_w_;    // [3, 128, 2048] WSConv f32
+    int32_t            enc_conv2_K_ = 3;
+    std::vector<float> enc_conv2_b_;    // [128]
+    std::vector<float> enc_fn_exp_a_;   // final encoder snake alpha [2048]
+    std::vector<float> enc_fn_inv_b_;   // final encoder snake beta  [2048]
+    BlockWeights       enc_blk_[5];     // 5 encoder blocks
 };
 
 }  // namespace audiocore::acestep

@@ -61,9 +61,37 @@ const std::vector<Rule>& rules() {
             "blk.$1.ffn_up.weight"},
         {std::regex("^model\\.layers\\.(\\d+)\\.mlp\\.down_proj\\.weight$"),
             "blk.$1.ffn_down.weight"},
+        // QK-norm (both LM and TE variants).
+        {std::regex("^model\\.layers\\.(\\d+)\\.self_attn\\.k_norm\\.weight$"),
+            "blk.$1.attn_k_norm.weight"},
+        {std::regex("^model\\.layers\\.(\\d+)\\.self_attn\\.q_norm\\.weight$"),
+            "blk.$1.attn_q_norm.weight"},
+
         // Text-encoder variant: same layers but no `model.` prefix.
         {std::regex("^embed_tokens\\.weight$"), "token_embd.weight"},
         {std::regex("^norm\\.weight$"),         "output_norm.weight"},
+        {std::regex("^layers\\.(\\d+)\\.input_layernorm\\.weight$"),
+            "blk.$1.attn_norm.weight"},
+        {std::regex("^layers\\.(\\d+)\\.post_attention_layernorm\\.weight$"),
+            "blk.$1.ffn_norm.weight"},
+        {std::regex("^layers\\.(\\d+)\\.self_attn\\.q_proj\\.weight$"),
+            "blk.$1.attn_q.weight"},
+        {std::regex("^layers\\.(\\d+)\\.self_attn\\.k_proj\\.weight$"),
+            "blk.$1.attn_k.weight"},
+        {std::regex("^layers\\.(\\d+)\\.self_attn\\.v_proj\\.weight$"),
+            "blk.$1.attn_v.weight"},
+        {std::regex("^layers\\.(\\d+)\\.self_attn\\.o_proj\\.weight$"),
+            "blk.$1.attn_output.weight"},
+        {std::regex("^layers\\.(\\d+)\\.mlp\\.gate_proj\\.weight$"),
+            "blk.$1.ffn_gate.weight"},
+        {std::regex("^layers\\.(\\d+)\\.mlp\\.up_proj\\.weight$"),
+            "blk.$1.ffn_up.weight"},
+        {std::regex("^layers\\.(\\d+)\\.mlp\\.down_proj\\.weight$"),
+            "blk.$1.ffn_down.weight"},
+        {std::regex("^layers\\.(\\d+)\\.self_attn\\.k_norm\\.weight$"),
+            "blk.$1.attn_k_norm.weight"},
+        {std::regex("^layers\\.(\\d+)\\.self_attn\\.q_norm\\.weight$"),
+            "blk.$1.attn_q_norm.weight"},
     };
     return R;
 }
@@ -128,30 +156,34 @@ int main(int argc, char** argv) {
     if (n_renamed == 0) {
         std::printf("%s: nothing to convert (already in llama.cpp layout, "
                     "or unrecognized names).\n", in_path.c_str());
+        if (dry_run) {
+            int shown = 0;
+            for (const auto& p : plan) {
+                if (!p.will_rename) {
+                    std::printf("  skipped: %s\n", p.old_name.c_str());
+                    if (++shown >= 5) break;
+                }
+            }
+            return 0;
+        }
+        // Still write with KV fix even when no tensors need renaming —
+        // the upstream GGUFs ship general.file_type as str but llama.cpp
+        // expects u32. Fall through to the write path below.
+    } else {
+        std::printf("%s: %d of %zu tensors will be renamed.\n",
+                    in_path.c_str(), n_renamed, plan.size());
         int shown = 0;
         for (const auto& p : plan) {
-            if (!p.will_rename) {
-                std::printf("  skipped: %s\n", p.old_name.c_str());
-                if (++shown >= 5) break;
-            }
+            if (!p.will_rename) continue;
+            std::printf("  %s -> %s\n", p.old_name.c_str(), p.new_name.c_str());
+            if (++shown >= 10) { std::printf("  …\n"); break; }
         }
-        return 0;
-    }
 
-    std::printf("%s: %d of %zu tensors will be renamed.\n",
-                in_path.c_str(), n_renamed, plan.size());
-    int shown = 0;
-    for (const auto& p : plan) {
-        if (!p.will_rename) continue;
-        std::printf("  %s -> %s\n", p.old_name.c_str(), p.new_name.c_str());
-        if (++shown >= 10) { std::printf("  …\n"); break; }
+        if (dry_run) {
+            std::printf("dry-run: no file written.\n");
+            return 0;
+        }
     }
-
-    if (dry_run) {
-        std::printf("dry-run: no file written.\n");
-        return 0;
-    }
-
     // Allocate one big arena that backs every output tensor's bytes. We
     // materialize each input tensor into the arena at its own offset, then
     // build a fresh ggml_context of tensor structs that point into the
@@ -210,6 +242,121 @@ int main(int argc, char** argv) {
         gguf_context* dst = gguf_init_empty();
         if (dst) {
             gguf_set_kv(dst, src);
+            // Fix general.file_type: upstream ACE-Step GGUFs store it as str
+            // ("Q8_0") but llama.cpp expects u32. Override with the correct
+            // integer value (LLAMA_FTYPE_MOSTLY_Q8_0 = 7 for Q8_0 weights;
+            // the converter preserves the quantization so this is safe).
+            gguf_set_val_u32(dst, "general.file_type", 7);
+            // Override architecture: ACE-Step Qwen3-based GGUFs use
+            // "acestep-lm" (LM) and "acestep-text-enc" (TE) but llama.cpp
+            // only recognizes "qwen3". Both are architecturally Qwen3
+            // models (same tensor structure, config keys, etc.).
+            gguf_set_val_str(dst, "general.architecture", "qwen3");
+            // Remap arch-prefixed KV keys: the source uses acestep-lm.*,
+            // acestep-text-enc.* or acestep.*, but llama.cpp reads qwen3.*
+            // after the architecture change above.
+            {
+                const char* old_prefixes[] = {"acestep-lm.", "acestep-text-enc.", "acestep."};
+                int nkvs = gguf_get_n_kv(src);
+                for (int i = 0; i < nkvs; i++) {
+                    const char* key = gguf_get_key(src, i);
+                    for (const char* prefix : old_prefixes) {
+                        size_t plen = std::strlen(prefix);
+                        if (std::strncmp(key, prefix, plen) == 0) {
+                            std::string new_key = std::string("qwen3.") + (key + plen);
+                            int vt = gguf_get_kv_type(src, i);
+                            switch (vt) {
+                                case GGUF_TYPE_UINT32:
+                                    gguf_set_val_u32(dst, new_key.c_str(),
+                                        gguf_get_val_u32(src, i)); break;
+                                case GGUF_TYPE_INT32:
+                                    gguf_set_val_i32(dst, new_key.c_str(),
+                                        gguf_get_val_i32(src, i)); break;
+                                case GGUF_TYPE_FLOAT32:
+                                    gguf_set_val_f32(dst, new_key.c_str(),
+                                        gguf_get_val_f32(src, i)); break;
+                                case GGUF_TYPE_BOOL:
+                                    gguf_set_val_bool(dst, new_key.c_str(),
+                                        gguf_get_val_bool(src, i)); break;
+                                case GGUF_TYPE_STRING:
+                                    gguf_set_val_str(dst, new_key.c_str(),
+                                        gguf_get_val_str(src, i)); break;
+                                default: break;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            // Set attention.value_length explicitly if missing. Without it,
+            // llama.cpp defaults to n_embd / n_head (64 for TE head_dim=128),
+            // causing a shape mismatch on attn_v.weight. Match key_length.
+            {
+                int kl_idx = gguf_find_key(dst, "qwen3.attention.key_length");
+                int vl_idx = gguf_find_key(dst, "qwen3.attention.value_length");
+                if (kl_idx != -1 && vl_idx == -1) {
+                    uint32_t kl = gguf_get_val_u32(dst, kl_idx);
+                    std::fprintf(stderr, "  setting qwen3.attention.value_length = %u"
+                                 " (was unset; default would be wrong for TE)\n", kl);
+                    gguf_set_val_u32(dst, "qwen3.attention.value_length", kl);
+                }
+            }
+
+            // Pad tokenizer arrays to match qwen3.vocab_size (ACE-Step LM
+            // adds audio-code tokens beyond the BPE tokenizer; llama.cpp
+            // uses len(tokenizer.ggml.tokens) as n_vocab for tensor dim
+            // checks, so the array must be padded to avoid shape errors).
+            {
+                int vs_idx = gguf_find_key(dst, "qwen3.vocab_size");
+                int tk_idx = gguf_find_key(dst, "tokenizer.ggml.tokens");
+                if (vs_idx != -1 && tk_idx != -1) {
+                    uint32_t target = gguf_get_val_u32(dst, vs_idx);
+                    int cur = gguf_get_arr_n(dst, tk_idx);
+                    if (cur > 0 && (uint32_t)cur < target) {
+                        std::fprintf(stderr, "  padding tokenizer arrays %d → %u\n",
+                                     cur, target);
+                        // Read existing tokens into stable strings
+                        std::vector<std::string> token_strs;
+                        token_strs.reserve(target);
+                        for (int i = 0; i < cur; i++)
+                            token_strs.push_back(
+                                gguf_get_arr_str(dst, tk_idx, i));
+                        // Pad with unique placeholders (llama.cpp requires
+                        // id_to_token.size() == token_to_id.size(), so each
+                        // entry must be a distinct non-empty string).
+                        for (uint32_t i = (uint32_t)cur; i < target; i++)
+                            token_strs.push_back("<|extra_"
+                                + std::to_string(i - (uint32_t)cur) + "|>");
+                        std::vector<const char*> strs(target);
+                        for (uint32_t i = 0; i < target; i++)
+                            strs[i] = token_strs[i].c_str();
+                        gguf_set_arr_str(dst, "tokenizer.ggml.tokens",
+                                         strs.data(), (int)target);
+                        // Pad scores if present
+                        int sc_idx = gguf_find_key(dst, "tokenizer.ggml.scores");
+                        if (sc_idx != -1) {
+                            const void* raw = gguf_get_arr_data(dst, sc_idx);
+                            int n_raw = gguf_get_arr_n(dst, sc_idx);
+                            std::vector<float> scores(target, 0.0f);
+                            std::memcpy(scores.data(), raw,
+                                         (size_t)std::min(n_raw, (int)target) * sizeof(float));
+                            gguf_set_arr_data(dst, "tokenizer.ggml.scores",
+                                GGUF_TYPE_FLOAT32, scores.data(), (int)target);
+                        }
+                        // Pad token types if present
+                        int tt_idx = gguf_find_key(dst, "tokenizer.ggml.token_type");
+                        if (tt_idx != -1) {
+                            const void* raw = gguf_get_arr_data(dst, tt_idx);
+                            int n_raw = gguf_get_arr_n(dst, tt_idx);
+                            std::vector<int32_t> types(target, 0);
+                            std::memcpy(types.data(), raw,
+                                         (size_t)std::min(n_raw, (int)target) * sizeof(int32_t));
+                            gguf_set_arr_data(dst, "tokenizer.ggml.token_type",
+                                GGUF_TYPE_INT32, types.data(), (int)target);
+                        }
+                    }
+                }
+            }
             // Add renamed tensors in source order.
             for (const auto& w : writes) gguf_add_tensor(dst, w.tensor);
             if (!gguf_write_to_file(dst, out_arg.c_str(), /*only_meta=*/false)) {

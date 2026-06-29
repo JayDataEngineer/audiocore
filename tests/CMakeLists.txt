@@ -48,6 +48,12 @@ audiocore_test_with_bin(test_convert_acestep convert_acestep)
 add_executable(test_moss_e2e test_moss_e2e.cpp)
 target_link_libraries(test_moss_e2e PRIVATE audiocore_framework)
 
+# End-to-end MOSS-TTS voice-clone test — exercises the real codec encoder
+# path. Requires test_moss_e2e to have produced test_moss_output.wav in the
+# working directory; otherwise soft-skips. Run manually: ./test_moss_voice_clone_e2e
+add_executable(test_moss_voice_clone_e2e test_moss_voice_clone_e2e.cpp)
+target_link_libraries(test_moss_voice_clone_e2e PRIVATE audiocore_framework)
+
 # End-to-end Qwen3-TTS test — loads talker GGUF + predictor GGUF + ONNX codec.
 # Requires ~1.4GB of model files from hf.co/wkwong/Lunavox-Qwen3-TTS-GGUF.
 # Run manually: ./test_qwen3tts_e2e
@@ -55,5 +61,16 @@ target_link_libraries(test_moss_e2e PRIVATE audiocore_framework)
 add_executable(test_qwen3tts_e2e test_qwen3tts_e2e.cpp)
 target_link_libraries(test_qwen3tts_e2e PRIVATE audiocore_framework)
 
+# End-to-end ACE-Step test — loads 4 GGUFs (DiT + LM + TE + VAE), ~5.3GB total.
+# Run manually: ./test_acestep_e2e
+# Set ACESTEP_DIR / ACESTEP_NGPU / ACESTEP_DEVICE env vars to configure.
+add_executable(test_acestep_e2e test_acestep_e2e.cpp)
+target_link_libraries(test_acestep_e2e PRIVATE audiocore_framework)
+
 add_executable(test_gguf_dump test_gguf_dump.cpp)
 target_link_libraries(test_gguf_dump PRIVATE audiocore_framework)
+
+# Verifies that unsupported modes fail fast with a clear error rather than
+# silently degrading through system-prompt impersonation (GAP_TRACKER.md §1.2).
+add_executable(test_moss_modes test_moss_modes.cpp)
+target_link_libraries(test_moss_modes PRIVATE audiocore_framework)
