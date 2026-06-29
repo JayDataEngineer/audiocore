@@ -7,7 +7,7 @@ is the only implementation language.
 
 | Model | Family | Capabilities | Status |
 |---|---|---|---|
-| **[MOSS-TTS](https://github.com/pwilkin/openmoss)** (8B) | `moss_tts` | TTS, dialogue (TTSD-style), voice design (VoiceGenerator-equivalent), sound effects, voice cloning | ✅ Stage 16: codec → PCM ported (adapted from `pwilkin/openmoss`, Apache-2.0). 3 of 6 modes wired end-to-end when fed codec-bearing weights (e.g. `smcleed/MOSS-TTS-v1.5-GGUF` sidecar); dialogue/voice_design are best-effort fallbacks for dedicated variants; realtime/streaming fails fast. |
+| **[MOSS-TTS](https://github.com/pwilkin/openmoss)** (8B) | `moss_tts` | TTS, voice cloning, streaming; (sfx/dialogue/voice_design/realtime fail fast — need dedicated checkpoints we don't ship) | ✅ Flagship backbone fully wired end-to-end with the upstream prompt template and the openmoss codec (`pwilkin/openmoss`, Apache-2.0). `tts` + `voice_clone` + `streaming` verified against real weights. Modes that need separate MOSS checkpoints (TTSD, VoiceGenerator, SoundEffect, Realtime) fail fast with an error naming the missing model. |
 | **[Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS)** (Talker + MTP Predictor) | `qwen3_tts` | Multilingual TTS, instructable voice design, 9 default speakers (CustomVoice) | ✅ Stage 17b: codec → PCM ported (Stage 17) + ECAPA-TDNN speaker encoder (Stage 17b), both adapted from `CrispStrobe/CrispASR` (MIT). 4 of 5 modes wired end-to-end when fed the codec sidecar GGUF and talker with `speaker.*` tensors; voice_clone fails fast only when the speaker encoder tensors are absent; streaming fails fast. |
 | **[ACE-Step](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF)** (DiT + LM) | `ace_step` | Music generation (text-conditional, lyrics) | ✅ Text-to-Music fully wired end-to-end; 5 other modes fail fast. |
 
@@ -377,11 +377,11 @@ Returns `{"status": "ok"}`.
 |---|---|
 | **Source** | [OpenMOSS-Team/MOSS-TTS](https://huggingface.co/OpenMOSS-Team/MOSS-TTS), [pwilkin/openmoss](https://github.com/pwilkin/openmoss) |
 | **Backbone** | Qwen3-8B (GGUF, via the unified `qwen3::Runner` over llama.cpp) |
-| **Audio codec** | 32-RVQ delay-pattern sampling. **Stage 16:** codec-token → PCM decoder is a ggml port of `openmoss/src/codec.cpp` (Apache-2.0) at `src/models/moss_tts/codec.cpp`. Auto-activates when the GGUF carries `moss.codec.*` tensors (e.g. `smcleod/MOSS-TTS-v1.5-GGUF` sidecar); community backbone-only GGUFs fall back to 1 s silence.. |
+| **Audio codec** | 32-RVQ delay-pattern sampling. Codec-token → PCM decoder is a ggml port of `openmoss/src/codec.cpp` (Apache-2.0) at `src/models/moss_tts/codec.cpp`. Binds automatically when the GGUF carries `moss.codec.*` tensors (e.g. `smcleod/MOSS-TTS-v1.5-GGUF` sidecar). The codec encoder is also ported and drives `voice_clone` (real WAV → codes → splice). Missing codec tensors is a hard error, not a silence fallback. |
 | **Sampling** | Delay-pattern autoregressive: top-k, top-p, temperature, repetition penalty (via `audiocore::sampler`) |
 | **Output** | 24 kHz mono PCM |
 | **Weight formats** | Single GGUF (community), sidecar pair (`X.gguf` + `X.extras.gguf`, smcleod/MOSS-TTS-v1.5-GGUF), or backbone GGUF + `.npy` embedding/lm_head dirs |
-| **Status** | ✅ Stage 16: generation + codec decode work end-to-end with codec-bearing weights. Silence fallback otherwise. |
+| **Status** | ✅ End-to-end verified: `test_moss_e2e` (TTS, RMS 0.160), `test_moss_voice_clone_e2e` (38.8 s output, RMS 0.185), streaming (~1.3 s cold-start then 80 ms/frame). |
 | **Reference** | `pwilkin/openmoss` (C++, Apache-2.0) — parity target for byte-identical audio; pre-built sidecar GGUFs at `smcleod/MOSS-TTS-v1.5-GGUF` |
 
 GGUF tensor map: see the family `loader.cpp` and `tools/inspect_gguf`.
