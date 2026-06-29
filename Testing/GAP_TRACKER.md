@@ -543,6 +543,107 @@ Ranked by "how much of the fraud surface area" the fix removes:
 | 6 | ACE-Step | `mode=repaint` (in-paint a region) | ✅ FIXED (rev 5) — full HOT-Step port: correct channel layout, stride=P patchify, latent-space Euler, per-step repaint injection | `session.cpp` (rev 5 rewrite) |
 | 7 | Qwen3 | `mode=voice_design` (VoiceDesign 1.7B) | Base talker with instruct-prefix | `session.cpp:120–124, 244–252` |
 
+## Appendix C: Bespoke setup — things that must be done manually
+
+These are one-time (or repeated-on-update) steps that are NOT automated by
+the build system. If a new dev clones this repo or the weights are re-downloaded,
+these steps must be re-run or the tests will fail.
+
+### C.1 ACE-Step LM / TE conversion (HF → llama.cpp tensor names)
+
+The ACE-Step LM and Text-Encoder GGUFs ship from upstream in HuggingFace
+PyTorch naming (`model.embed_tokens.weight`, `model.layers.N.*`). libllama
+rejects these. The `convert_acestep` tool rewrites the names in-place.
+
+**When to run**: any time a new LM or TE checkpoint is downloaded from upstream.
+
+**Checkpoints that need conversion** (DiT and VAE do NOT — they use GgufReader):
+
+| Source file (HF format) | Converted output | Status |
+|---|---|---|
+| `/mnt/data/models/audio/acestep-cpp/acestep-5Hz-lm-1.7B-Q8_0.gguf` | `weights/ace_step/ace-step-1.5-turbo/acestep-5Hz-lm-1.7B-Q8_0.gguf` | ✅ Done 2026-06-29 |
+| `/mnt/data/models/audio/acestep-cpp/acestep-5Hz-lm-4B-Q8_0.gguf` | `weights/ace_step/acestep-5Hz-lm-4B-Q8_0.gguf` | ✅ Done 2026-06-30 |
+| `/mnt/data/models/audio/acestep-cpp/Qwen3-Embedding-0.6B-Q8_0.gguf` | `weights/ace_step/ace-step-1.5-turbo/Qwen3-Embedding-0.6B-Q8_0.gguf` | ✅ Done 2026-06-29 |
+
+**Commands**:
+```sh
+# 1.7B LM (turbo default dir)
+build/convert_acestep \
+  /mnt/data/models/audio/acestep-cpp/acestep-5Hz-lm-1.7B-Q8_0.gguf \
+  weights/ace_step/ace-step-1.5-turbo/acestep-5Hz-lm-1.7B-Q8_0.gguf
+
+# 4B LM
+build/convert_acestep \
+  /mnt/data/models/audio/acestep-cpp/acestep-5Hz-lm-4B-Q8_0.gguf \
+  weights/ace_step/acestep-5Hz-lm-4B-Q8_0.gguf
+
+# TE (Qwen3-Embedding)
+build/convert_acestep \
+  /mnt/data/models/audio/acestep-cpp/Qwen3-Embedding-0.6B-Q8_0.gguf \
+  weights/ace_step/ace-step-1.5-turbo/Qwen3-Embedding-0.6B-Q8_0.gguf
+```
+
+Use `build/convert_acestep <input> --dry-run` first to verify the rename table.
+
+### C.2 ACE-Step per-variant test directories
+
+`test_acestep_e2e` needs one directory containing all four GGUFs. The DiT
+variants live on a different filesystem (`/mnt/data`) from the converted
+LM/TE/VAE (`weights/`), so we can't hardlink — symlinks are used.
+
+**Re-create after a fresh clone** (one-time, not committed because symlinks
+target absolute paths on this machine):
+
+```sh
+BASE=Testing/variant-tests
+SHARED=weights/ace_step/ace-step-1.5-turbo
+SRC=/mnt/data/models/audio/acestep-cpp
+
+for variant in sft xl-base xl-sft xl-turbo; do
+    mkdir -p "$BASE/acestep-v15-$variant"
+    ln -sf "$SRC/acestep-v15-$variant-Q8_0.gguf" \
+           "$BASE/acestep-v15-$variant/acestep-v15-$variant-Q8_0.gguf"
+    ln -f "$SHARED/acestep-5Hz-lm-1.7B-Q8_0.gguf" "$BASE/acestep-v15-$variant/"
+    ln -f "$SHARED/Qwen3-Embedding-0.6B-Q8_0.gguf" "$BASE/acestep-v15-$variant/"
+    ln -f "$SHARED/vae-BF16.gguf"                  "$BASE/acestep-v15-$variant/"
+done
+
+# lm-4B test dir (uses converted 4B LM + default turbo DiT)
+mkdir -p "$BASE/lm-4B"
+ln -f "$SHARED/acestep-v15-turbo-Q8_0.gguf"      "$BASE/lm-4B/"
+ln -f "$SHARED/Qwen3-Embedding-0.6B-Q8_0.gguf"   "$BASE/lm-4B/"
+ln -f "$SHARED/vae-BF16.gguf"                    "$BASE/lm-4B/"
+ln -f weights/ace_step/acestep-5Hz-lm-4B-Q8_0.gguf "$BASE/lm-4B/"
+```
+
+**Run tests**:
+```sh
+# Individual variant (use ACESTEP_DIR):
+ACESTEP_DIT_VARIANT=xl-turbo ACESTEP_DIR=Testing/variant-tests/acestep-v15-xl-turbo \
+  build/tests/test_acestep_e2e
+
+# 4B LM:
+ACESTEP_LM_VARIANT=4B ACESTEP_DIR=Testing/variant-tests/lm-4B \
+  build/tests/test_acestep_e2e
+```
+
+### C.3 Qwen3-TTS conversion (future)
+
+The Qwen3-TTS codec (`tokenizer-f16.gguf`) and additional talker variants
+have not been converted. When they are downloaded, use `build/convert_qwen3tts`
+(analogous to `convert_acestep`). No bespoke work needed yet — only the q8_0
+talker is currently tested.
+
+### C.4 MOSS-SoundEffect-v2 (future)
+
+Raw safetensors are at `/mnt/data/models/audio/moss-soundeffect-v2/`. No
+converter exists yet. When built, it will require:
+1. A Python safetensors→GGUF converter (analogous to `convert_acestep`).
+2. A new `MossSfxRunner` class (DiT + Flow Matching, different from the
+   Delay backbone).
+
+---
+
 ## Appendix B: Dormant-weight inventory
 
 Weights that exist on local disk but are loaded by **no** test:
