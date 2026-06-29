@@ -31,6 +31,7 @@
 
 #include "audiocore/framework/core/backend.h"
 #include "audiocore/framework/core/session.h"
+#include "audiocore/framework/runtime/discovery.h"
 #include "audiocore/framework/runtime/registry.h"
 #include "audiocore/models/ace_step/family.h"
 #include "audiocore/models/moss_tts/family.h"
@@ -74,6 +75,10 @@ struct ServerConfig {
     int port = 8080;
     int device = 0;
     int threads = 1;
+    // llama.cpp-style auto-discovery root. When `models` is empty and this
+    // is set, the server walks the directory and registers one model per
+    // subdir whose name matches a registered family. See discovery.h.
+    std::string model_dir;
     std::vector<ConfigModel> models;
 };
 
@@ -101,29 +106,34 @@ bool load_config(const std::string& path, ServerConfig& out) {
     out.port   = j.value("port", out.port);
     out.device = j.value("device", out.device);
     out.threads= j.value("threads", out.threads);
-    if (!j.contains("models") || !j["models"].is_array()) {
-        std::fprintf(stderr, "config missing 'models' array\n");
-        return false;
-    }
-    for (const auto& m : j["models"]) {
-        ConfigModel cm;
-        cm.id       = m.value("id", "");
-        cm.family   = m.value("family", "");
-        cm.path     = m.value("path", "");
-        cm.backend  = m.value("backend", cm.backend);
-        if (m.contains("voice_path"))
-            cm.load_options.voice_path = m["voice_path"].get<std::string>();
-        if (m.contains("language"))
-            cm.load_options.language = m["language"].get<std::string>();
-        if (m.contains("extras") && m["extras"].is_object()) {
-            for (auto& [key, val] : m["extras"].items())
-                cm.load_options.extras[key] = val.get<std::string>();
-        }
-        if (cm.id.empty() || cm.family.empty() || cm.path.empty()) {
-            std::fprintf(stderr, "model entry missing id/family/path\n");
+    out.model_dir = j.value("model_dir", "");
+    // `models` is optional when `model_dir` is set — discovery fills it in
+    // after load_config returns. If `models` IS present it must be an array.
+    if (j.contains("models")) {
+        if (!j["models"].is_array()) {
+            std::fprintf(stderr, "config 'models' must be an array\n");
             return false;
         }
-        out.models.push_back(std::move(cm));
+        for (const auto& m : j["models"]) {
+            ConfigModel cm;
+            cm.id       = m.value("id", "");
+            cm.family   = m.value("family", "");
+            cm.path     = m.value("path", "");
+            cm.backend  = m.value("backend", cm.backend);
+            if (m.contains("voice_path"))
+                cm.load_options.voice_path = m["voice_path"].get<std::string>();
+            if (m.contains("language"))
+                cm.load_options.language = m["language"].get<std::string>();
+            if (m.contains("extras") && m["extras"].is_object()) {
+                for (auto& [key, val] : m["extras"].items())
+                    cm.load_options.extras[key] = val.get<std::string>();
+            }
+            if (cm.id.empty() || cm.family.empty() || cm.path.empty()) {
+                std::fprintf(stderr, "model entry missing id/family/path\n");
+                return false;
+            }
+            out.models.push_back(std::move(cm));
+        }
     }
     return true;
 }
@@ -132,19 +142,51 @@ bool load_config(const std::string& path, ServerConfig& out) {
 
 int main(int argc, char** argv) {
     std::string config_path;
+    std::string model_dir_override;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--config" && i + 1 < argc) config_path = argv[++i];
+        if (a == "--config" && i + 1 < argc)        config_path        = argv[++i];
+        else if (a == "--model-dir" && i + 1 < argc) model_dir_override = argv[++i];
     }
     if (config_path.empty()) {
-        std::fprintf(stderr, "usage: %s --config server.json\n", argv[0]);
+        std::fprintf(stderr,
+            "usage: %s --config server.json [--model-dir /path]\n", argv[0]);
         return 1;
     }
 
     ServerConfig cfg;
     if (!load_config(config_path, cfg)) return 1;
 
+    // CLI override beats JSON. Lets operators point at a different models
+    // root without editing the config (mirrors llama.cpp's flag precedence).
+    if (!model_dir_override.empty()) cfg.model_dir = model_dir_override;
+
     register_all_families();   // pulls in moss_tts, ace_step, …
+
+    // Auto-discovery: only fires when no explicit models are configured.
+    // Preserves today's explicit-config behavior and only adds a new mode.
+    // The per-family loaders do their own file resolution within each
+    // discovered directory, so we only need to pick the right FAMILY per
+    // subdir (see discovery.cpp).
+    if (cfg.models.empty() && !cfg.model_dir.empty()) {
+        std::string err;
+        auto discovered = audiocore::discover_models(cfg.model_dir, &err);
+        if (!err.empty()) {
+            std::fprintf(stderr, "discovery: %s\n", err.c_str());
+            return 1;
+        }
+        for (auto& d : discovered) {
+            ConfigModel cm;
+            cm.id           = std::move(d.id);
+            cm.family       = std::move(d.family);
+            cm.path         = std::move(d.path);
+            cm.backend      = std::move(d.backend);
+            cm.load_options = std::move(d.load_options);
+            cfg.models.push_back(std::move(cm));
+        }
+        std::fprintf(stderr, "audiocore_server: discovered %zu model(s) under %s\n",
+                     cfg.models.size(), cfg.model_dir.c_str());
+    }
 
     // Instantiate one Session per configured model id. Each lives behind a
     // mutex so concurrent requests on the same model serialize.

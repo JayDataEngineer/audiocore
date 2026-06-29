@@ -8,8 +8,8 @@ is the only implementation language.
 | Model | Family | Capabilities | Status |
 |---|---|---|---|
 | **[MOSS-TTS](https://github.com/pwilkin/openmoss)** (8B) | `moss_tts` | TTS, voice cloning, streaming; (sfx/dialogue/voice_design/realtime fail fast — need dedicated checkpoints we don't ship) | ✅ Flagship backbone fully wired end-to-end with the upstream prompt template and the openmoss codec (`pwilkin/openmoss`, Apache-2.0). `tts` + `voice_clone` + `streaming` verified against real weights. Modes that need separate MOSS checkpoints (TTSD, VoiceGenerator, SoundEffect, Realtime) fail fast with an error naming the missing model. |
-| **[Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS)** (Talker + MTP Predictor) | `qwen3_tts` | Multilingual TTS, instructable voice design, 9 default speakers (CustomVoice) | ✅ Stage 17b: codec → PCM ported (Stage 17) + ECAPA-TDNN speaker encoder (Stage 17b), both adapted from `CrispStrobe/CrispASR` (MIT). 4 of 5 modes wired end-to-end when fed the codec sidecar GGUF and talker with `speaker.*` tensors; voice_clone fails fast only when the speaker encoder tensors are absent; streaming fails fast. |
-| **[ACE-Step](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF)** (DiT + LM) | `ace_step` | Music generation (text-conditional, lyrics) | ✅ Text-to-Music fully wired end-to-end; 5 other modes fail fast. |
+| **[Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS)** (Talker + MTP Predictor) | `qwen3_tts` | Multilingual TTS, style instruct, voice cloning, streaming | ✅ Talker + Code Predictor run through the unified `qwen3::Runner`; 16-codebook codec and ECAPA-TDNN speaker encoder are ggml ports of `CrispStrobe/CrispASR` (MIT). TTS (incl. style-instruct), Voice Clone, and Streaming are wired end-to-end. Voice Design fails fast — it needs the dedicated `Qwen3-TTS-12Hz-1.7B-VoiceDesign` checkpoint, which is not shipped. |
+| **[ACE-Step](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF)** (DiT + LM) | `ace_step` | Music generation (text-conditional, lyrics), repaint, completion, cover | ✅ `text_to_music` + `repaint` + `completion` + `cover` verified end-to-end across all six DiT checkpoints and both LM sizes (`test_acestep_e2e`, RMS ≈ 0.0229). `stem` and `lego` fail fast — they need a separate Demucs-style stem assembler that is not shipped. |
 
 Run `audiocore_cli --list-supported` for the live mode matrix.
 
@@ -392,11 +392,12 @@ GGUF tensor map: see the family `loader.cpp` and `tools/inspect_gguf`.
 |---|---|
 | **Source** | [QwenLM/Qwen3-TTS](https://huggingface.co/QwenLM/Qwen3-TTS) |
 | **Backbone** | Talker (qwen3tts arch) + Code Predictor (qwen3tts_cp), both via the unified `qwen3::Runner` with `load_extras(ExtraKind::Talker/Predictor)` |
-| **Audio codec** | 16-codebook matrix (1 coarse + 15 MTP fine). Codec-token → PCM decoder is `Qwen3TtsCodecGraphs` in `src/models/qwen3_tts/codec.cpp` (Stage 17, adapted from `CrispStrobe/CrispASR` MIT). Auto-binds when the codec sidecar GGUF is discovered (`extras["codec_path"]` or `tokenizer-{f16,q8_0}.gguf` next to the talker); silence fallback otherwise. Pre-built GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`.. Speaker embedding via ECAPA-TDNN (`src/models/qwen3_tts/speaker_encoder.cpp`, Stage 17b) for Voice Clone — loaded from `speaker.*` tensors in the talker GGUF. |
+| **Audio codec** | 16-codebook matrix (1 coarse + 15 MTP fine). Codec-token → PCM decoder is `Qwen3TtsCodecGraphs` in `src/models/qwen3_tts/codec.cpp` (adapted from `CrispStrobe/CrispASR`, MIT). Auto-binds when the codec sidecar GGUF is discovered (`extras["codec_path"]` or `tokenizer-{f16,q8_0}.gguf` next to the talker); pre-built GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`. Missing codec is a hard error. |
+| **Speaker encoder** | ECAPA-TDNN at `src/models/qwen3_tts/speaker_encoder.cpp` (adapted from CrispASR, MIT). Loads from `speaker.*` tensors in the talker GGUF; drives Voice Clone by extracting a 192-d embedding from a reference WAV. Missing encoder tensors is a hard error for Voice Clone. |
 | **Sampling** | Top-p / temperature via `audiocore::sampler`; MTP predictor uses the same sampler for fine-codebook draws |
 | **Output** | 24 kHz mono PCM |
 | **Weight formats** | Two GGUFs (talker + predictor) produced by `tools/convert_qwen3tts` from the official safetensors; pre-built codec GGUF from `cstr/qwen3-tts-tokenizer-12hz-GGUF` (no conversion) |
-| **Status** | ✅ Stage 17b: talker + predictor load and run; codec → PCM ported (Stage 17); ECAPA-TDNN speaker encoder ported for Voice Clone (Stage 17b); auto-bind for both; silence / fail-fast fallbacks |
+| **Status** | ✅ End-to-end verified: TTS (incl. style-instruct), Voice Clone, and Streaming (`test_qwen3tts_e2e` against Lunavox/CrispASR-derived talker + 12 Hz codec sidecar). Voice Design fails fast — dedicated checkpoint not shipped. |
 | **Reference** | `QwenLM/Qwen3-TTS` (Python) — parity target. Codec + ECAPA parity: `CrispStrobe/CrispASR` (C++, MIT) |
 
 ### ACE-Step (`ace_step`)
@@ -407,7 +408,7 @@ GGUF tensor map: see the family `loader.cpp` and `tools/inspect_gguf`.
 | **Pipeline** | Text encoder (Qwen3-Embedding) → 5Hz LM (Qwen3-1.7B/4B) → DiT → VAE |
 | **Components** | 4 separate GGUFs (DiT, LM, TE, VAE) |
 | **Output** | 48 kHz stereo PCM |
-| **Status** | 🚧 Weight loading + family registration done. `run_lm()` and `run_dit_and_vae()` are scaffolds returning "not yet wired". |
+| **Status** | ✅ End-to-end verified: Text-to-Music (`test_acestep_e2e`, RMS ≈ 0.0229) across all six DiT checkpoints (v1.5 turbo/sft, XL base/sft/turbo) and both LM sizes (1.7B, 4B). `repaint`, `completion`, and `cover` modes ported from HOT-Step (correct `[src|mask|xt]` channel layout, stride=P patchify, latent-space Euler, per-step repaint injection + boundary blend). `stem` and `lego` modes fail fast — they need a separate Demucs-style stem assembler that is not shipped. |
 | **Reference** | `ServeurpersoCom/acestep.cpp` (single-purpose C++ server) |
 
 > **Note**: ACE-Step ships with HuggingFace-style tensor names. The

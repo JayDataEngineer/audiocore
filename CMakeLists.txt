@@ -63,6 +63,10 @@ add_library(audiocore_framework STATIC
     src/framework/core/backend.cpp
     src/framework/core/session.cpp
     src/framework/runtime/registry.cpp
+    # llama.cpp-style --model-dir auto-discovery. Walks a directory and
+    # emits one DiscoveredModel per subdir whose name matches a registered
+    # family. See discovery.h for the layout contract.
+    src/framework/runtime/discovery.cpp
     # Manifest reader — powers `audiocore_cli --list-supported` and the
     # server's future server.json validator. Reads models/manifest.json,
     # the same file scripts/fetch_models.sh consumes.

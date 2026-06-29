@@ -1,10 +1,11 @@
 {
-  "_comment": "Container-friendly default audiocore server config. Ships with NO models so 'docker run -e AUDIOCORE_ALLOW_EMPTY=1 audiocore' boots cleanly for smoke tests. To actually serve requests, mount real GGUF weights under /models and override this file with a populated server.json (see examples/server.json in the repo).",
+  "_comment": "Container-friendly default audiocore server config. Auto-discovers models under /models by default — drop subdirs named moss-tts/, qwen3-tts/, ace-step/ there and they load automatically. Override 'models' with an explicit list to take manual control; see examples/server.json for the schema.",
 
   "host":   "0.0.0.0",
   "port":   8080,
   "device": 0,
   "threads": 4,
 
+  "model_dir": "/models",
   "models": []
 }
