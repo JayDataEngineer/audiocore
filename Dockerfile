@@ -67,6 +67,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libmp3lame0 \
+        libgomp1 \
         ca-certificates \
         curl \
         tini \
