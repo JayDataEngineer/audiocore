@@ -4,13 +4,10 @@
 //   Download GGUFs from:
 //     https://huggingface.co/wkwong/Lunavox-Qwen3-TTS-GGUF  (talker + predictor)
 //     https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF  (codec sidecar)
-//   Or use the default paths:
-//     /mnt/data/models/audio/qwen3-tts/talker.q5_k.gguf
-//     /mnt/data/models/audio/qwen3-tts/predictor.q8_0.gguf
-//     /mnt/data/models/audio/qwen3-tts/tokenizer-q8_0.gguf
+//   Place them in any directory and point QWEN3TTS_DIR at it.
 //
 // Environment variables:
-//   QWEN3TTS_DIR        Model directory           (default: /mnt/data/models/audio/qwen3-tts)
+//   QWEN3TTS_DIR        Model directory           (REQUIRED — test skips if unset)
 //   QWEN3TTS_TALKER     Talker filename           (default: talker.q5_k.gguf)
 //   QWEN3TTS_PREDICTOR  Predictor filename        (default: predictor.q8_0.gguf)
 //   QWEN3TTS_CODEC      Codec sidecar filename    (default: tokenizer-q8_0.gguf)
@@ -34,7 +31,13 @@ int main() {
     audiocore_register_qwen3_tts();
 
     const char* env_dir  = std::getenv("QWEN3TTS_DIR");
-    std::string model_dir = env_dir ? env_dir : "/mnt/data/models/audio/qwen3-tts/";
+    if (!env_dir) {
+        std::fprintf(stderr,
+            "[SKIP] set QWEN3TTS_DIR to the directory holding the Qwen3-TTS "
+            "talker/predictor/codec GGUFs to run this e2e test\n");
+        return 0;
+    }
+    std::string model_dir = env_dir;
 
     const char* env_talker = std::getenv("QWEN3TTS_TALKER");
     std::string talker_fn  = env_talker ? env_talker : "talker.q5_k.gguf";
