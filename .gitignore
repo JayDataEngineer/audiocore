@@ -28,8 +28,22 @@ __pycache__/
 # Model weights directory (downloaded, not source)
 weights/
 
-# Secrets
+# Secrets — never commit real tokens. Ship only *.env.example templates.
 config/secrets.env
+*.env
+!config/*.env.example
+!examples/*.env.example
+
+# Internal notes / scratch docs (private to the maintainer; never ship).
+notes/
+
+# CTest artifacts and machine-local weight symlinks (created on demand by
+# notes/GAP_TRACKER.md appendix C.2; paths target /mnt/data on this machine).
+Testing/
+
+# Stray Python tooling scratch (compare_ui.py during experiments).
+tools/compare/__pycache__/
+tools/compare/*.pyc
 
 # Swap files
 *.swp
