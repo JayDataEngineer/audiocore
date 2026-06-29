@@ -1,0 +1,70 @@
+# gitleaks configuration for audiocore.
+#
+# Custom rules + the upstream default rule set (covers OpenAI, AWS, GCP,
+# GitHub PATs, generic high-entropy secrets, etc.). Project-specific
+# allowlist at the bottom.
+#
+# Local usage:
+#   gitleaks detect --source . --config .gitleaks.toml --verbose --redact
+#
+# Pre-push hook: scripts/install-git-hooks.sh
+
+title = "audiocore"
+
+[extend]
+useDefault = true
+
+# ─── Custom rules ────────────────────────────────────────────────────────
+# Rules the upstream default set does NOT ship (audiocore handles HuggingFace
+# tokens to pull model weights — these are the highest-value secret in this
+# repo, so they get an explicit rule).
+
+[[rules]]
+id = "huggingface-access-token"
+description = "Hugging Face User Access Token (hf_…)"
+# HuggingFace tokens are `hf_` + 34 alphanumeric chars (user tokens). Org /
+# fine-grained tokens use the same prefix with similar length. The 30–40
+# window covers the observed formats without matching short arbitrary
+# base64 fragments that happen to start with hf_.
+regex = '''\bhf_[A-Za-z0-9]{30,40}\b'''
+keywords = ["hf_"]
+entropy = 3.0
+
+    [[rules.allowlists]]
+    description = "obvious placeholders used in *.env.example templates"
+    regexes = [
+        '''hf_[a-z_]*here''',
+        '''hf_your[_a-z0-9]*''',
+        '''hf_x{3,}''',
+        '''hf_redacted''',
+        '''hf_placeholder''',
+    ]
+
+[[rules]]
+id = "huggingface-org-api-key"
+description = "Hugging Face organization API key (api_org_…)"
+regex = '''\bapi_org_[A-Za-z0-9]{30,40}\b'''
+keywords = ["api_org_"]
+entropy = 3.0
+
+# ─── Allowlist ───────────────────────────────────────────────────────────
+
+[allowlist]
+description = "audiocore allowlist — vendored deps, build artifacts, example templates"
+
+# Paths we never want to scan (vendored deps carry their own test fixtures,
+# build/ is generated, *.env.example templates carry placeholders by design).
+paths = [
+    '''third_party/.*''',
+    '''build(-debug)?/.*''',
+    '''cmake-build-.*/.*''',
+    '''\.git/.*''',
+    '''config/secrets\.env\.example''',
+    '''examples/.*\.env\.example''',
+    '''.gitleaks\.toml''',
+]
+
+# Allowlist commit shas go here if a historical false positive ever needs to
+# be permitted. Format: full 40-char sha.
+# commits = ["abc123..."]
+
