@@ -42,8 +42,7 @@ notes/
 Testing/
 
 # Stray Python tooling scratch (compare_ui.py during experiments).
-tools/compare/__pycache__/
-tools/compare/*.pyc
+tools/compare/
 
 # Swap files
 *.swp
