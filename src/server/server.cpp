@@ -153,14 +153,19 @@ std::shared_ptr<httplib::Server> build_server(
         tr.mode            = body.value("mode", "tts");
         tr.speed           = body.value("speed", 1.0f);
         tr.instruct        = body.value("instruct", "");
+        tr.quality         = body.value("quality", "");
         tr.speaker_name    = body.value("speaker", "");
         tr.reference_audio = body.value("reference_audio", "");
         tr.reference_text  = body.value("reference_text", "");
-        if (body.contains("seed"))           tr.seed           = body["seed"].get<int32_t>();
-        if (body.contains("temperature"))    tr.temperature    = body["temperature"].get<float>();
-        if (body.contains("top_p"))          tr.top_p          = body["top_p"].get<float>();
-        if (body.contains("max_new_tokens")) tr.max_new_tokens = body["max_new_tokens"].get<int32_t>();
-        if (body.contains("max_tokens"))     tr.max_new_tokens = body["max_tokens"].get<int32_t>();
+        if (body.contains("seed"))             tr.seed             = body["seed"].get<int32_t>();
+        if (body.contains("temperature"))      tr.temperature      = body["temperature"].get<float>();
+        if (body.contains("top_p"))            tr.top_p            = body["top_p"].get<float>();
+        if (body.contains("text_temperature")) tr.text_temperature = body["text_temperature"].get<float>();
+        if (body.contains("text_top_p"))       tr.text_top_p       = body["text_top_p"].get<float>();
+        if (body.contains("text_top_k"))       tr.text_top_k       = body["text_top_k"].get<int32_t>();
+        if (body.contains("duration_tokens"))  tr.duration_tokens  = body["duration_tokens"].get<int32_t>();
+        if (body.contains("max_new_tokens"))   tr.max_new_tokens   = body["max_new_tokens"].get<int32_t>();
+        if (body.contains("max_tokens"))       tr.max_new_tokens   = body["max_tokens"].get<int32_t>();
         // Parse multi-turn messages (OpenAI-compatible format)
         if (body.contains("messages") && body["messages"].is_array()) {
             for (const auto& m : body["messages"]) {
@@ -346,15 +351,20 @@ std::shared_ptr<httplib::Server> build_server(
         tr.mode            = body.value("mode", "tts");
         tr.speed           = body.value("speed", 1.0f);
         tr.instruct        = body.value("instruct", "");
+        tr.quality         = body.value("quality", "");
         tr.speaker_name    = body.value("speaker", "");
         tr.reference_audio = body.value("reference_audio", "");
         tr.reference_text  = body.value("reference_text", "");
         tr.response_format = body.value("response_format", "wav");
-        if (body.contains("seed"))           tr.seed           = body["seed"].get<int32_t>();
-        if (body.contains("temperature"))    tr.temperature    = body["temperature"].get<float>();
-        if (body.contains("top_p"))          tr.top_p          = body["top_p"].get<float>();
-        if (body.contains("max_new_tokens")) tr.max_new_tokens = body["max_new_tokens"].get<int32_t>();
-        if (body.contains("max_tokens"))     tr.max_new_tokens = body["max_tokens"].get<int32_t>();
+        if (body.contains("seed"))             tr.seed             = body["seed"].get<int32_t>();
+        if (body.contains("temperature"))      tr.temperature      = body["temperature"].get<float>();
+        if (body.contains("top_p"))            tr.top_p            = body["top_p"].get<float>();
+        if (body.contains("text_temperature")) tr.text_temperature = body["text_temperature"].get<float>();
+        if (body.contains("text_top_p"))       tr.text_top_p       = body["text_top_p"].get<float>();
+        if (body.contains("text_top_k"))       tr.text_top_k       = body["text_top_k"].get<int32_t>();
+        if (body.contains("duration_tokens"))  tr.duration_tokens  = body["duration_tokens"].get<int32_t>();
+        if (body.contains("max_new_tokens"))   tr.max_new_tokens   = body["max_new_tokens"].get<int32_t>();
+        if (body.contains("max_tokens"))       tr.max_new_tokens   = body["max_tokens"].get<int32_t>();
         if (body.contains("messages") && body["messages"].is_array()) {
             for (const auto& m : body["messages"]) {
                 ChatMessage cm;

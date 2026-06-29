@@ -72,8 +72,17 @@ struct TtsRequest {
     // ── Output format ──
     std::string response_format = "wav"; // "wav" | "mp3"
 
-    // ── Family-specific knobs ──
-    std::string mode = "tts";          // MOSS: "tts" | "sfx" | "voice_clone"
+    // ── MOSS-specific knobs ──
+    std::string mode = "tts";          // MOSS: "tts" | "voice_clone"
+    std::string quality;               // MOSS: free-text quality hint (empty = "None")
+    int32_t     duration_tokens = 0;   // MOSS: duration hint in codec frames (0 = "None"; 1s ≈ 12.5)
+
+    // ── Per-family text-column sampling (MOSS exposes independent text/audio params) ──
+    float       text_temperature = 0.0f;  // 0 → use family default (MOSS: 1.5)
+    float       text_top_p       = 0.0f;  // 0 → use family default (MOSS: 1.0)
+    int32_t     text_top_k       = 0;     // 0 → use family default (MOSS: 50)
+
+    // ── Qwen3-TTS knob ──
     float       speed = 1.0f;          // Qwen3-TTS: speed multiplier
 };
 

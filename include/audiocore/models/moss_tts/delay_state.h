@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <random>
 #include <vector>
 
 namespace audiocore::moss {
@@ -35,6 +36,7 @@ struct SamplingConfig {
     float audio_top_p = 0.8f;
     int   audio_top_k = 25;
     float audio_repetition_penalty = 1.0f;
+    std::mt19937 rng{std::random_device{}()};   // seeded in run_tts from req->seed
 };
 
 // ── Delay state (batch_size=1) ────────────────────────────────────────────
@@ -57,10 +59,11 @@ DelayState init_delay_state(const std::vector<std::vector<int32_t>>& prompt);
 // Execute one autoregressive step. Returns (1+N_VQ) next token IDs.
 //   text_logits:  (vocab_size,) — llama text logits at last position
 //   audio_logits: (N_VQ, audio_vocab_size+1) — per-stream audio logits
+// config is taken by non-const reference because the rng inside it advances.
 std::vector<int32_t> delay_step(DelayState& state,
                                 const float* text_logits, int32_t text_vocab,
                                 const float* audio_logits, int32_t audio_vocab,
-                                const SamplingConfig& config);
+                                SamplingConfig& config);
 
 // Remove delay pattern from generated audio codes.
 // delay_codes: (T_delayed, N_VQ) — the audio channels from generation

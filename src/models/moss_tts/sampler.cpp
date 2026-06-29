@@ -15,15 +15,16 @@ int32_t sample_token(const float* logits, int32_t vocab_size,
                      const int32_t* prev_tokens, int32_t n_prev,
                      float repetition_penalty,
                      float top_p, int top_k,
-                     bool do_sample) {
+                     bool do_sample,
+                     std::mt19937* rng) {
     sampler::Params p;
-    p.temperature        = 1.0f;   // MOSS path applies no temperature scaling
+    p.temperature        = 1.0f;   // MOSS path applies temperature scaling before calling
     p.top_p              = top_p;
     p.top_k              = top_k;
     p.repetition_penalty = repetition_penalty;
     p.do_sample          = do_sample;
     return sampler::sample_token(logits, vocab_size, p,
-                                 prev_tokens, n_prev);
+                                 prev_tokens, n_prev, rng);
 }
 
 void sample_audio_tokens(const float* logits, int32_t n_streams, int32_t vocab_size,

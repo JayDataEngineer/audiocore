@@ -93,7 +93,7 @@ DelayState init_delay_state(const std::vector<std::vector<int32_t>>& prompt) {
 std::vector<int32_t> delay_step(DelayState& state,
                                 const float* text_logits, int32_t text_vocab,
                                 const float* audio_logits, int32_t audio_vocab,
-                                const SamplingConfig& config) {
+                                SamplingConfig& config) {
     std::vector<int32_t> result(1 + N_VQ);
 
     if (state.is_stopping) {
@@ -144,7 +144,7 @@ std::vector<int32_t> delay_step(DelayState& state,
         next_text = sample_token(scaled.data(), text_vocab,
                                  nullptr, 0,  // no rep penalty for text
                                  1.0f, config.text_top_p, config.text_top_k,
-                                 do_sample);
+                                 do_sample, &config.rng);
     }
 
     if (next_text == AUDIO_START_TOKEN_ID)
@@ -207,7 +207,7 @@ std::vector<int32_t> delay_step(DelayState& state,
                                          static_cast<int32_t>(prev_for_stream.size()),
                                          config.audio_repetition_penalty,
                                          config.audio_top_p, config.audio_top_k,
-                                         do_sample);
+                                         do_sample, &config.rng);
         }
     }
 
