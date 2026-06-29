@@ -146,7 +146,7 @@ that pairs the speaker embedding with ref-text AND ref-codes for improved
 clone fidelity — Stage 18 added the xvec_only ICL path (ref-text via text_proj,
 injected between spk and codec_bos), which gives the talker phonetic context.
 The full ICL path with ref-codes (requiring the codec encoder to produce them
-locally from the reference WAV) remains unported.
+locally from the reference WAV) is now ported (Phase B).
 
 ---
 
@@ -306,8 +306,7 @@ families, after Stages 9–19:
 - 🚧 blocked on major port: **1** (ACE-Step stem/lego — separate
   Demucs-class model)
 - 📋 reference impl identified, port scoped: **0** (all ported) — minor
-  refinements remain: full ICL prefill builder (ref-text + ref-codes) for
-  improved Voice Clone fidelity; MOSS dialogue multi-turn input surface
+  refinements remain: MOSS dialogue multi-turn input surface
 
 Stage 9 closed the entire IaC bucket. Stages 10–12 flipped six
 modes from ❌ to 🟡 (Qwen3-TTS voice_design, MOSS dialogue, MOSS
@@ -321,9 +320,7 @@ streaming for both MOSS and Qwen3-TTS.**
 
 The remaining work is concentrated in the following place:
 
-1. **Full ICL prefill builder** — Voice Clone now supports the xvec_only
-   ICL path (Stage 18: ref-text phonetic context via text_proj). The full
-   ICL (in-context learning) path with ref-codes pairs the embedding with
-   both ref-text AND ref-codes for improved clone fidelity, as CrispASR's
-   `build_icl_prefill_embeds` implements. Requires the codec encoder to
-   produce ref-codes locally from the reference WAV.
+1. **Full ICL prefill builder** — ✅ Now supports both xvec_only (Stage 18)
+   and full ICL with ref-codes (Phase B). The codec encoder port (§4.8)
+   produces ref-codes from the reference WAV; `run_inference()` fuses them
+   into the talker prefill between ref_text and codec_bos.

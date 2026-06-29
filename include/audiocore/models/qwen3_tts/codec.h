@@ -101,6 +101,14 @@ public:
     };
     HP hp;
 
+    // ── Encode (WAV → code tokens) ──────────────────────────────────────
+    // Encode 24 kHz mono PCM into (n_q=16, T_frames) code matrix row-major.
+    // Requires encoder tensors in the GGUF (`codec.enc.*`). Returns empty
+    // vector when encoder tensors are absent.
+    std::vector<int32_t> encode(const float* pcm, int32_t n_samples);
+
+    bool has_encoder() const { return enc_present_; }
+
 private:
     struct XfmrLayer {
         ggml_tensor* attn_norm_w = nullptr;
@@ -145,6 +153,38 @@ private:
         ggml_tensor* tconv_b = nullptr;
         ResUnit     res[3]   = {};
     };
+
+    // ── Encoder (codec.enc.*) ───────────────────────────────────────────
+    struct EncConv { ggml_tensor* w = nullptr; ggml_tensor* b = nullptr; };
+    struct EncResBlk { EncConv shortcut; EncConv expand; };
+    struct EncSEANet {
+        EncConv    init;              // k=7, 1→64
+        EncResBlk  resblk[4];         // stages 0..3
+        EncConv    ds[4];             // stride convs 4,5,6,8
+        EncConv    final;             // k=3, 1024→512
+    } enc_seanet_;
+    struct EncXfmrLayer {
+        ggml_tensor* norm1_w = nullptr; ggml_tensor* norm1_b = nullptr;
+        ggml_tensor* norm2_w = nullptr; ggml_tensor* norm2_b = nullptr;
+        ggml_tensor* attn_q_w = nullptr; ggml_tensor* attn_k_w = nullptr;
+        ggml_tensor* attn_v_w = nullptr; ggml_tensor* attn_o_w = nullptr;
+        ggml_tensor* attn_ls  = nullptr;
+        ggml_tensor* fc1_w    = nullptr;  // 512→2048
+        ggml_tensor* fc2_w    = nullptr;  // 2048→512
+        ggml_tensor* ffn_ls   = nullptr;
+    };
+    std::vector<EncXfmrLayer> enc_xfmr_layers_;
+    struct EncDownsample {
+        ggml_tensor* w = nullptr;  // stride-2, k=4
+    } enc_ds_;
+    struct EncRVQ {
+        ggml_tensor* sem_in_w = nullptr;   // 512→256
+        ggml_tensor* sem_cb   = nullptr;   // [2048, 256]
+        ggml_tensor* ac_in_w  = nullptr;   // 512→256
+        ggml_tensor* ac_cb[15] = {};
+    } enc_rvq_;
+
+    bool enc_present_ = false;
 
     // ── State ───────────────────────────────────────────────────────────
     bool            present_    = false;
@@ -211,6 +251,18 @@ private:
                            const XfmrLayer& L) const;
     static ggml_tensor* make_causal_mask_(ggml_context* ctx, int64_t T);
     static void         fill_causal_mask_(ggml_tensor* mask);
+
+    // ── Encoder helpers ─────────────────────────────────────────────────
+    void resolve_cenc_tensors_();
+    ggml_tensor* build_cenc_seanet_(ggml_context* ctx, ggml_tensor* pcm) const;
+    ggml_tensor* build_cenc_xfmr_(ggml_context* ctx, ggml_tensor* x,
+                                   int32_t T_enc) const;
+    ggml_tensor* build_cenc_downsample_(ggml_context* ctx, ggml_tensor* x) const;
+    bool cenc_rvq_encode_(const float* emb, int32_t T_frames,
+                          std::vector<int32_t>* codes_out) const;
+    static ggml_tensor* cenc_conv1d_ext_(ggml_context* ctx, ggml_tensor* x,
+                                          ggml_tensor* w, ggml_tensor* b,
+                                          int stride, bool pad_replicate);
 };
 
 }  // namespace audiocore::qwen3_tts

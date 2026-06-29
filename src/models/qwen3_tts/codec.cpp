@@ -217,6 +217,7 @@ bool Qwen3TtsCodecGraphs::bind(ggml_context* source_ctx,
     }
     try {
         resolve_tensors_();
+        resolve_cenc_tensors_();
         parse_hp_from_kv_();
     } catch (const std::exception& e) {
         if (error) *error = std::string("Qwen3TtsCodecGraphs::bind: ") + e.what();
@@ -629,6 +630,310 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
 
     ggml_free(ctx);
     return wav;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Encoder: tensor resolution
+// ═════════════════════════════════════════════════════════════════════════════
+
+void Qwen3TtsCodecGraphs::resolve_cenc_tensors_() {
+    EncSEANet& E = enc_seanet_;
+    E.init.w = tensor_or_null_("codec.enc.seanet.init_w");
+    E.init.b = tensor_or_null_("codec.enc.seanet.init_b");
+    E.final.w = tensor_or_null_("codec.enc.seanet.final_w");
+    E.final.b = tensor_or_null_("codec.enc.seanet.final_b");
+    for (int i = 0; i < 4; ++i) {
+        const std::string p = "codec.enc.seanet.blk." + std::to_string(i) + ".";
+        E.resblk[i].shortcut.w = tensor_or_null_(p + "short_w");
+        E.resblk[i].shortcut.b = tensor_or_null_(p + "short_b");
+        E.resblk[i].expand.w   = tensor_or_null_(p + "exp_w");
+        E.resblk[i].expand.b   = tensor_or_null_(p + "exp_b");
+        E.ds[i].w = tensor_or_null_(p + "ds." + std::to_string(i) + ".w");
+        E.ds[i].b = tensor_or_null_(p + "ds." + std::to_string(i) + ".b");
+    }
+    if (!E.init.w) { enc_present_ = false; return; }
+
+    enc_xfmr_layers_.resize(8);
+    for (size_t i = 0; i < enc_xfmr_layers_.size(); ++i) {
+        const std::string p = "codec.enc.xfmr.blk." + std::to_string(i) + ".";
+        EncXfmrLayer& L = enc_xfmr_layers_[i];
+        L.norm1_w  = tensor_(p + "norm1_w");  L.norm1_b = tensor_or_null_(p + "norm1_b");
+        L.norm2_w  = tensor_(p + "norm2_w");  L.norm2_b = tensor_or_null_(p + "norm2_b");
+        L.attn_q_w = tensor_(p + "attn_q_w"); L.attn_k_w = tensor_(p + "attn_k_w");
+        L.attn_v_w = tensor_(p + "attn_v_w"); L.attn_o_w = tensor_(p + "attn_o_w");
+        L.attn_ls  = tensor_or_null_(p + "attn_ls");
+        L.fc1_w    = tensor_(p + "fc1_w");
+        L.fc2_w    = tensor_(p + "fc2_w");
+        L.ffn_ls   = tensor_or_null_(p + "ffn_ls");
+    }
+
+    enc_ds_.w = tensor_or_null_("codec.enc.ds_w");
+
+    enc_rvq_.sem_in_w = tensor_or_null_("codec.enc.rvq.sem.in_w");
+    enc_rvq_.sem_cb   = tensor_or_null_("codec.enc.rvq.sem.cb");
+    enc_rvq_.ac_in_w  = tensor_or_null_("codec.enc.rvq.ac.in_w");
+    for (int q = 0; q < 15; ++q)
+        enc_rvq_.ac_cb[q] = tensor_or_null_("codec.enc.rvq.ac." + std::to_string(q) + ".cb");
+
+    enc_present_ = true;
+}
+
+// ── cenc_conv1d_ext: replicate-padded conv1d ───────────────────────────────
+ggml_tensor* Qwen3TtsCodecGraphs::cenc_conv1d_ext_(ggml_context* ctx,
+                                                     ggml_tensor* x,
+                                                     ggml_tensor* w,
+                                                     ggml_tensor* b,
+                                                     int stride,
+                                                     bool pad_replicate) {
+    if (pad_replicate && w) {
+        const int K = (int)w->ne[0];
+        const int T = (int)x->ne[1];
+        const int pad = K - 1;
+        ggml_tensor* padded = ggml_new_tensor_2d(ctx, x->type, T + 2 * pad, x->ne[0]);
+        ggml_set_name(padded, "cenc_padded");
+        ggml_set_input(padded);
+        x = padded;
+    }
+    if (!w) return x;
+    x = ggml_conv_1d(ctx, x, w, 0, 1, stride);
+    if (b) x = ggml_add(ctx, x, b);
+    return x;
+}
+
+// ── build_cenc_seanet: SEANet encoder graph ────────────────────────────────
+ggml_tensor* Qwen3TtsCodecGraphs::build_cenc_seanet_(ggml_context* ctx,
+                                                       ggml_tensor* pcm) const {
+    const EncSEANet& E = enc_seanet_;
+    ggml_tensor* h = causal_conv1d_(ctx, pcm, E.init.w, E.init.b, 1, 1);
+    h = ggml_elu(ctx, h);
+    for (int i = 0; i < 4; ++i) {
+        ggml_tensor* r = causal_conv1d_(ctx, h, E.resblk[i].shortcut.w,
+                                         E.resblk[i].shortcut.b, 1, 1);
+        ggml_tensor* e = ggml_conv_1d(ctx, h, E.resblk[i].expand.w, 0, 1, 1);
+        if (E.resblk[i].expand.b) e = ggml_add(ctx, e, E.resblk[i].expand.b);
+        h = ggml_add(ctx, r, e);
+        h = ggml_elu(ctx, h);
+        const int s = (i == 0) ? 4 : (i == 1) ? 5 : (i == 2) ? 6 : 8;
+        h = causal_conv1d_(ctx, h, E.ds[i].w, E.ds[i].b, s, 1);
+        h = ggml_elu(ctx, h);
+    }
+    h = causal_conv1d_(ctx, h, E.final.w, E.final.b, 1, 1);
+    return h;
+}
+
+// ── build_cenc_xfmr: encoder transformer ───────────────────────────────────
+ggml_tensor* Qwen3TtsCodecGraphs::build_cenc_xfmr_(ggml_context* ctx,
+                                                     ggml_tensor* x,
+                                                     int32_t T_enc) const {
+    std::vector<int32_t> pos_vals;
+    pos_vals.resize(size_t(T_enc));
+    for (int32_t i = 0; i < T_enc; ++i) pos_vals[size_t(i)] = i;
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_enc);
+    ggml_set_name(positions, "cenc_pos");
+    ggml_set_input(positions);
+
+    ggml_tensor* mask = make_causal_mask_(ctx, T_enc);
+    ggml_set_name(mask, "cenc_mask");
+    ggml_set_input(mask);
+
+    const int hd = (int)hp.head_dim;
+    const int n_q = (int)hp.n_heads;
+    const int n_ctx_o = (int)hp.max_pos;
+    const float theta = hp.rope_theta;
+    const float scale = 1.0f / std::sqrt((float)hd);
+
+    for (size_t il = 0; il < enc_xfmr_layers_.size(); ++il) {
+        const EncXfmrLayer& L = enc_xfmr_layers_[il];
+        ggml_tensor* residual = x;
+
+        ggml_tensor* a = ggml_norm(ctx, x, hp.rms_norm_eps);
+        a = ggml_mul(ctx, a, L.norm1_w);
+        if (L.norm1_b) a = ggml_add(ctx, a, L.norm1_b);
+        {
+            const int64_t T = a->ne[1];
+            ggml_tensor* Qv = ggml_mul_mat(ctx, L.attn_q_w, a);
+            ggml_tensor* Kv = ggml_mul_mat(ctx, L.attn_k_w, a);
+            ggml_tensor* Vv = ggml_mul_mat(ctx, L.attn_v_w, a);
+            Qv = ggml_reshape_3d(ctx, Qv, hd, n_q, T);
+            Kv = ggml_reshape_3d(ctx, Kv, hd, n_q, T);
+            Vv = ggml_reshape_3d(ctx, Vv, hd, n_q, T);
+            Qv = ggml_rope_ext(ctx, Qv, positions, nullptr, hd,
+                               GGML_ROPE_TYPE_NEOX, n_ctx_o, theta,
+                               1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            Kv = ggml_rope_ext(ctx, Kv, positions, nullptr, hd,
+                               GGML_ROPE_TYPE_NEOX, n_ctx_o, theta,
+                               1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            Qv = ggml_cont(ctx, ggml_permute(ctx, Qv, 0, 2, 1, 3));
+            Kv = ggml_cont(ctx, ggml_permute(ctx, Kv, 0, 2, 1, 3));
+            Vv = ggml_cont(ctx, ggml_permute(ctx, Vv, 0, 2, 1, 3));
+            ggml_tensor* attn = ggml_flash_attn_ext(ctx, Qv, Kv, Vv, mask, scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+            attn = ggml_reshape_2d(ctx, attn, hd * n_q, T);
+            a = ggml_mul_mat(ctx, L.attn_o_w, attn);
+        }
+        if (L.attn_ls) a = ggml_mul(ctx, a, L.attn_ls);
+        x = ggml_add(ctx, residual, a);
+
+        residual = x;
+        ggml_tensor* f = ggml_norm(ctx, x, hp.rms_norm_eps);
+        f = ggml_mul(ctx, f, L.norm2_w);
+        if (L.norm2_b) f = ggml_add(ctx, f, L.norm2_b);
+        f = ggml_mul_mat(ctx, L.fc1_w, f);
+        f = ggml_gelu(ctx, f);
+        f = ggml_mul_mat(ctx, L.fc2_w, f);
+        if (L.ffn_ls) f = ggml_mul(ctx, f, L.ffn_ls);
+        x = ggml_add(ctx, residual, f);
+    }
+    return x;
+}
+
+// ── build_cenc_downsample: stride-2 conv with replicate padding ────────────
+ggml_tensor* Qwen3TtsCodecGraphs::build_cenc_downsample_(ggml_context* ctx,
+                                                           ggml_tensor* x) const {
+    if (!enc_ds_.w) return x;
+    return cenc_conv1d_ext_(ctx, x, enc_ds_.w, nullptr, 2, true);
+}
+
+// ── cenc_rvq_encode: CPU RVQ quantize ──────────────────────────────────────
+bool Qwen3TtsCodecGraphs::cenc_rvq_encode_(const float* emb, int32_t T_frames,
+                                             std::vector<int32_t>* codes_out) const {
+    if (!enc_rvq_.sem_in_w || !enc_rvq_.sem_cb || !enc_rvq_.ac_in_w) return false;
+    for (int q = 0; q < 15; ++q) if (!enc_rvq_.ac_cb[q]) return false;
+
+    codes_out->resize(size_t(16) * size_t(T_frames), 0);
+    constexpr int d_half = 256;
+    constexpr int C_emb = 512;
+
+    auto rvq_nn = [](const float* z, const float* cb, int cb_size, int dim) -> int {
+        int best = 0;
+        float best_d = 0.0f;
+        for (int i = 0; i < cb_size; ++i) {
+            float d = 0.0f;
+            for (int j = 0; j < dim; ++j) {
+                float diff = z[j] - cb[size_t(i) * size_t(dim) + j];
+                d += diff * diff;
+            }
+            if (i == 0 || d < best_d) { best_d = d; best = i; }
+        }
+        return best;
+    };
+
+    auto matmul = [](const float* x, const float* w, int C_in, int C_out,
+                     int T, float* out) {
+        for (int t = 0; t < T; ++t) {
+            for (int o = 0; o < C_out; ++o) {
+                float s = 0.0f;
+                for (int i = 0; i < C_in; ++i)
+                    s += x[size_t(t) * size_t(C_in) + i] *
+                         w[size_t(o) + size_t(i) * size_t(C_out)];
+                out[size_t(t) * size_t(C_out) + o] = s;
+            }
+        }
+    };
+
+    // Transpose emb from [C, T] to [T, C] for CPU matmul
+    std::vector<float> emb_T(size_t(T_frames) * C_emb);
+    for (int t = 0; t < T_frames; ++t)
+        for (int c = 0; c < C_emb; ++c)
+            emb_T[size_t(t) * C_emb + c] = emb[size_t(c) * T_frames + t];
+
+    std::vector<float> z(size_t(T_frames) * d_half);
+
+    // Semantic book (codebook 0): project 512->256, NN search
+    const float* siw = (const float*)enc_rvq_.sem_in_w->data;
+    const int sid = (int)enc_rvq_.sem_in_w->ne[1];
+    const int sod = (int)enc_rvq_.sem_in_w->ne[0];
+    matmul(emb_T.data(), siw, sid, sod, T_frames, z.data());
+    const float* scb = (const float*)enc_rvq_.sem_cb->data;
+    const int scs = (int)enc_rvq_.sem_cb->ne[0];
+    for (int t = 0; t < T_frames; ++t)
+        (*codes_out)[t] = rvq_nn(&z[size_t(t) * d_half], scb, scs, d_half);
+
+    // Acoustic books (1..15): project 512->256, residual NN search
+    const float* aiw = (const float*)enc_rvq_.ac_in_w->data;
+    const int aid = (int)enc_rvq_.ac_in_w->ne[1];
+    const int aod = (int)enc_rvq_.ac_in_w->ne[0];
+    matmul(emb_T.data(), aiw, aid, aod, T_frames, z.data());
+
+    for (int q = 1; q < 16; ++q) {
+        const int q_idx = q - 1;
+        const float* cb = (const float*)enc_rvq_.ac_cb[q_idx]->data;
+        const int cbs = (int)enc_rvq_.ac_cb[q_idx]->ne[0];
+        for (int t = 0; t < T_frames; ++t) {
+            int code = rvq_nn(&z[size_t(t) * d_half], cb, cbs, d_half);
+            (*codes_out)[size_t(q) * T_frames + t] = code;
+            // Subtract quantized embedding from residual
+            for (int j = 0; j < d_half; ++j)
+                z[size_t(t) * d_half + j] -= cb[size_t(code) * d_half + j];
+        }
+    }
+    return true;
+}
+
+// ── encode: PCM 24kHz → [16, T_frames] codes row-major ─────────────────────
+std::vector<int32_t> Qwen3TtsCodecGraphs::encode(const float* pcm,
+                                                   int32_t n_samples) {
+    if (!enc_present_ || !pcm || n_samples <= 0) return {};
+
+    // Round n_samples down to nearest multiple of 960 (SEANet stride product)
+    const int T_pad = (n_samples + 959) / 960 * 960;
+    const int T_enc = T_pad / 960;
+
+    // Build encoder compute graph
+    ggml_context* ctx = nullptr;
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 64ull * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ctx = ggml_init(params);
+    if (!ctx) throw std::runtime_error("Qwen3TtsCodecGraphs::encode: ggml_init failed");
+
+    struct ggml_tensor* pcm_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_pad, 1);
+    ggml_set_name(pcm_t, "cenc_pcm");
+    ggml_set_input(pcm_t);
+
+    ggml_tensor* h = build_cenc_seanet_(ctx, pcm_t);
+    h = build_cenc_xfmr_(ctx, h, T_enc);
+    h = build_cenc_downsample_(ctx, h);
+    // h is [latent_dim=512, T_frames] after downsample
+    ggml_set_name(h, "cenc_out");
+    ggml_set_output(h);
+
+    // Build compute graph
+    ggml_cgraph* graph = ggml_new_graph_custom(ctx, 65536, false);
+    ggml_build_forward_expand(graph, h);
+
+    // Allocate + compute
+    if (!ggml_gallocr_alloc_graph(galloc_, graph)) {
+        ggml_free(ctx);
+        throw std::runtime_error("Qwen3TtsCodecGraphs::encode: gallocr_alloc_graph failed");
+    }
+    ggml_backend_tensor_set(pcm_t, pcm, 0, size_t(n_samples) * sizeof(float));
+    if (T_pad > n_samples) {
+        std::vector<float> zero(size_t(T_pad - n_samples), 0.0f);
+        ggml_backend_tensor_set(pcm_t, zero.data(),
+                                size_t(n_samples) * sizeof(float),
+                                size_t(T_pad - n_samples) * sizeof(float));
+    }
+    if (ggml_backend_graph_compute(backend_, graph) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        throw std::runtime_error("Qwen3TtsCodecGraphs::encode: graph_compute failed");
+    }
+
+    // Read output
+    const int64_t T_frames = h->ne[1];
+    const int64_t C_latent = h->ne[0];
+    std::vector<float> h_cpu(size_t(C_latent) * size_t(T_frames));
+    ggml_backend_tensor_get(h, h_cpu.data(), 0, h_cpu.size() * sizeof(float));
+
+    ggml_free(ctx);
+
+    // RVQ quantize to codes
+    std::vector<int32_t> codes;
+    if (!cenc_rvq_encode_(h_cpu.data(), (int32_t)T_frames, &codes))
+        return {};
+    return codes;
 }
 
 }  // namespace audiocore::qwen3_tts
