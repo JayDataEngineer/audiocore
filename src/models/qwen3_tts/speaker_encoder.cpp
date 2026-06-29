@@ -81,10 +81,6 @@ std::vector<float> Qwen3TtsSpeakerEncoder::load_wav(const std::string& path,
             channels = (int)ch;
             bits = (int)bps;
         } else if (std::memcmp(id, "data", 4) == 0) {
-            if (sr != 24000) {
-                if (error) *error = "reference audio must be 24 kHz, got " + std::to_string(sr) + " Hz";
-                cleanup(); return {};
-            }
             const int n_frames = (int)(sz / (channels * (bits / 8)));
             samples.reserve((size_t)n_frames);
             if (bits == 16) {
@@ -120,6 +116,22 @@ std::vector<float> Qwen3TtsSpeakerEncoder::load_wav(const std::string& path,
         if (error) *error = "no audio data found in WAV";
         return {};
     }
+
+    // Resample to 24 kHz if needed (linear interpolation)
+    if (sr != 24000 && sr > 0) {
+        const int n_dst = (int)((double)samples.size() * 24000.0 / sr);
+        std::vector<float> resampled((size_t)n_dst);
+        for (int i = 0; i < n_dst; i++) {
+            double pos = (double)i * sr / 24000.0;
+            int i0 = (int)pos;
+            int i1 = std::min(i0 + 1, (int)samples.size() - 1);
+            double frac = pos - i0;
+            resampled[(size_t)i] = (float)(samples[(size_t)i0] * (1.0 - frac)
+                                         + samples[(size_t)i1] * frac);
+        }
+        samples.swap(resampled);
+    }
+
     return samples;
 }
 

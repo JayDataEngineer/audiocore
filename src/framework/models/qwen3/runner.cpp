@@ -164,17 +164,17 @@ std::unique_ptr<Runner> Runner::load(const std::string& gguf_path,
 }
 
 // Build a llama_batch ready for llama_decode with embd OR token input,
-// positions starting at n_pos, and EVERY position marked for output. We use
-// llama_batch_init (not _get_one) so the logits/output flags are properly
-// allocated; this is required to read embeddings/logits for all rows.
-//
-// `is_embd` switches between embd (float*) and token (llama_token*) input.
+// positions starting at n_pos. By default every position is marked for
+// output so callers can read per-row logits/embeddings. Pass
+// `last_only=true` to mark only the final position for output — used for
+// intermediate prefill chunks where intermediate hidden states are not needed.
 static llama_batch make_batch(int32_t n_tokens, int32_t n_pos, bool is_embd,
-                              const float* embd, const llama_token* tokens) {
+                              const float* embd, const llama_token* tokens,
+                              bool last_only = false) {
     llama_batch b = llama_batch_init(n_tokens,
                                      /*embd=*/ is_embd ? 1 : 0,
                                      /*n_seq_max=*/ 1);
-    b.n_tokens = n_tokens;  // llama_batch_init allocates storage but leaves n_tokens=0
+    b.n_tokens = n_tokens;
     if (is_embd) {
         b.token = nullptr;
         b.embd  = const_cast<float*>(embd);
@@ -182,11 +182,11 @@ static llama_batch make_batch(int32_t n_tokens, int32_t n_pos, bool is_embd,
         b.token = const_cast<llama_token*>(tokens);
         b.embd  = nullptr;
     }
-    // Positions: contiguous from n_pos.
     for (int32_t i = 0; i < n_tokens; i++) b.pos[i] = n_pos + i;
-    // Mark every position for output so we can read per-row logits/embd.
-    for (int32_t i = 0; i < n_tokens; i++) b.logits[i] = 1;
-    // Default each token to sequence 0.
+    // Mark output positions. last_only=true: only the final row is live,
+    // which avoids allocating/computing output for prefill chunks.
+    for (int32_t i = 0; i < n_tokens; i++)
+        b.logits[i] = (!last_only || i == n_tokens - 1) ? 1 : 0;
     for (int32_t i = 0; i < n_tokens; i++) {
         b.n_seq_id[i] = 1;
         b.seq_id[i][0] = 0;
@@ -196,29 +196,52 @@ static llama_batch make_batch(int32_t n_tokens, int32_t n_pos, bool is_embd,
 
 bool Runner::forward_embeddings(const float* embd, int32_t n_tokens, int32_t n_pos,
                                 float* hidden, std::string* error) {
-    llama_batch b = make_batch(n_tokens, n_pos, /*is_embd=*/true, embd, nullptr);
-    const int32_t n_embd = hidden_size_;
-    bool ok = (llama_decode(ctx_, b) == 0);
-    if (!ok) {
-        if (error) *error = "llama_decode failed";
-    } else {
-        for (int32_t i = 0; i < n_tokens && ok; i++) {
-            const float* row = llama_get_embeddings_ith(ctx_, i);
-            if (!row) {
-                if (error) *error = "llama_get_embeddings_ith failed";
-                ok = false;
-                break;
-            }
-            std::memcpy(hidden + static_cast<size_t>(i) * n_embd, row,
-                        static_cast<size_t>(n_embd) * sizeof(float));
+    // Chunk the prefill when n_tokens exceeds n_batch. The KV cache is
+    // accumulated across chunks; only the last position's hidden state is
+    // returned (all callers only use hidden[(n_tokens-1)*n_embd]).
+    // Intermediate chunks use last_only=true to avoid allocating output
+    // buffers for positions whose hidden states are never read.
+    // Use n_ubatch (physical micro-batch) as the chunk ceiling: that's what
+    // sizes the output buffer that llama_get_embeddings_ith indexes into.
+    // n_batch (logical) may be much larger (e.g. == n_ctx) but submitting a
+    // chunk larger than n_ubatch would push output indices out of range.
+    const int32_t n_batch = static_cast<int32_t>(llama_n_ubatch(ctx_));
+    const int32_t n_embd  = hidden_size_;
+
+    for (int32_t chunk_start = 0; chunk_start < n_tokens; ) {
+        const int32_t chunk_size = std::min(n_batch, n_tokens - chunk_start);
+        const bool    is_last    = (chunk_start + chunk_size == n_tokens);
+        const float*  chunk_embd = embd + static_cast<size_t>(chunk_start) * n_embd;
+
+        llama_batch b = make_batch(chunk_size, n_pos + chunk_start,
+                                   /*is_embd=*/true, chunk_embd, nullptr,
+                                   /*last_only=*/true);
+        const bool ok = (llama_decode(ctx_, b) == 0);
+        b.token = nullptr;
+        b.embd  = nullptr;
+        if (!ok) {
+            llama_batch_free(b);
+            if (error) *error = "llama_decode failed (prefill chunk)";
+            return false;
         }
+
+        // Only copy the last position's hidden state, and only from the
+        // final chunk (that's the only slot callers actually read).
+        if (is_last && hidden) {
+            const float* row = llama_get_embeddings_ith(ctx_, chunk_size - 1);
+            if (!row) {
+                llama_batch_free(b);
+                if (error) *error = "forward_embeddings: llama_get_embeddings_ith failed (prefill chunk)";
+                return false;
+            }
+            std::memcpy(hidden + static_cast<size_t>(n_tokens - 1) * n_embd,
+                        row, static_cast<size_t>(n_embd) * sizeof(float));
+        }
+
+        llama_batch_free(b);
+        chunk_start += chunk_size;
     }
-    // make_batch overrode b.embd (and/or b.token) to point at OUR data.
-    // Null them so llama_batch_free doesn't free caller-owned memory.
-    b.token = nullptr;
-    b.embd  = nullptr;
-    llama_batch_free(b);
-    return ok;
+    return true;
 }
 
 bool Runner::forward_tokens(const int32_t* tokens, int32_t n_tokens, int32_t n_pos,
@@ -356,6 +379,18 @@ bool Runner::is_eog(int32_t token) const {
     const llama_vocab* vocab = model_ ? llama_model_get_vocab(model_) : nullptr;
     if (!vocab) return false;
     return llama_vocab_is_eog(vocab, static_cast<llama_token>(token));
+}
+
+int32_t Runner::bos_token_id() const {
+    const llama_vocab* vocab = model_ ? llama_model_get_vocab(model_) : nullptr;
+    if (!vocab) return 151644;
+    return llama_vocab_bos(vocab);
+}
+
+int32_t Runner::eos_token_id() const {
+    const llama_vocab* vocab = model_ ? llama_model_get_vocab(model_) : nullptr;
+    if (!vocab) return 151645;
+    return llama_vocab_eos(vocab);
 }
 
 bool Runner::apply_chat_template(
@@ -634,6 +669,70 @@ bool Runner::compute_text_embedding(const std::string& text,
     return true;
 }
 
+bool Runner::project_text_tokens(const int32_t* token_ids, int32_t n_tokens,
+                                  float* out_embd, std::string* error) {
+    if (!has_text_embd_) {
+        if (error) *error = "runner: text_embedding tensors not loaded";
+        return false;
+    }
+    if (n_tokens <= 0) return true;
+
+    const int32_t text_dim = text_embd_dim_;
+    const int32_t proj_dim = hidden_size_;
+
+    std::vector<float> raw_embd(static_cast<size_t>(n_tokens) * text_dim);
+    for (int32_t i = 0; i < n_tokens; i++) {
+        const int32_t id = token_ids[static_cast<size_t>(i)];
+        if (id >= 0 && id < text_vocab_) {
+            const float* row = text_embd_ + static_cast<size_t>(id) * text_dim;
+            std::memcpy(&raw_embd[static_cast<size_t>(i) * text_dim], row,
+                        static_cast<size_t>(text_dim) * sizeof(float));
+        } else {
+            std::memset(&raw_embd[static_cast<size_t>(i) * text_dim], 0,
+                        static_cast<size_t>(text_dim) * sizeof(float));
+        }
+    }
+
+    for (int32_t i = 0; i < n_tokens; i++) {
+        const float* x = &raw_embd[static_cast<size_t>(i) * text_dim];
+        float h[2048];
+        if (text_proj_0_w_ && text_proj_0_b_) {
+            for (int j = 0; j < text_dim; j++) {
+                float sum = text_proj_0_b_[j];
+                for (int k = 0; k < text_dim; k++) {
+                    sum += x[k] * text_proj_0_w_[static_cast<size_t>(j) * text_dim + k];
+                }
+                h[j] = sum;
+            }
+        } else {
+            std::memcpy(h, x, static_cast<size_t>(text_dim) * sizeof(float));
+        }
+        for (int j = 0; j < text_dim; j++) {
+            const float v = h[j];
+            h[j] = v / (1.0f + std::exp(-v));
+        }
+
+        float* y = out_embd + static_cast<size_t>(i) * proj_dim;
+        if (text_proj_1_w_ && text_proj_1_b_) {
+            for (int j = 0; j < proj_dim; j++) {
+                float sum = text_proj_1_b_[j];
+                for (int k = 0; k < text_dim; k++) {
+                    sum += h[k] * text_proj_1_w_[static_cast<size_t>(j) * text_dim + k];
+                }
+                y[j] = sum;
+            }
+        } else {
+            std::memcpy(y, h, static_cast<size_t>(proj_dim) * sizeof(float));
+        }
+    }
+    return true;
+}
+
+bool Runner::project_single_token(int32_t token_id, float* out_embd,
+                                   std::string* error) {
+    return project_text_tokens(&token_id, 1, out_embd, error);
+}
+
 // ── Predictor MTP step (predict_one_step) ───────────────────────────────────
 //
 // Ported verbatim from the former PredictorRunner::predict_one_step. At each
@@ -736,6 +835,17 @@ bool Runner::predict_one_step(const float* talker_hidden,
     }
 
     return true;
+}
+
+bool Runner::clear_kv_cache(std::string* error) {
+    llama_memory_t mem = llama_get_memory(ctx_);
+    if (!mem) {
+        if (error) *error = "clear_kv_cache: llama_get_memory returned null";
+        return false;
+    }
+    // Remove all tokens of all sequences (seq_id < 0 = any sequence,
+    // p0 = 0, p1 = -1 = infinity) to effectively clear the KV cache.
+    return llama_memory_seq_rm(mem, -1, 0, -1);
 }
 
 }  // namespace audiocore::qwen3

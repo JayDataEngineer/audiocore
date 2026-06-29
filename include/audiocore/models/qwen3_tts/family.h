@@ -153,6 +153,20 @@ public:
     bool run_tts(const void* request, void* response,
                  std::string* error = nullptr) override;
 
+    // ── Speaker embedding extract / synthesize API ────────────────────────
+    // Compute a speaker embedding from a reference WAV file for later reuse.
+    // Returns the embedding as a float vector (size = d_model, 1024).
+    std::vector<float> extract_speaker_embedding(const std::string& wav_path,
+                                                  std::string* error = nullptr);
+
+    // Synthesize with a pre-computed speaker embedding (bypasses WAV load).
+    // `embedding` must be the output of extract_speaker_embedding or match
+    // the talker's n_embd dimension.
+    bool synthesize_with_embedding(const TtsRequest& req_base,
+                                   const float* embedding, size_t emb_dim,
+                                   TtsResponse& resp,
+                                   std::string* error = nullptr);
+
 private:
     std::unique_ptr<qwen3::Runner> talker_;     // qwen3tts backbone + dual-embedding extras
     std::unique_ptr<qwen3::Runner> predictor_;  // qwen3tts_cp + MTP extras
