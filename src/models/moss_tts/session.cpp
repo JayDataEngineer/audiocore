@@ -222,9 +222,11 @@ bool MossSession::run_tts(const void* request, void* response,
     std::string system_prompt;
     if (is_sfx) {
         system_prompt = "You are a sound effects generator.";
-    } else if (is_dialogue && req->messages.empty()) {
-        // Default dialogue system prompt when no messages array is provided.
-        // The user's single `text` becomes the opening turn.
+    } else if (is_dialogue) {
+        // Default dialogue system prompt. Used when no messages array (single
+        // `text` becomes the opening turn) OR when messages are provided but
+        // the first message is not a system prompt (the multi-turn branch at
+        // line 245 prepends this as the system message in that case).
         system_prompt =
             "You are a spoken-dialogue assistant. Continue the conversation "
             "the user begins, alternating between speakers with natural "
