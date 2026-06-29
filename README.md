@@ -220,15 +220,21 @@ docker build -t audiocore .
 # CPU image
 docker build -f Dockerfile.cpu -t audiocore:cpu .
 
-# Run — mount weights under /models, override config if you have one
+# Primary workflow — mount weights under /models and the server
+# auto-discovers them at boot (see "Model directory layout" below).
+docker run --gpus all -p 8080:8080 \
+    -v "$PWD/weights:/models:ro" \
+    audiocore
+
+# Override the auto-discovered config with an explicit server.json:
 docker run --gpus all -p 8080:8080 \
     -v "$PWD/weights:/models:ro" \
     -v "$PWD/examples/server.json:/etc/audiocore/server.json:ro" \
     audiocore
 
-# Smoke test with no models mounted (server starts, /health returns 200,
-# /v1/models returns []; useful for verifying the image)
-docker run --rm -p 8080:8080 -e AUDIOCORE_ALLOW_EMPTY=1 audiocore
+# No models mounted — server boots idle (/health → 200, /v1/models → []).
+# Useful for image smoke-tests; /v1/audio/* returns 404 until a model loads.
+docker run --rm -p 8080:8080 audiocore:cpu
 ```
 
 Once `curl http://localhost:8080/health` returns `{"status":"ok"}`, the API is
@@ -237,15 +243,50 @@ vars:
 
 | Mount | Purpose |
 |---|---|
-| `/models` | GGUF weights (read-only) |
-| `/etc/audiocore/server.json` | Override the default config |
+| `/models` | GGUF weights (read-only); auto-discovered at boot |
+| `/etc/audiocore/server.json` | Override the default config (optional) |
 
 | Env | Default | Purpose |
 |---|---|---|
 | `AUDIOCORE_CONFIG` | `/etc/audiocore/server.json` | Path to the config file |
 | `AUDIOCORE_PORT` | `8080` | Used by the in-image `HEALTHCHECK` |
-| `AUDIOCORE_ALLOW_EMPTY` | `0` | Set `1` to fall back to the no-model default config |
 | `LD_LIBRARY_PATH` | `/opt/audiocore/lib` | Where the ggml/llama `.so`s live |
+
+`AUDIOCORE_ALLOW_EMPTY` from older revisions is tolerated but no longer
+required — the shipped default config now auto-discovers `/models` and boots
+idle if nothing is mounted, so it is always safe to seed.
+
+#### Model directory layout
+
+The default config sets `"model_dir": "/models"`. At boot the server walks
+that directory one level deep and registers one model per subdirectory whose
+name matches a registered family (after `kebab-case` → `snake_case`
+normalization). Each family's loader picks its own files within the
+subdirectory — you don't have to enumerate them.
+
+```
+/models/
+  moss-tts/                     → id="moss-tts",        family="moss_tts"
+    moss-tts-q8_0.gguf            (moss_tts loader picks its .gguf itself)
+  qwen3-tts/                    → id="qwen3-tts",       family="qwen3_tts"
+    talker.q5_k.gguf              (loader resolves siblings by name)
+    predictor.q8_0.gguf
+    tokenizer-f16.gguf
+  ace-step/                     → id="ace-step",        family="ace_step"
+    acestep-v15-turbo-*.gguf      (loader finds its 4 GGUFs by pattern)
+    5Hz-lm-1.7B-*.gguf
+    Qwen3-Embedding-*.gguf
+    vae-*.gguf
+```
+
+Subdirectories whose names don't match a registered family are skipped with
+a warning, so a stray `README.md` or unrelated folder won't break boot.
+Discovery only fires when the config's `models` array is empty — an explicit
+`models: [...]` block always takes precedence.
+
+Outside Docker, pass `--model-dir /path` on the server CLI (or set
+`"model_dir": "/path"` in the JSON) to point at a different root. The flag
+overrides the JSON value when both are set.
 
 #### Build knobs
 
