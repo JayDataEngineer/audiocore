@@ -1,20 +1,27 @@
-// discovery.h — llama.cpp-style model directory auto-discovery.
+// discovery.h — llama.cpp-style model resolution.
 //
-// Given a root directory (typically /models in the container, or wherever
-// the user pointed --model-dir), walk it one level deep and emit one
-// DiscoveredModel per subdir whose name matches a registered family.
+// Two entry points, both used by main.cpp at server boot:
 //
-// Resolution is intentionally name-based for v1 — the per-family loaders
-// already do their own file resolution within a directory, so discovery
-// only needs to pick the right FAMILY for each subdir, not the right
-// files. See discovery.cpp for the kebab→snake normalization rules.
+//   discover_models(root)       — --model-dir mode. Walks the root one
+//                                 level deep, emits one DiscoveredModel
+//                                 per subdir whose name matches a
+//                                 registered family.
 //
-// Phase 2 will add loose-*.gguf sniffing (family inferred from GGUF
-// metadata) so a flat /models/foo.gguf also auto-registers.
+//   from_single_path(path)      — --model mode (recommended). Resolves a
+//                                 single file or directory to exactly one
+//                                 DiscoveredModel. Family is inferred from
+//                                 the dirname (directory case) or sniffed
+//                                 from GGUF metadata (file case). This is
+//                                 the llama.cpp server pattern: one model
+//                                 per container, swap by restarting.
+//
+// Per-family loaders already do their own file resolution within a
+// directory, so discovery only picks the right FAMILY — not the files.
 
 #ifndef AUDIOCORE_FRAMEWORK_RUNTIME_DISCOVERY_H
 #define AUDIOCORE_FRAMEWORK_RUNTIME_DISCOVERY_H
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -42,6 +49,28 @@ struct DiscoveredModel {
 // "scanned fine, nothing recognized".
 std::vector<DiscoveredModel> discover_models(const std::string& root_dir,
                                              std::string* error = nullptr);
+
+// Resolve a single model path to one DiscoveredModel — the llama.cpp-style
+// "--model /path" entry point. This is the recommended way to run the
+// server: one model per container, swap by restarting with a different
+// path. Bypasses the JSON models array entirely when set.
+//
+//   model_path is a directory  → id = dirname, family inferred from
+//                                dirname (kebab→snake normalized)
+//   model_path is a .gguf file → id = filename stem, family sniffed from
+//                                GGUF metadata (general.architecture,
+//                                then tensor/KV prefixes)
+//
+// family_override (if non-empty) bypasses both inference paths and is
+// validated against the registry verbatim. Use it for layouts the sniffer
+// can't resolve, or to override a wrong guess.
+//
+// Returns std::nullopt and sets *error on: missing path, undeterminable
+// family, family not in the registry.
+std::optional<DiscoveredModel> from_single_path(
+    const std::string& model_path,
+    const std::string& family_override = "",
+    std::string* error = nullptr);
 
 }  // namespace audiocore
 

@@ -154,11 +154,31 @@ cmake --build build --parallel --target convert_qwen3tts   # Qwen3-TTS safetenso
 
 ### Run the server
 
+**Recommended — `--model` (llama.cpp-style, single model):**
+
 ```bash
-build/bin/audiocore_server --config examples/server.json
+# Family sniffed from the GGUF (or from the directory name):
+build/bin/audiocore_server --config examples/server.json --model /path/to/moss-tts-q8_0.gguf
+build/bin/audiocore_server --config examples/server.json --model /path/to/qwen3-tts/
+
+# Override the family if the sniffer can't decide:
+build/bin/audiocore_server --config examples/server.json --model /path/to/file.gguf --family moss_tts
 ```
 
-Example `server.json` (`examples/server.json`):
+One model per process. To swap, stop the server and restart with a different
+`--model`. The `examples/server.json` config supplies `host` / `port` /
+`device` / `threads` — only one entry is needed even though `models` is an
+array (for backwards compat). When `--model` is set, it overrides any
+`models: [...]` block in the JSON.
+
+**Backwards-compatible — `models: [...]` or `--model-dir`:**
+
+```bash
+build/bin/audiocore_server --config examples/server.json
+build/bin/audiocore_server --config examples/server.json --model-dir /models
+```
+
+`examples/server.json` (`models` array form, still supported):
 
 ```json
 {
@@ -220,16 +240,22 @@ docker build -t audiocore .
 # CPU image
 docker build -f Dockerfile.cpu -t audiocore:cpu .
 
-# Primary workflow — mount weights under /models and the server
-# auto-discovers them at boot (see "Model directory layout" below).
+# Recommended — llama.cpp-style single-model. Mount one model and point
+# --model at it. To swap models, stop the container and restart with a
+# different mount + --model.
 docker run --gpus all -p 8080:8080 \
-    -v "$PWD/weights:/models:ro" \
-    audiocore
+    -v "$PWD/weights/moss-tts-q8_0.gguf:/model.gguf:ro" \
+    audiocore --model /model.gguf
 
-# Override the auto-discovered config with an explicit server.json:
+# Multi-file family (e.g. qwen3-tts needs talker + predictor + codec) —
+# mount the whole directory and pass it to --model:
+docker run --gpus all -p 8080:8080 \
+    -v "$PWD/weights/qwen3-tts:/model:ro" \
+    audiocore --model /model
+
+# Auto-discover everything under /models (one subdir per family):
 docker run --gpus all -p 8080:8080 \
     -v "$PWD/weights:/models:ro" \
-    -v "$PWD/examples/server.json:/etc/audiocore/server.json:ro" \
     audiocore
 
 # No models mounted — server boots idle (/health → 200, /v1/models → []).
