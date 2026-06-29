@@ -152,6 +152,50 @@ cmake --build build --parallel --target convert_qwen3tts   # Qwen3-TTS safetenso
 | `ENGINE_BUILD_SERVER` | ON | `audiocore_server` |
 | `ENGINE_BUILD_TESTS` | OFF | unit + e2e tests |
 
+### Fetch models
+
+audiocore separates **fetch** from **serve** — same pattern as llama.cpp
+(`huggingface-cli download` separate from `llama-server`). The bundled
+`scripts/fetch_models.sh` is the canonical puller: pure bash + curl, no
+Python, no huggingface-cli dependency. It reads `models/manifest.json`
+for repo / revision / sha256, downloads via the HF Hub API, optionally
+runs `convert_acestep` / `convert_qwen3tts` post-process, and verifies
+SHA256 when recorded.
+
+```bash
+# Fetch every family + variant the manifest knows about:
+./scripts/fetch_models.sh
+
+# Fetch just one family:
+./scripts/fetch_models.sh moss_tts
+
+# Fetch one specific variant:
+./scripts/fetch_models.sh moss_tts moss-tts-q4-k-m
+
+# Dry run (show what would be fetched):
+./scripts/fetch_models.sh --dry-run
+
+# List the mode matrix the manifest describes:
+./scripts/fetch_models.sh --list
+```
+
+Environment knobs (also honored inside Docker — see "Docker" below):
+
+| Env | Default | Purpose |
+|---|---|---|
+| `AUDIOCORE_MODELS_DIR` | `./weights/` | **Destination folder for downloaded GGUFs.** Override to target any path. |
+| `AUDIOCORE_BUILD_DIR` | `./build/bin` | Where `convert_*` binaries live |
+| `HF_TOKEN` | unset | Auth for gated repos (passed as `Authorization: Bearer`) |
+
+After fetching, point the server at the downloaded weights with
+`--model`, `--model-dir`, or a `models: [...]` config block.
+
+```bash
+./scripts/fetch_models.sh moss_tts
+build/bin/audiocore_server --config examples/server.json \
+    --model "$AUDIOCORE_MODELS_DIR/moss-tts/MOSS_TTS_Q4_K_M.gguf"
+```
+
 ### Run the server
 
 **Recommended — `--model` (llama.cpp-style, single model):**
@@ -269,7 +313,7 @@ vars:
 
 | Mount | Purpose |
 |---|---|
-| `/models` | GGUF weights (read-only); auto-discovered at boot |
+| `/models` | GGUF weights (auto-discovered at boot; mount **without** `:ro` if you use `AUDIOCORE_PREPULL=1`) |
 | `/etc/audiocore/server.json` | Override the default config (optional) |
 
 | Env | Default | Purpose |
@@ -277,10 +321,50 @@ vars:
 | `AUDIOCORE_CONFIG` | `/etc/audiocore/server.json` | Path to the config file |
 | `AUDIOCORE_PORT` | `8080` | Used by the in-image `HEALTHCHECK` |
 | `LD_LIBRARY_PATH` | `/opt/audiocore/lib` | Where the ggml/llama `.so`s live |
+| `AUDIOCORE_PREPULL` | `0` | Set `1` to run `fetch_models.sh` before the server boots (see below) |
+| `AUDIOCORE_MODELS_DIR` | `/models` | Destination folder for the prepull — **target any path** |
+| `AUDIOCORE_PREPULL_FAMILY` | unset | Restrict prepull to one family (e.g. `moss_tts`) |
+| `AUDIOCORE_PREPULL_VARIANT` | unset | Restrict prepull to one variant (e.g. `moss-tts-q4-k-m`) |
+| `HF_TOKEN` | unset | Auth for gated repos; passed through to `fetch_models.sh` |
 
 `AUDIOCORE_ALLOW_EMPTY` from older revisions is tolerated but no longer
 required — the shipped default config now auto-discovers `/models` and boots
 idle if nothing is mounted, so it is always safe to seed.
+
+#### Boot-time model pull (`AUDIOCORE_PREPULL=1`)
+
+The image ships `scripts/fetch_models.sh` and `models/manifest.json`. Set
+`AUDIOCORE_PREPULL=1` and the entrypoint runs the fetcher before starting
+the server, populating `AUDIOCORE_MODELS_DIR` (default `/models`) and then
+letting auto-discovery pick up the results.
+
+```bash
+# Pull every family the manifest knows about, then serve:
+docker run --gpus all -p 8080:8080 \
+    -e AUDIOCORE_PREPULL=1 \
+    -e HF_TOKEN=hf_xxx \
+    -v audiocore-weights:/models \
+    audiocore
+
+# Pull just one family into a specific host folder:
+docker run --gpus all -p 8080:8080 \
+    -e AUDIOCORE_PREPULL=1 \
+    -e AUDIOCORE_PREPULL_FAMILY=moss_tts \
+    -e AUDIOCORE_MODELS_DIR=/models \
+    -e HF_TOKEN=hf_xxx \
+    -v /data/audiocore/weights:/models \
+    audiocore
+
+# Bypass the prepull and serve whatever is already on disk (the primary
+# workflow once weights are present):
+docker run --gpus all -p 8080:8080 \
+    -v /data/audiocore/weights:/models:ro \
+    audiocore
+```
+
+The prepull runs as the `audiocore` user (UID 10000), so `/models` must be
+writable by that UID — mount without `:ro`. If `fetch_models.sh` exits
+non-zero, the entrypoint refuses to start the server.
 
 #### Model directory layout
 
