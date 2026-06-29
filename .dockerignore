@@ -1,0 +1,46 @@
+# Build artifacts
+build/
+build-debug/
+cmake-build-*/
+
+# Weights and downloaded model files — always mount at runtime, never bake in.
+weights/
+*.gguf
+*.safetensors
+*.onnx
+
+# Object files / intermediate build outputs
+*.o
+*.obj
+*.a
+*.dll
+*.dylib
+
+# Test outputs and scratch
+*.wav
+Testing/
+tools/compare/
+test_*.wav
+
+# Secrets — never bake tokens into an image.
+config/secrets.env
+*.env
+!config/*.env.example
+!examples/*.env.example
+
+# Internal / private
+notes/
+
+# Editor / OS
+.idea/
+.vscode/
+.cache/
+.clangd/
+.DS_Store
+compile_commands.json
+
+# Docker artifacts themselves — keep Dockerfile/.dockerignore buildable.
+# (Docker reads these even if listed, but excluding avoids cache thrash.)
+*.swp
+*.swo
+*~
