@@ -43,6 +43,11 @@ struct AudioStreamCallbacks {
     // Return true to continue generation, false to abort.
     // Thread-safety: called from the family's generation thread.
     std::function<bool(const float* pcm, size_t n_samples)> on_audio;
+
+    // Called to report inference progress. phase is a human-readable
+    // phase name (e.g. "prefill", "ar_decode", "codec_decode"). pct is
+    // 0.0–1.0. Called from the generation thread.
+    std::function<void(const char* phase, float pct, const char* msg)> on_progress;
 };
 
 // ── Text-to-Speech ────────────────────────────────────────────────────────
@@ -64,7 +69,7 @@ struct TtsRequest {
     std::string instruct;              // natural-language style instruction
     std::string reference_audio;       // path to reference audio (Qwen3-TTS base)
     std::string reference_text;        // reference text for ICL cloning
-    std::string speaker_embedding;     // pre-computed embedding (opaque blob)
+    std::vector<float> speaker_embedding;  // pre-computed embedding (float vector, bypasses WAV load)
 
     // ── Streaming ──
     AudioStreamCallbacks* stream = nullptr;  // non-null → enable streaming
@@ -82,8 +87,9 @@ struct TtsRequest {
     float       text_top_p       = 0.0f;  // 0 → use family default (MOSS: 1.0)
     int32_t     text_top_k       = 0;     // 0 → use family default (MOSS: 50)
 
-    // ── Qwen3-TTS knob ──
-    float       speed = 1.0f;          // Qwen3-TTS: speed multiplier
+    // ── Qwen3-TTS knobs ──
+    float       speed = 1.0f;                 // speed multiplier
+    float       repetition_penalty = 1.05f;   // repetition penalty (CB0, HuggingFace style)
 };
 
 struct TtsResponse {

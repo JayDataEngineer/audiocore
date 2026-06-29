@@ -70,7 +70,7 @@ struct ConfigModel {
 };
 
 struct ServerConfig {
-    std::string host = "127.0.0.1";
+    std::string host = "0.0.0.0";
     int port = 8080;
     int device = 0;
     int threads = 1;

@@ -163,9 +163,49 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("text_temperature")) tr.text_temperature = body["text_temperature"].get<float>();
         if (body.contains("text_top_p"))       tr.text_top_p       = body["text_top_p"].get<float>();
         if (body.contains("text_top_k"))       tr.text_top_k       = body["text_top_k"].get<int32_t>();
-        if (body.contains("duration_tokens"))  tr.duration_tokens  = body["duration_tokens"].get<int32_t>();
-        if (body.contains("max_new_tokens"))   tr.max_new_tokens   = body["max_new_tokens"].get<int32_t>();
-        if (body.contains("max_tokens"))       tr.max_new_tokens   = body["max_tokens"].get<int32_t>();
+        if (body.contains("duration_tokens"))     tr.duration_tokens     = body["duration_tokens"].get<int32_t>();
+        if (body.contains("max_new_tokens"))      tr.max_new_tokens      = body["max_new_tokens"].get<int32_t>();
+        if (body.contains("max_tokens"))          tr.max_new_tokens      = body["max_tokens"].get<int32_t>();
+        if (body.contains("repetition_penalty"))  tr.repetition_penalty  = body["repetition_penalty"].get<float>();
+        // Parse pre-computed speaker embedding (base64-encoded float array)
+        if (body.contains("speaker_embedding") && body["speaker_embedding"].is_string()) {
+            std::string b64 = body["speaker_embedding"].get<std::string>();
+            if (!b64.empty()) {
+                static const char kDec[256] = {
+                    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+                    52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,
+                    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+                };
+                std::vector<uint8_t> raw;
+                raw.reserve(b64.size() * 3 / 4);
+                int pad = 0;
+                uint8_t buf[4];
+                int nbuf = 0;
+                for (char c : b64) {
+                    if (c == '=') { pad++; continue; }
+                    int v = kDec[static_cast<uint8_t>(c)];
+                    if (v < 0) continue;
+                    buf[nbuf++] = static_cast<uint8_t>(v);
+                    if (nbuf == 4) {
+                        raw.push_back((buf[0] << 2) | (buf[1] >> 4));
+                        raw.push_back((buf[1] << 4) | (buf[2] >> 2));
+                        raw.push_back((buf[2] << 6) | buf[3]);
+                        nbuf = 0;
+                    }
+                }
+                if (nbuf >= 2) raw.push_back((buf[0] << 2) | (buf[1] >> 4));
+                if (nbuf >= 3) raw.push_back((buf[1] << 4) | (buf[2] >> 2));
+                // Interpret raw bytes as float array (little-endian)
+                size_t n_floats = raw.size() / sizeof(float);
+                tr.speaker_embedding.resize(n_floats);
+                std::memcpy(tr.speaker_embedding.data(), raw.data(), n_floats * sizeof(float));
+            }
+        }
         // Parse multi-turn messages (OpenAI-compatible format)
         if (body.contains("messages") && body["messages"].is_array()) {
             for (const auto& m : body["messages"]) {
@@ -363,8 +403,45 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("text_top_p"))       tr.text_top_p       = body["text_top_p"].get<float>();
         if (body.contains("text_top_k"))       tr.text_top_k       = body["text_top_k"].get<int32_t>();
         if (body.contains("duration_tokens"))  tr.duration_tokens  = body["duration_tokens"].get<int32_t>();
-        if (body.contains("max_new_tokens"))   tr.max_new_tokens   = body["max_new_tokens"].get<int32_t>();
-        if (body.contains("max_tokens"))       tr.max_new_tokens   = body["max_tokens"].get<int32_t>();
+        if (body.contains("max_new_tokens"))      tr.max_new_tokens      = body["max_new_tokens"].get<int32_t>();
+        if (body.contains("max_tokens"))          tr.max_new_tokens      = body["max_tokens"].get<int32_t>();
+        if (body.contains("repetition_penalty"))  tr.repetition_penalty  = body["repetition_penalty"].get<float>();
+        if (body.contains("speaker_embedding") && body["speaker_embedding"].is_string()) {
+            std::string b64 = body["speaker_embedding"].get<std::string>();
+            if (!b64.empty()) {
+                static const char kDec[256] = {
+                    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+                    52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,
+                    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+                };
+                std::vector<uint8_t> raw;
+                raw.reserve(b64.size() * 3 / 4);
+                int nbuf = 0;
+                uint8_t buf[4];
+                for (char c : b64) {
+                    if (c == '=') continue;
+                    int v = kDec[static_cast<uint8_t>(c)];
+                    if (v < 0) continue;
+                    buf[nbuf++] = static_cast<uint8_t>(v);
+                    if (nbuf == 4) {
+                        raw.push_back((buf[0] << 2) | (buf[1] >> 4));
+                        raw.push_back((buf[1] << 4) | (buf[2] >> 2));
+                        raw.push_back((buf[2] << 6) | buf[3]);
+                        nbuf = 0;
+                    }
+                }
+                if (nbuf >= 2) raw.push_back((buf[0] << 2) | (buf[1] >> 4));
+                if (nbuf >= 3) raw.push_back((buf[1] << 4) | (buf[2] >> 2));
+                size_t n_floats = raw.size() / sizeof(float);
+                tr.speaker_embedding.resize(n_floats);
+                std::memcpy(tr.speaker_embedding.data(), raw.data(), n_floats * sizeof(float));
+            }
+        }
         if (body.contains("messages") && body["messages"].is_array()) {
             for (const auto& m : body["messages"]) {
                 ChatMessage cm;

@@ -2,12 +2,14 @@
 //
 // Prompts and the codec-encode path are verbatim ports of
 // pwilkin/openmoss (Apache-2.0) src/pipeline.cpp + src/codec.cpp::encode().
-// The fraud surface documented in Testing/GAP_TRACKER.md §1 (system-prompt
-// impersonation of SFX/VoiceDesign/Dialogue/Realtime modes; .codes binary
-// voice cloning; per-mode fabricated sampling configs; silence fallbacks)
-// has been removed. Unsupported modes now fail fast; voice cloning now reads
-// a WAV and runs the real codec encoder; plain TTS now builds the upstream
-// `<user_inst>` template the model was trained on.
+// Earlier revisions of this file impersonated SFX / VoiceDesign / Dialogue /
+// Realtime modes by routing requests through the flagship backbone with a
+// system-prompt disguise (silently producing off-distribution output), and
+// implemented voice cloning via a `.codes` binary loader. That surface has
+// been removed: unsupported modes now fail fast, voice cloning now reads a
+// WAV and runs the real codec encoder, and plain TTS now builds the upstream
+// `<user_inst>` template the model was trained on. See GAPS.md §1 for the
+// per-mode support matrix.
 //
 // Pipeline:
 //   1. Build the upstream chat prompt:
@@ -40,7 +42,7 @@
 // PCM through the callback. The first frame becomes available after N_VQ
 // delay steps (~1.3 s at 80 ms/frame) — this is the cold-start of the Delay
 // architecture. It is NOT the upstream MossTTSRealtime architecture, which
-// we do not ship (see GAP_TRACKER.md §1.1).
+// we do not ship (see GAPS.md §1.1).
 
 #include "audiocore/models/moss_tts/family.h"
 #include "audiocore/models/moss_tts/projection.h"
@@ -306,7 +308,7 @@ bool MossSession::embed_one_step(const int32_t* tokens,
 //
 // Any other mode (sfx / dialogue / voice_design / realtime) is a request for
 // a model we do not ship. We fail fast with an error that names the missing
-// checkpoint — see Testing/GAP_TRACKER.md §1.2 for the full list.
+// checkpoint — see GAPS.md §1.2 for the full list.
 // ---------------------------------------------------------------------------
 bool MossSession::run_tts(const void* request, void* response,
                           std::string* error) {
@@ -337,7 +339,7 @@ bool MossSession::run_tts(const void* request, void* response,
             "This build only ships the flagship MOSS-TTS backbone, which "
             "implements tts / voice_clone / streaming. The requested mode "
             "needs a dedicated checkpoint that is not loaded — see "
-            "Testing/GAP_TRACKER.md §1.2 for the mapping (sfx→MOSS-SoundEffect, "
+            "GAPS.md §1.2 for the mapping (sfx→MOSS-SoundEffect, "
             "dialogue→MOSS-TTSD, voice_design→MOSS-VoiceGenerator, "
             "realtime→MOSS-TTS-Realtime).";
         return false;

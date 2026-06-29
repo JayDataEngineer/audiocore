@@ -261,8 +261,10 @@ static void test_load_wav_wrong_samplerate() {
 
     std::string err;
     auto loaded = Qwen3TtsSpeakerEncoder::load_wav(path, &err);
-    CHECK(loaded.empty(), "48 kHz WAV returns empty (need 24 kHz)");
-    CHECK(!err.empty(), "error for wrong sample rate");
+    CHECK(!loaded.empty(), "48 kHz WAV resampled to 24 kHz");
+    int expected_len = (int)((double)pcm.size() * 24000.0 / 48000.0);
+    CHECK(std::abs((int)loaded.size() - expected_len) <= 1,
+          "resampled length matches expected");
 }
 
 // =========================================================================

@@ -123,6 +123,16 @@ public:
                                 int32_t* out_n_tokens,
                                 std::string* error = nullptr);
 
+    // Project pre-tokenized IDs through text_embd + text_proj MLP.
+    // Skips tokenization — callers that already have token IDs
+    // (e.g. qwen3_tts encode_for_tts) use this instead of compute_text_embedding.
+    bool project_text_tokens(const int32_t* token_ids, int32_t n_tokens,
+                             float* out_embd, std::string* error = nullptr);
+
+    // Project a single token through text_embd + text_proj MLP.
+    bool project_single_token(int32_t token_id, float* out_embd,
+                              std::string* error = nullptr);
+
     // Codec embedding table ([codec_vocab, n_embd]) and codec head
     // ([codec_vocab, n_embd]) — both anchored on the runner. libllama owns
     // its own internal copy of token_embd/output; these pointers alias the
@@ -171,6 +181,10 @@ public:
     // True if `token` is the model's end-of-generation marker.
     bool is_eog(int32_t token) const;
 
+    // BOS / EOS token IDs from the loaded vocabulary.
+    int32_t bos_token_id() const;
+    int32_t eos_token_id() const;
+
     // Apply the model's chat template to a message list, returning the
     // templated string ready for tokenize(). Each message is {role, content}.
     // libllama supports the Qwen3 chat template natively; we don't need to
@@ -188,6 +202,11 @@ public:
     // Low-level access to decoder results. Pointers valid until next decode.
     const float* get_embeddings_ith(int32_t i) const;
     const float* get_logits_ith(int32_t i) const;
+
+    // Clear all KV cache entries. Must be called before starting a new
+    // inference sequence when reusing the same Runner across requests.
+    // Returns false on failure.
+    bool clear_kv_cache(std::string* error = nullptr);
 
     llama_model*   raw_model()    const { return model_; }
     llama_context* raw_context()  const { return ctx_;   }
