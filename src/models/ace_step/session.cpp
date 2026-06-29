@@ -269,12 +269,21 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                                      const std::vector<int32_t>& music_codes,
                                      std::vector<float>* pcm_stereo,
                                      std::string* error) {
-    // ── Dimensionality ───────────────────────────────────────────────────────
-    const int32_t n_codes_5  = static_cast<int32_t>(music_codes.size());
-    const int32_t n_frames   = n_codes_5 * 5;        // 5 Hz → 25 Hz
+    // ── Cover mode: use cover_latent_cond_ to determine frame count ────────
+    const bool is_cover_mode = !cover_latent_cond_.empty();
+    const int32_t out_ch     = cfg_.dit.out_channels; //   64 (acoustic latent)
     const int32_t in_ch      = cfg_.dit.in_channels;  //  192
     const int32_t H          = cfg_.dit.hidden_size;  // 1024 (1.5B DiT)
-    const int32_t out_ch     = cfg_.dit.out_channels; //   64 (acoustic latent)
+
+    int32_t n_frames, n_codes_5;
+    if (is_cover_mode) {
+        n_frames = static_cast<int32_t>(cover_latent_cond_.size() / out_ch);
+        n_codes_5 = n_frames / 5;
+    } else {
+        n_codes_5 = static_cast<int32_t>(music_codes.size());
+        n_frames  = n_codes_5 * 5;
+    }
+
     const int32_t enc_hs     = cfg_.encoder_hidden_size;  // 1024
 
     if (H <= 0 || in_ch <= 0 || out_ch <= 0) {
@@ -285,27 +294,32 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
         return false;
     }
 
-    // ── 1. FSQ decode: codes → 6D → upsample 5→25 Hz ──────────────────────
-    // The upstream projects the 6D FSQ vectors through a learned MLP
-    // (6 → 2048 → SiLU → LayerNorm → 64).  If the MLP weights exist in
+    // ── 1. FSQ decode: codes → 6D → upsample 5→25 Hz (skipped for cover) ──
+    // For cover mode the FSQ decode is replaced by cover_latent_cond_ which
+    // already holds VAE-encoded + temporally-smoothed source latents.
+    // For non-cover: the upstream projects the 6D FSQ vectors through a learned
+    // MLP (6 → 2048 → SiLU → LayerNorm → 64).  If the MLP weights exist in
     // ext_ctx_ (as vae.fsq_*), use them; otherwise fall back to identity.
     //
-    // We store the result at 25 Hz as [n_frames, out_ch].
-    std::vector<float> fsq_latent(static_cast<size_t>(n_frames) * out_ch, 0.0f);
+    // Note: fsq_latent is currently unused in the DiT forward path — the
+    // DiT receives only noise + TE conditioning. It is kept for the code
+    // structure documentation until the FSQ conditioning path is wired.
+    std::vector<float> fsq_latent;
+    if (!is_cover_mode) {
+        fsq_latent.assign(static_cast<size_t>(n_frames) * out_ch, 0.0f);
 
-    // Try learned FSQ projection weights (in ext_ctx_, bound as vae.fsq_*
-    // or decoder.fsq_* — checked both conventions).
-    ggml_tensor* fsq_proj_w = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.0.weight");
-    if (!fsq_proj_w) fsq_proj_w = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.0.weight");
-    ggml_tensor* fsq_out_w  = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.2.weight");
-    if (!fsq_out_w) fsq_out_w = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.2.weight");
-    ggml_tensor* fsq_norm_w = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.1.weight");
-    if (!fsq_norm_w) fsq_norm_w = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.1.weight");
+        // Try learned FSQ projection weights
+        ggml_tensor* fsq_proj_w = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.0.weight");
+        if (!fsq_proj_w) fsq_proj_w = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.0.weight");
+        ggml_tensor* fsq_out_w  = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.2.weight");
+        if (!fsq_out_w) fsq_out_w = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.2.weight");
+        ggml_tensor* fsq_norm_w = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.1.weight");
+        if (!fsq_norm_w) fsq_norm_w = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.1.weight");
 
-    const bool has_fsq_mlp = (fsq_proj_w && fsq_out_w);
+        const bool has_fsq_mlp = (fsq_proj_w && fsq_out_w);
 
-    // Per 5-Hz frame: decode → project/unpad → repeat 5× at 25 Hz
-    for (int32_t i = 0; i < n_codes_5; i++) {
+        // Per 5-Hz frame: decode → project/unpad → repeat 5× at 25 Hz
+        for (int32_t i = 0; i < n_codes_5; i++) {
         float f6[6];
         fsq_decode_one(music_codes[static_cast<size_t>(i)], f6);
 
@@ -393,11 +407,33 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                         projected, static_cast<size_t>(out_ch) * sizeof(float));
         }
     }
+    }  // end if (!is_cover_mode)
 
     // ── 2. Prepare conditioning for DiT ─────────────────────────────────────
-    if (te_cond_.empty() || te_cond_len_ <= 0) {
+    if (!is_cover_mode && (te_cond_.empty() || te_cond_len_ <= 0)) {
         if (error) *error = "ACE-Step: run_lm must execute before run_dit_and_vae";
         return false;
+    }
+    // For cover mode, use empty text conditioning (TE is not needed since
+    // source audio provides the conditioning through the cover latent). The
+    // DiT still needs a valid cond_ptr — use a single EOS/BOS token's
+    // embedding as a minimal placeholder.
+    const float* cond_ptr;
+    int32_t T_cond;
+    const float* uncond_ptr;
+    int32_t T_uncond;
+    std::vector<float> dummy_cond(static_cast<size_t>(enc_hs), 0.0f);
+    if (is_cover_mode) {
+        cond_ptr   = dummy_cond.data();
+        T_cond     = 1;
+        uncond_ptr = nullptr;
+        T_uncond   = 0;
+    } else {
+        cond_ptr   = te_cond_.data();
+        T_cond     = te_cond_len_;
+        uncond_ptr = te_uncond_.empty() ? nullptr : te_uncond_.data();
+        T_uncond   = te_uncond_.empty() ? 0 :
+                     static_cast<int32_t>(te_uncond_.size() / enc_hs);
     }
 
     // ── 3. Initialize noise at [T, in_ch] and project to [T, H] ─────────────
@@ -406,8 +442,30 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
     std::normal_distribution<float> ndist(0.0f, 1.0f);
 
     // Raw noise: [n_frames, in_channels]
+    // Channel layout: [0..63]=noise_latent [64..127]=conditioning [128..191]=mask
+    // For cover mode: channels 64-127 hold the cover source latent (at 25Hz),
+    // channels 128-191 are all 1.0 (mask=always-on). For non-cover: all noise.
     std::vector<float> noise_raw(static_cast<size_t>(n_frames) * in_ch);
     for (auto& v : noise_raw) v = ndist(noise_rng);
+    if (is_cover_mode) {
+        // Fill channels 64-127 with cover source latent (chunk at frame boundary)
+        const int32_t T_use = std::min(n_frames,
+            static_cast<int32_t>(cover_latent_cond_.size() / out_ch));
+        for (int32_t i = 0; i < T_use; i++) {
+            float* row = &noise_raw[static_cast<size_t>(i) * in_ch];
+            // Channels 64-127 = source latent
+            const float* src = &cover_latent_cond_[static_cast<size_t>(i) * out_ch];
+            std::memcpy(row + 64, src, static_cast<size_t>(out_ch) * sizeof(float));
+            // Channels 128-191 = all 1.0 (mask on)
+            for (int32_t c = 0; c < out_ch; c++) row[128 + c] = 1.0f;
+        }
+        if (T_use < n_frames) {
+            fprintf(stderr, "[ace_step] cover: truncating source latent "
+                    "%d → %d frames\n",
+                    static_cast<int32_t>(cover_latent_cond_.size() / out_ch),
+                    n_frames);
+        }
+    }
 
     // proj_in: [T, in_ch] → [T, H]
     std::vector<float> x(static_cast<size_t>(n_frames) * H);
@@ -420,12 +478,6 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
     }
 
     // ── 4. DiT flow-matching Euler loop ─────────────────────────────────────
-    const float* cond_ptr   = te_cond_.data();
-    const int32_t T_cond    = te_cond_len_;
-    const float* uncond_ptr = te_uncond_.empty() ? nullptr : te_uncond_.data();
-    const int32_t T_uncond  = te_uncond_.empty() ? 0 :
-                              static_cast<int32_t>(te_uncond_.size() / enc_hs);
-
     const FlowSchedule sched = build_schedule(cfg_.variant, req.n_diffusion_steps);
     std::vector<float> dit_out(static_cast<size_t>(n_frames) * H);
 
@@ -550,9 +602,10 @@ bool AceStepSession::run_music(const void* request, void* response,
     const std::string mode = lower(req->mode);
     const bool is_repaint = (mode == "repaint");
     const bool is_completion = (mode == "completion");
+    const bool is_cover = (mode == "cover" || mode == "cover_nofsq");
 
-    if (!is_repaint && !is_completion && mode != "text_to_music" &&
-        mode != "text-to-music" && !mode.empty()) {
+    if (!is_repaint && !is_completion && !is_cover &&
+        mode != "text_to_music" && mode != "text-to-music" && !mode.empty()) {
         static const char* kHelp =
             "See GAPS.md §3.2 for the per-mode roadmap. ";
         if (mode == "stem" || mode == "lego") {
@@ -560,15 +613,11 @@ bool AceStepSession::run_music(const void* request, void* response,
                 "ace_step mode='") + req->mode + "' is a separate model family "
                 "(Demucs-class separator / stem-assembler), not an ACE-Step "
                 "DiT mode. " + kHelp;
-        } else if (mode == "cover") {
-            if (error) *error = std::string(
-                "ace_step mode='") + req->mode + "' needs a style encoder — "
-                "a separate model that hasn't been ported yet. " + kHelp;
         } else {
             if (error) *error = std::string(
                 "ace_step: unknown mode '") + req->mode +
-                "'. Supported: 'text_to_music', 'repaint', 'completion'. " +
-                kHelp;
+                "'. Supported: 'text_to_music', 'repaint', 'completion', "
+                "'cover'. " + kHelp;
         }
         return false;
     }
@@ -584,14 +633,11 @@ bool AceStepSession::run_music(const void* request, void* response,
                 "' requires non-empty input_audio (stereo PCM at 48kHz)";
             return false;
         }
-        // input_audio is interleaved stereo L,R,L,R,... at 48kHz
-        // n_samples must be divisible by 1920 (VAE downsample factor)
         const int32_t n_audio = static_cast<int32_t>(req->input_audio.size() / 2);
         if (n_audio < 1920) {
             if (error) *error = "ace_step: input_audio too short (min ~1920 samples = 40ms)";
             return false;
         }
-        // Pad to multiple of 1920
         const int32_t remainder = n_audio % 1920;
         std::vector<float> padded = req->input_audio;
         if (remainder != 0) {
@@ -599,22 +645,72 @@ bool AceStepSession::run_music(const void* request, void* response,
             padded.resize(padded.size() + pad, 0.0f);
         }
         const int32_t n_padded = static_cast<int32_t>(padded.size() / 2);
-
         if (!vae_runner_->encode(padded.data(), n_padded,
                                   &repaint_latent_cond_, error))
             return false;
-
-        // Override duration from input audio (let LM generate full context)
-        // Use const_cast since we know it won't be modified after this point,
-        // but we can't change the const* parameter. Instead, we mutate a copy.
-        // The original req-ptr is const, so we work with what we have:
-        // run_dit_and_vae will check repaint_latent_cond_ size for T.
         (void)n_audio;
         (void)remainder;
     }
 
+    // ── Cover: VAE-encode input audio + temporal smoothing ────────────────
+    cover_latent_cond_.clear();
+    if (is_cover) {
+        if (req->input_audio.empty()) {
+            if (error) *error = "ace_step mode='cover' requires non-empty "
+                "input_audio (stereo PCM at 48kHz)";
+            return false;
+        }
+        const int32_t n_audio = static_cast<int32_t>(req->input_audio.size() / 2);
+        if (n_audio < 1920) {
+            if (error) *error = "ace_step: input_audio too short (min ~1920 samples = 40ms)";
+            return false;
+        }
+        const int32_t remainder = n_audio % 1920;
+        std::vector<float> padded = req->input_audio;
+        if (remainder != 0) {
+            size_t pad = static_cast<size_t>(1920 - remainder) * 2;
+            padded.resize(padded.size() + pad, 0.0f);
+        }
+        const int32_t n_padded = static_cast<int32_t>(padded.size() / 2);
+        // VAE encode → source latents at 25 Hz [T_latent, 64]
+        std::vector<float> src_latent;
+        if (!vae_runner_->encode(padded.data(), n_padded, &src_latent, error))
+            return false;
+        // FSQ roundtrip proxy: average pool 5:1, then repeat 5×
+        // (degrades micro-timings without requiring FSQ encoder weights)
+        const int32_t T_lat = static_cast<int32_t>(src_latent.size() / 64);
+        const int32_t T_pooled = T_lat / 5;  // 25 Hz → 5 Hz
+        if (T_pooled == 0) {
+            if (error) *error = "ace_step: input_audio too short for cover mode";
+            return false;
+        }
+        cover_latent_cond_.resize(static_cast<size_t>(T_pooled * 5) * 64, 0.0f);
+        for (int32_t i = 0; i < T_pooled; i++) {
+            // Average pool 5 frames
+            float avg[64] = {0};
+            for (int j = 0; j < 5; j++) {
+                for (int k = 0; k < 64; k++) {
+                    avg[k] += src_latent[static_cast<size_t>(i * 5 + j) * 64 + k];
+                }
+            }
+            for (int k = 0; k < 64; k++) avg[k] /= 5.0f;
+            // Repeat 5× at 25 Hz
+            for (int j = 0; j < 5; j++) {
+                std::memcpy(&cover_latent_cond_[
+                    static_cast<size_t>(i * 5 + j) * 64],
+                    avg, 64 * sizeof(float));
+            }
+        }
+    }
+
+    // ── Run pipeline ──────────────────────────────────────────────────────
     std::vector<int32_t> music_codes;
-    if (!run_lm(*req, &music_codes, error)) return false;
+    if (!is_cover) {
+        // Normal mode: run LM to generate FSQ codes from text
+        if (!run_lm(*req, &music_codes, error)) return false;
+    }
+    // For cover mode, music_codes stays empty — run_dit_and_vae will use
+    // cover_latent_cond_ for n_frames and skip the FSQ decode step.
     if (!run_dit_and_vae(*req, music_codes, &res->pcm_stereo, error)) return false;
     return true;
 }

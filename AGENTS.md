@@ -131,7 +131,7 @@ Both transformers (talker + predictor) run through the unified `qwen3::Runner`
 | n_diffusion_steps | ✅ Done | `steps` |
 | temperature | ✅ Done | `temperature` (LM, 0=argmax) |
 | top_p | ✅ Done | `top_p` (LM nucleus, 1.0=off) |
-| mode | ✅ Stage 13 | `mode` (`text_to_music` default; `cover`/`repaint`/`stem`/`lego`/`completion` fail fast with a pointer at GAPS.md §3.2) |
+| mode | ✅ Stage 13 | `mode` (`text_to_music` default; `cover`/`repaint`/`completion` wired; `stem`/`lego` fail fast — separate model families) |
 
 Endpoint: `POST /v1/audio/music`
 

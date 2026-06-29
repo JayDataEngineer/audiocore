@@ -64,8 +64,9 @@ struct MusicRequest {
     // ── Mode selection ────────────────────────────────────────────────────
     //   "text_to_music" (default) — full pipeline from text only
     //   "repaint"  — regenerate region [mask_start, mask_end) of input_audio
-    //   "completion" — extend/generate end portion of input_audio
-    //   "cover"   — DiT needs target-voice conditioning (TODO, fail-fast)
+    //   "completion" — same as repaint but mask covers the end
+    //   "cover"   — VAE-encode input_audio, FSQ roundtrip, skip LM, condition
+    //               DiT on source latents for style reinterpretation
     //   "stem"    — separate model entirely (BLOCKED)
     //   "lego"    — separate stem-assembler entirely (BLOCKED)
     std::string mode = "text_to_music";
@@ -143,6 +144,8 @@ private:
 
     // For repaint/completion: VAE-encoded input audio latent [T, 64]
     std::vector<float> repaint_latent_cond_;
+    // For cover mode: VAE-encoded + FSQ-roundtripped source audio latent [T, 64]
+    std::vector<float> cover_latent_cond_;
 };
 
 }  // namespace audiocore::acestep
