@@ -12,7 +12,7 @@
 - `src/cli/` — CLI entry point.
 - `third_party/` — vendored deps. Each subdir keeps its own LICENSE.
 - `tools/` — weight converters, quantizers, utility scripts.
-- `docs/` — architecture, GGUF format spec.
+
 - `examples/` — `server.json` example configs.
 - `tests/` — unit + parity + e2e tests (see "Build / test" below).
 
@@ -24,7 +24,7 @@
 3. Implement `session.cpp` (subclass of `Session`, overrides the relevant
    `run_*` methods). Document the family in a `README.md` in the same dir.
 4. Add `AUDIOCORE_REGISTER_FAMILY(<name>, factory)` to `loader.cpp`.
-5. Document the GGUF tensor map in `docs/GGUF_FORMAT.md`.
+
 6. Add a parity test against a reference implementation if one exists.
 
 ## Conventions
@@ -77,9 +77,24 @@ audiocore_test_with_bin(my_e2e, convert_acestep)  # if it shells out to a binary
 The `convert_acestep` tool is the C++ rewrite of the audit-only Python
 script — it rewrites ACE-Step HF tensor names to llama.cpp names in place,
 preserving KV. `convert_qwen3tts` is a C++ safetensors→GGUF converter for
-Qwen3-TTS (replaces the Python original). All Python tooling has been
-removed from the project. The HTTP server is also testable in-process via
+Qwen3-TTS (replaces the Python original). All *build-time* Python tooling
+has been removed from the project. (A scratch `tools/compare/compare_ui.py`
+exists for ad-hoc A/B comparison only — it is gitignored and is not part
+of any build or test.) The HTTP server is also testable in-process via
 `audiocore::build_server(slots)`; see `test_server_e2e.cpp`.
+
+### Secrets, hooks, and internal notes
+
+- **Tokens** live in `config/secrets.env` (gitignored). Copy the template:
+  `cp config/secrets.env.example config/secrets.env`. Never commit a real
+  token — the pre-push hook and the `gitleaks` GitHub Action both fail
+  closed on HuggingFace tokens (and the rest of the gitleaks default
+  ruleset).
+- **Pre-push hook** — run `./scripts/install-git-hooks.sh` once after a
+  fresh clone to enable secret scanning on push. Config: `.gitleaks.toml`.
+- **`notes/`** is a gitignored scratch directory for maintainer-only docs
+  (the honest GAP tracker, agent memory, ad-hoc status files). It is never
+  committed (the public repo ships only README.md and CLAUDE.md).
 
 ## Family feature matrix
 
@@ -93,7 +108,7 @@ removed from the project. The HTTP server is also testable in-process via
 | Dialogue (TTSD) | ✅ Stage 11 | `POST /v1/audio/speech {"mode":"dialogue"}` | TTSD-style system prompt + dialogue sampling defaults. Multi-turn via `messages` array (system/user/assistant roles). Single `text` becomes opening turn when `messages` absent. Codec wired (Stage 16). |
 | Voice design | 🟡 Stage 11 | `POST /v1/audio/speech {"mode":"voice_design","instruct":"a calm deep female voice"}` | Voice description in `instruct` routes through flagship backbone with voice-design system prompt. Best-effort fallback for the dedicated VoiceGenerator model. Codec wired (Stage 16). |
 | Streaming | ✅ Stage 18 | `POST /v1/audio/speech {"mode":"realtime"}` | Per-frame streaming: incremental codec decode during AR loop, PCM emitted via stream callback. Requires non-null `stream.on_audio`. First frame after ~1.3s delay (N_VQ × 80ms), then 80ms/frame. Response PCM empty in streaming mode. |
-| ggml codec graph | ✅ Stage 16 | — | `src/models/moss_tts/codec.cpp` adapts `pwilkin/openmoss/src/codec.cpp` (Apache-2.0). Auto-binds when GGUF carries `moss.codec.*`; silence fallback otherwise. Pre-built sidecar GGUFs at `smcleod/MOSS-TTS-v1.5-GGUF`. Architecture in `docs/CODEC_PORTS.md` §1. |
+| ggml codec graph | ✅ Stage 16 | — | `src/models/moss_tts/codec.cpp` adapts `pwilkin/openmoss/src/codec.cpp` (Apache-2.0). Auto-binds when GGUF carries `moss.codec.*`; silence fallback otherwise. Pre-built sidecar GGUFs at `smcleod/MOSS-TTS-v1.5-GGUF`. |
 
 **Codec token format** (`.codes` binary): `[n_frames: i32le] [codes: n_frames × 32 × i32le]`.
 
@@ -104,10 +119,10 @@ removed from the project. The HTTP server is also testable in-process via
 | TTS (talker + MTP predictor) | ✅ Stage 17 | `POST /v1/audio/speech` | Talker + Code Predictor load and run. Codec-token → PCM via `Qwen3TtsCodecGraphs` when codec sidecar GGUF is discovered (`extras["codec_path"]` or `tokenizer-{f16,q8_0}.gguf` next to talker); silence fallback otherwise. |
 | TTS with style instructions | ✅ Stage 17 | `POST /v1/audio/speech {"speaker":"Vivian","instruct":"whispered"}` | Speaker routing injects `<|spk_NAME|>` codec token; `instruct` summed into the text embedding. Same codec path. |
 | Voice design | ✅ Stage 17 | `POST /v1/audio/speech {"mode":"voice_design","instruct":"young female, energetic"}` | Instruct prefixed with the official VoiceDesign template. Best-effort on Base backbone. Same codec path. |
-| Voice clone | ✅ Stage 18 (Phase B) | `POST /v1/audio/speech {"mode":"voice_clone","reference_audio":"path.wav","reference_text":"the reference text"}` | ECAPA-TDNN speaker encoder + ICL prefill with ref-codes (Phase B). When `codec.enc.*` tensors present, reference WAV is encoded into code tokens and injected as acoustic context alongside ref-text phonetic context. xvec_only fallback if encoder absent. Requires speaker encoder tensors in talker GGUF; fail-fast with GAPS.md pointer otherwise. |
+| Voice clone | ✅ Stage 18 (Phase B) | `POST /v1/audio/speech {"mode":"voice_clone","reference_audio":"path.wav","reference_text":"the reference text"}` | ECAPA-TDNN speaker encoder + ICL prefill with ref-codes (Phase B). When `codec.enc.*` tensors present, reference WAV is encoded into code tokens and injected as acoustic context alongside ref-text phonetic context. xvec_only fallback if encoder absent. Requires speaker encoder tensors in talker GGUF; fail-fast otherwise. |
 | Streaming | ✅ Stage 19 | `POST /v1/audio/speech/stream {"mode":"streaming"}` | Per-frame streaming: codec frames decoded incrementally during AR loop and emitted via callback. Requires non-null `stream.on_audio`. First frame after ~80ms, then 80ms/frame. Response PCM empty in streaming mode. |
 | Variant detection | ✅ Stage 10 | — | Set `extras["variant"]` = `Base` / `CustomVoice` / `VoiceDesign`, or rely on directory-name substring match. |
-| ggml codec graph | ✅ Stage 17 | — | `src/models/qwen3_tts/codec.cpp` adapts `CrispStrobe/CrispASR`'s Qwen3-TTS codec section (MIT). Auto-binds when codec sidecar GGUF is discovered; silence fallback otherwise. Pre-built sidecar GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`. Architecture in `docs/CODEC_PORTS.md` §2. |
+| ggml codec graph | ✅ Stage 17 | — | `src/models/qwen3_tts/codec.cpp` adapts `CrispStrobe/CrispASR`'s Qwen3-TTS codec section (MIT). Auto-binds when codec sidecar GGUF is discovered; silence fallback otherwise. Pre-built sidecar GGUFs at `cstr/qwen3-tts-tokenizer-12hz-GGUF`. |
 
 Both transformers (talker + predictor) run through the unified `qwen3::Runner`
 — the same class MOSS and ACE-Step use. Weights: official
@@ -164,7 +179,7 @@ output (modulo quantization noise).
 - MOSS-Audio-Tokenizer codec: `pwilkin/openmoss/src/codec.cpp` — full
   encoder/decoder/RVQ graphs in pure ggml. Pre-built sidecar GGUFs at
   `smcleod/MOSS-TTS-v1.5-GGUF` and `ilintar/moss-tts-gguf`. Port plan
-  in `docs/CODEC_PORTS.md` §1.
+  in the MOSS codec source.
 - Qwen3-TTS: `QwenLM/Qwen3-TTS` (official Python reference)
 - Qwen3-TTS-Tokenizer-12Hz codec: `CrispStrobe/CrispASR` (MIT) — full
   codec + ECAPA-TDNN speaker encoder in pure ggml. Pre-built GGUFs at
@@ -172,6 +187,6 @@ output (modulo quantization noise).
   (`src/models/qwen3_tts/codec.cpp`, codec section only). **Stage 17b**
   **port wired** (`src/models/qwen3_tts/speaker_encoder.cpp`, ECAPA-TDNN
   section only). Architecture and substitution tables in
-  `docs/CODEC_PORTS.md` §2 and §4. Do **not** use
+  the Qwen3-TTS codec source. Do **not** use
   `predict-woo/qwen3-tts.cpp` as a reference — it has no license file.
 - ACE-Step: `ServeurpersoCom/acestep.cpp`
