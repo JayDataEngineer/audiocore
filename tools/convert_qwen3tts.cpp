@@ -33,7 +33,8 @@ using json = nlohmann::json;
     std::exit(1);
 }
 
-static void die_f(const char* fmt, const auto&... args) {
+template <typename... Args>
+static void die_f(const char* fmt, const Args&... args) {
     std::fprintf(stderr, "error: ");
     std::fprintf(stderr, fmt, args...);
     std::fprintf(stderr, "\n");
