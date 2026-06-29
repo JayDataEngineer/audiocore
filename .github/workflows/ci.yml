@@ -1,0 +1,58 @@
+# Build + test CI. Runs on every push and PR.
+#
+# Compiles audiocore with ENGINE_BUILD_TESTS=ON (CPU-only — CUDA is not
+# available on GitHub-hosted runners without a private runner) and runs
+# the ctest suite. The ctest suite is the unit + framework tests that do
+# not need real model weights; the e2e tests that load GGUFs are skipped
+# here (they live in tests/test_*_e2e.cpp and are intentionally not in
+# ctest per CLAUDE.md).
+
+name: build-and-test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.cc }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc-11, clang-14]
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cc == 'gcc-11' && 'g++-11' || 'clang++-14' }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential ${{ matrix.cc }}
+
+      - name: apply submodule patches
+        run: ./scripts/apply-submodule-patches.sh
+
+      - name: configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENGINE_BUILD_TESTS=ON \
+            -DENGINE_ENABLE_CUDA=OFF
+
+      - name: build
+        run: cmake --build build --parallel --target audiocore_server audiocore_cli convert_acestep convert_qwen3tts
+
+      - name: test
+        run: ctest --test-dir build --output-on-failure --no-tests=error
