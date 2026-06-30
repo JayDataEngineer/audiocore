@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <unordered_map>
@@ -431,8 +432,37 @@ bool MossSession::load(const std::string& model_path,
                        const LoadOptions& opts,
                        const BackendConfig& backend_cfg,
                        std::string* error) {
+    // Resolve model path: if it's a directory, find .gguf files inside.
+    // The per-family loader is responsible for file discovery within its
+    // own directory (see discovery.cpp docstring).
+    std::string resolved_path = model_path;
+    LoadOptions resolved_opts = opts;
+    {
+        std::error_code ec;
+        namespace fs = std::filesystem;
+        if (fs::is_directory(model_path, ec)) {
+            std::string primary, extras;
+            for (const auto& entry : fs::directory_iterator(model_path, ec)) {
+                const auto& p = entry.path();
+                if (p.extension() != ".gguf") continue;
+                const std::string fn = p.filename().string();
+                if (fn.find("extras") != std::string::npos) {
+                    if (extras.empty()) extras = p.string();
+                } else if (primary.empty()) {
+                    primary = p.string();
+                }
+            }
+            if (!primary.empty()) {
+                resolved_path = primary;
+            }
+            if (!extras.empty()) {
+                resolved_opts.extras["extras_gguf_path"] = extras;
+            }
+        }
+    }
+
     // (1) Open the GGUF via the format-neutral factory.
-    loader_ = make_weight_loader(model_path, error);
+    loader_ = make_weight_loader(resolved_path, error);
     if (!loader_) return false;
     auto* gguf = dynamic_cast<GgufReader*>(loader_.get());
     if (!gguf) {
@@ -441,24 +471,30 @@ bool MossSession::load(const std::string& model_path,
     }
 
     // (2) Parse MOSS KV metadata. All optional — defaults baked into MossConfig
-    //     headers (see family.h). Community GGUFs omit these; only the upstream
-    //     full_community.gguf from pwilkin/openmoss carries them.
-    int32_t tmp = 0;
-    if (gguf->get_kv_i32("moss.n_vq",             &tmp)) cfg_.n_vq             = tmp;
-    if (gguf->get_kv_i32("moss.audio_vocab_size", &tmp)) cfg_.audio_vocab_size = tmp;
-    if (gguf->get_kv_i32("moss.sampling_rate",    &tmp)) cfg_.sampling_rate    = tmp;
-    if (gguf->get_kv_i32("moss.audio_pad_code",   &tmp)) cfg_.audio_pad_code   = tmp;
-    if (gguf->get_kv_i32("moss.downsample_rate",  &tmp)) cfg_.downsample_rate  = tmp;
-    if (gguf->get_kv_i32("moss.token.audio_start",      &tmp)) cfg_.tok_audio_start = tmp;
-    if (gguf->get_kv_i32("moss.token.audio_end",        &tmp)) cfg_.tok_audio_end   = tmp;
-    if (gguf->get_kv_i32("moss.token.user_slot",        &tmp)) cfg_.tok_user_slot   = tmp;
-    if (gguf->get_kv_i32("moss.token.audio_gen_slot",   &tmp)) cfg_.tok_audio_gen   = tmp;
-    if (gguf->get_kv_i32("moss.token.audio_delay_slot", &tmp)) cfg_.tok_audio_delay = tmp;
-    if (gguf->get_kv_i32("moss.token.im_start",         &tmp)) cfg_.tok_im_start    = tmp;
-    if (gguf->get_kv_i32("moss.token.im_end",           &tmp)) cfg_.tok_im_end      = tmp;
-    if (gguf->get_kv_i32("moss.token.pad",              &tmp)) cfg_.tok_pad         = tmp;
-    if (gguf->get_kv_i32("moss.codec.present",          &tmp)) cfg_.codec_present   = (tmp != 0);
-    if (gguf->get_kv_i32("moss.n_quantized_embd",       &tmp)) cfg_.n_quantized_embd = tmp;
+    //     headers (see family.h). Community GGUFs (backbone-only) omit these;
+    //     the extras sidecar GGUF carries them.
+    auto parse_moss_metadata = [&](const GgufReader* g) {
+        if (!g) return;
+        int32_t tmp = 0;
+        if (g->get_kv_i32("moss.n_vq",             &tmp)) cfg_.n_vq             = tmp;
+        if (g->get_kv_i32("moss.audio_vocab_size", &tmp)) cfg_.audio_vocab_size = tmp;
+        if (g->get_kv_i32("moss.sampling_rate",    &tmp)) cfg_.sampling_rate    = tmp;
+        if (g->get_kv_i32("moss.audio_pad_code",   &tmp)) cfg_.audio_pad_code   = tmp;
+        if (g->get_kv_i32("moss.downsample_rate",  &tmp)) cfg_.downsample_rate  = tmp;
+        {   float ftmp = 0.0f;
+            if (g->get_kv_f32("moss.frame_rate", &ftmp)) cfg_.frame_rate = ftmp; }
+        if (g->get_kv_i32("moss.token.audio_start",      &tmp)) cfg_.tok_audio_start = tmp;
+        if (g->get_kv_i32("moss.token.audio_end",        &tmp)) cfg_.tok_audio_end   = tmp;
+        if (g->get_kv_i32("moss.token.user_slot",        &tmp)) cfg_.tok_user_slot   = tmp;
+        if (g->get_kv_i32("moss.token.audio_gen_slot",   &tmp)) cfg_.tok_audio_gen   = tmp;
+        if (g->get_kv_i32("moss.token.audio_delay_slot", &tmp)) cfg_.tok_audio_delay = tmp;
+        if (g->get_kv_i32("moss.token.im_start",         &tmp)) cfg_.tok_im_start    = tmp;
+        if (g->get_kv_i32("moss.token.im_end",           &tmp)) cfg_.tok_im_end      = tmp;
+        if (g->get_kv_i32("moss.token.pad",              &tmp)) cfg_.tok_pad         = tmp;
+        if (g->get_kv_i32("moss.codec.present",          &tmp)) cfg_.codec_present   = (tmp != 0);
+        if (g->get_kv_i32("moss.n_quantized_embd",       &tmp)) cfg_.n_quantized_embd = tmp;
+    };
+    parse_moss_metadata(gguf);
 
     // (3) Spin up the Qwen3 backbone via the unified runner.
     qwen3::RunnerConfig rc;
@@ -466,7 +502,7 @@ bool MossSession::load(const std::string& model_path,
     rc.n_threads    = backend_cfg.n_threads;
     rc.n_gpu_layers = (backend_cfg.kind == BackendKind::ggml_cuda) ? -1 : 0;
     rc.flash_attn   = true;
-    backbone_ = qwen3::Runner::load(model_path, rc, error);
+    backbone_ = qwen3::Runner::load(resolved_path, rc, error);
     if (!backbone_) return false;
 
     // (3b) Construct the same ggml Backend the Qwen3 backbone chose, so the
@@ -490,8 +526,8 @@ bool MossSession::load(const std::string& model_path,
         if (!bind_extension_tensors(*gguf, error)) return false;
     } else {
         // Path C: separate extras GGUF (e.g. moss-tts-v1.5-q8_0.extras.gguf).
-        auto it_extras_gguf = opts.extras.find("extras_gguf_path");
-        if (it_extras_gguf != opts.extras.end()) {
+        auto it_extras_gguf = resolved_opts.extras.find("extras_gguf_path");
+        if (it_extras_gguf != resolved_opts.extras.end()) {
             auto extras_loader = make_weight_loader(it_extras_gguf->second, error);
             if (!extras_loader) return false;
             auto* extras_gguf = dynamic_cast<GgufReader*>(extras_loader.get());
@@ -508,13 +544,14 @@ bool MossSession::load(const std::string& model_path,
                                     "\" has no moss.* tensors";
                 return false;
             }
+            parse_moss_metadata(extras_gguf);
             extra_loaders_.push_back(std::move(extras_loader));
             if (!bind_extension_tensors(*extras_gguf, error)) return false;
         } else {
             // Path B: .npy files from embeddings_dir / lm_heads_dir.
-            auto it_emb = opts.extras.find("embeddings_dir");
-            auto it_lm  = opts.extras.find("lm_heads_dir");
-            if (it_emb == opts.extras.end() || it_lm == opts.extras.end()) {
+            auto it_emb = resolved_opts.extras.find("embeddings_dir");
+            auto it_lm  = resolved_opts.extras.find("lm_heads_dir");
+            if (it_emb == resolved_opts.extras.end() || it_lm == resolved_opts.extras.end()) {
                 if (error) *error = "GGUF has no moss.* tensors — pass extras_gguf_path,"
                                     " embeddings_dir, or lm_heads_dir in LoadOptions::extras";
                 return false;
@@ -530,15 +567,52 @@ bool MossSession::load(const std::string& model_path,
     //      decode_codec() path falls back to silence. Detection is by
     //      checking for the first codebook tensor, which every codec-bearing
     //      sidecar must have (openmoss codec.cpp resolve_decoder_).
-    if (codec_dec_root_ || ggml_get_tensor(ext_ctx_, "moss.codec.quantizer.q.0.codebook.weight")) {
-        ggml_backend_t be = backend_ ? backend_->raw_ggml_backend() : nullptr;
+    cfg_.codec_present = false;
+    ggml_backend_t be = backend_ ? backend_->raw_ggml_backend() : nullptr;
+    if (be && (codec_dec_root_ ||
+               ggml_get_tensor(ext_ctx_, "moss.codec.quantizer.q.0.codebook.weight"))) {
         std::string codec_err;
-        if (be && codec_graphs_.bind(ext_ctx_, be, &codec_err)) {
+        if (codec_graphs_.bind(ext_ctx_, be, &codec_err)) {
             cfg_.codec_present = true;
         } else {
-            // Not fatal — log and continue. decode_codec stays silence-stubbed.
             std::fprintf(stderr, "moss_tts: codec tensors present but bind failed "
-                                 "(%s); falling back to silence\n", codec_err.c_str());
+                                 "(%s)\n", codec_err.c_str());
+        }
+    }
+
+    // (4c) If codec still not bound, try a fallback GGUF with intact tensors.
+    //      The v1.5 extras GGUF (moss-tts-v1.5-q8_0.extras.gguf) is often
+    //      truncated, but the v1.4 moss-tts.extras.gguf (4 GB) in the same
+    //      directory has complete codec data. The codec architecture is shared
+    //      across all MOSS-TTS variants so this is safe.
+    if (!cfg_.codec_present && be) {
+        std::error_code ec;
+        namespace fs = std::filesystem;
+        fs::path fallback_path = fs::path(resolved_path).parent_path() / "moss-tts.extras.gguf";
+        if (fs::exists(fallback_path, ec)) {
+            std::fprintf(stderr, "moss_tts: trying codec fallback %s\n",
+                         fallback_path.c_str());
+            auto fallback_loader = make_weight_loader(fallback_path.string(), error);
+            if (fallback_loader) {
+                auto* fallback_gguf = dynamic_cast<GgufReader*>(fallback_loader.get());
+                if (fallback_gguf && fallback_gguf->meta_ctx() &&
+                    ggml_get_tensor(fallback_gguf->meta_ctx(),
+                        "moss.codec.quantizer.q.0.codebook.weight")) {
+                    std::string fb_err;
+                    if (codec_graphs_.bind(fallback_gguf->meta_ctx(), be, &fb_err)) {
+                        cfg_.codec_present = true;
+                        extra_loaders_.push_back(std::move(fallback_loader));
+                        std::fprintf(stderr, "moss_tts: codec fallback OK\n");
+                    } else {
+                        std::fprintf(stderr, "moss_tts: codec fallback also failed (%s)\n",
+                                     fb_err.c_str());
+                    }
+                }
+            }
+        }
+        if (!cfg_.codec_present) {
+            std::fprintf(stderr, "moss_tts: no codec tensors bound — "
+                                 "decode_codec() will return silence\n");
         }
     }
 
@@ -546,6 +620,7 @@ bool MossSession::load(const std::string& model_path,
     //     old ONNX decoder / encoder paths are no longer honored; codec
     //     decoding will read moss.codec.dec.* tensors from the GGUF directly.
     (void)opts;
+    (void)resolved_opts;
 
     loaded_ = true;
     return true;

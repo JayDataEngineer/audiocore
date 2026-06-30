@@ -47,6 +47,7 @@ struct MossConfig {
     int32_t audio_pad_code    = 1024;   // moss.audio_pad_code
     int32_t sampling_rate     = 24000;  // moss.sampling_rate
     int32_t downsample_rate   = 320;    // moss.downsample_rate (codec)
+    float   frame_rate        = 0.0f;   // moss.frame_rate — computed from sr/dsr when 0
     int32_t n_quantized_embd  = 0;      // moss.n_quantized_embd (optional)
     // Token IDs matching _constants.py / delay_state.h:
     int32_t tok_audio_start   = 151652;

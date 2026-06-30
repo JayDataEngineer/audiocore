@@ -61,6 +61,7 @@
 #include <vector>
 
 #include "ggml.h"
+#include "llama.h"
 
 namespace audiocore::moss {
 
@@ -316,6 +317,27 @@ bool MossSession::run_tts(const void* request, void* response,
         if (error) *error = "MossSession not loaded";
         return false;
     }
+
+    // Clear the KV cache before each request so sequence positions start at 0.
+    // Without this, the cache fills up across requests and eventually runs out
+    // of slots (n_ctx = 8192 by default), causing "failed to find a memory
+    // slot" errors on subsequent calls.
+    {
+        llama_context* ctx = backbone_->raw_context();
+        llama_memory_t mem = llama_get_memory(ctx);
+        std::fprintf(stderr, "[moss_tts] run_tts: ctx=%p mem=%p\n",
+                     (void*)ctx, (void*)mem);
+        if (mem) {
+            llama_pos before = llama_memory_seq_pos_max(mem, 0);
+            bool ok = llama_memory_seq_rm(mem, -1, -1, -1);
+            llama_pos after = llama_memory_seq_pos_max(mem, 0);
+            std::fprintf(stderr, "[moss_tts] run_tts: seq_rm ok=%d pos_max(0) before=%d after=%d\n",
+                         ok, before, after);
+        } else {
+            std::fprintf(stderr, "[moss_tts] run_tts: mem is NULL — clear is no-op!\n");
+        }
+    }
+
     const auto* req = static_cast<const TtsRequest*>(request);
     auto*       res = static_cast<TtsResponse*>(response);
     if (!req || !res) {
@@ -520,6 +542,13 @@ bool MossSession::run_tts(const void* request, void* response,
     }
 
     // ── 3. Prefill through backbone ─────────────────────────────────────────
+    {
+        llama_memory_t debug_mem = llama_get_memory(backbone_->raw_context());
+        if (debug_mem) {
+            std::fprintf(stderr, "[moss_tts] run_tts: prefill at pos=0, seq_pos_max(0)=%d\n",
+                         llama_memory_seq_pos_max(debug_mem, 0));
+        }
+    }
     std::vector<float> hidden_buf(static_cast<size_t>(total_S) * hs);
     if (!backbone_->forward_embeddings(prompt_embeds.data(), total_S, 0,
                                         hidden_buf.data(), error)) {
@@ -537,14 +566,21 @@ bool MossSession::run_tts(const void* request, void* response,
     samp_cfg.audio_top_p       = req->top_p       > 0.0f ? req->top_p       : 0.8f;
     samp_cfg.audio_top_k       = 25;
     samp_cfg.audio_repetition_penalty = 1.0f;
-    samp_cfg.rng = req->seed != 0
-        ? std::mt19937(static_cast<uint32_t>(req->seed))
-        : std::mt19937(std::random_device{}());
+    samp_cfg.rng.seed = req->seed != 0 ? req->seed : 0;
+    if (req->seed == 0) {
+        std::random_device rd;
+        samp_cfg.rng.seed = (static_cast<int64_t>(rd()) << 32) ^ rd();
+    }
 
     // ── 5. Autoregressive generation loop ──────────────────────────────────
+    // Compute frame rate from config: prefer explicit frame_rate from GGUF,
+    // then fall back to sampling_rate / downsample_rate.
+    const float effective_fps = cfg_.frame_rate > 0.0f
+        ? cfg_.frame_rate
+        : static_cast<float>(cfg_.sampling_rate) / static_cast<float>(cfg_.downsample_rate);
     const int32_t max_steps = req->max_new_tokens > 0
         ? req->max_new_tokens
-        : cfg_.n_vq * 60 * 30;  // default: 60 fps * 30 s
+        : static_cast<int32_t>(effective_fps * 30.0f) + cfg_.n_vq;  // 30 s + delay flush
 
     std::vector<float> step_embd(static_cast<size_t>(hs));
     std::vector<float> step_hidden(static_cast<size_t>(hs));
