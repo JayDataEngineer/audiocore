@@ -38,6 +38,7 @@ struct SigSegvInstaller { SigSegvInstaller() { std::signal(SIGSEGV, sigsegv_hand
 namespace audiocore::acestep {
 
 using audiocore::sampler::Params;
+using audiocore::sampler::PhiloxRng;
 using audiocore::sampler::sample_token;
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -354,7 +355,7 @@ bool AceStepSession::run_lm(const MusicRequest& req,
             n_codes, lm_->vocab_size(), code_start);
 
     // RNG for stochastic sampling (seeded for reproducibility)
-    std::mt19937 rng(static_cast<unsigned>(req.seed != 0 ? req.seed : 42));
+    PhiloxRng rng{req.seed != 0 ? req.seed : 42};
 
     for (int32_t s = 0; s < n_codes; s++) {
         const int32_t n_pos = prompt_len + s;

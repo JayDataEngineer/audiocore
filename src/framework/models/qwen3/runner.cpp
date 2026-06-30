@@ -27,6 +27,7 @@ using audiocore::GgufReader;
 using audiocore::TensorStorage;
 using audiocore::sampler::Params;
 using audiocore::sampler::sample_token;
+using audiocore::sampler::PhiloxRng;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Extras tensor materialization via WeightLoader.
@@ -774,7 +775,7 @@ bool Runner::predict_one_step(const float* talker_hidden,
     std::vector<float> seq;
     seq.reserve(static_cast<size_t>(nf + 2) * ne);
 
-    std::mt19937 rng(42);
+    PhiloxRng rng{42};
     std::vector<int32_t> cur_codes(prev_codes, prev_codes + nf);
 
     for (int k = 0; k < nf; k++) {

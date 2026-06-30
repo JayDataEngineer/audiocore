@@ -9,8 +9,9 @@
 
 #include <cstdint>
 #include <limits>
-#include <random>
 #include <vector>
+
+#include "audiocore/framework/sampling/sampler.h"
 
 namespace audiocore::moss {
 
@@ -36,7 +37,7 @@ struct SamplingConfig {
     float audio_top_p = 0.8f;
     int   audio_top_k = 25;
     float audio_repetition_penalty = 1.0f;
-    std::mt19937 rng{std::random_device{}()};   // seeded in run_tts from req->seed
+    audiocore::sampler::PhiloxRng rng{0};        // seeded in run_tts from req->seed
 };
 
 // ── Delay state (batch_size=1) ────────────────────────────────────────────

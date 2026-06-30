@@ -1,10 +1,3 @@
-// sampler.cpp — MOSS-TTS sampling functions.
-//
-// Thin shim over the unified audiocore::sampler. The MOSS-specific public
-// API (audiocore::moss::sample_token / sample_audio_tokens) is preserved so
-// existing call sites in src/models/moss_tts/session.cpp don't need to
-// change; the implementation now defers to framework/sampling/sampler.cpp.
-
 #include "audiocore/models/moss_tts/sampler.h"
 
 #include "audiocore/framework/sampling/sampler.h"
@@ -16,9 +9,9 @@ int32_t sample_token(const float* logits, int32_t vocab_size,
                      float repetition_penalty,
                      float top_p, int top_k,
                      bool do_sample,
-                     std::mt19937* rng) {
+                     PhiloxRng* rng) {
     sampler::Params p;
-    p.temperature        = 1.0f;   // MOSS path applies temperature scaling before calling
+    p.temperature        = 1.0f;
     p.top_p              = top_p;
     p.top_k              = top_k;
     p.repetition_penalty = repetition_penalty;
@@ -39,7 +32,6 @@ void sample_audio_tokens(const float* logits, int32_t n_streams, int32_t vocab_s
             ? prev_tokens + static_cast<size_t>(s)
             : nullptr;
         const int32_t n_prev_s = (prev_tokens && n_prev > 0) ? n_prev : 0;
-
         out[s] = sample_token(row, vocab_size,
                               prev, n_prev_s,
                               repetition_penalty,

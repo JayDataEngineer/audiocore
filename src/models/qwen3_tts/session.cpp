@@ -68,6 +68,7 @@ namespace audiocore::qwen3_tts {
 using audiocore::qwen3::Runner;
 using audiocore::qwen3::RunnerConfig;
 using audiocore::sampler::Params;
+using audiocore::sampler::PhiloxRng;
 using audiocore::sampler::sample_token;
 
 // ── Simple phase timer ───────────────────────────────────────────────────
@@ -304,7 +305,7 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
 
     const int32_t codec_vocab = talker_->codec_vocab();
     const int32_t n_embd = talker_->n_embd();
-    std::mt19937 rng(42);
+    PhiloxRng rng{42};
 
     // ── Progress callback helper ──────────────────────────────────────────
     auto prog = [&](const char* phase, float pct, const char* msg) {
