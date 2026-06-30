@@ -207,13 +207,20 @@ build/bin/audiocore_server --config examples/server.json --model /path/to/qwen3-
 
 # Override the family if the sniffer can't decide:
 build/bin/audiocore_server --config examples/server.json --model /path/to/file.gguf --family moss_tts
+
+# Rename the loaded model for OpenAI client compatibility (clients that
+# hardcode "tts-1", "whisper-1", etc.). /v1/models returns the alias,
+# /v1/audio/speech accepts it as the model name.
+build/bin/audiocore_server --config examples/server.json \
+    --model /path/to/moss-tts-q8_0.gguf --alias tts-1
 ```
 
 One model per process. To swap, stop the server and restart with a different
-`--model`. The `examples/server.json` config supplies `host` / `port` /
-`device` / `threads` — only one entry is needed even though `models` is an
-array (for backwards compat). When `--model` is set, it overrides any
-`models: [...]` block in the JSON.
+`--model`. `--alias` only works in single-model mode (errors out if the
+config has 0 or >1 models). The `examples/server.json` config supplies
+`host` / `port` / `device` / `threads` — only one entry is needed even
+though `models` is an array (for backwards compat). When `--model` is set,
+it overrides any `models: [...]` block in the JSON.
 
 **Backwards-compatible — `models: [...]` or `--model-dir`:**
 
@@ -296,6 +303,12 @@ docker run --gpus all -p 8080:8080 \
 docker run --gpus all -p 8080:8080 \
     -v "$PWD/weights/qwen3-tts:/model:ro" \
     audiocore --model /model
+
+# OpenAI client compat — rename the loaded model so a client that hardcodes
+# "tts-1" (or any other name) hits it without code changes. Pairs with --model.
+docker run --gpus all -p 8080:8080 \
+    -v "$PWD/weights/moss-tts-q8_0.gguf:/model.gguf:ro" \
+    audiocore --model /model.gguf --alias tts-1
 
 # Auto-discover everything under /models (one subdir per family):
 docker run --gpus all -p 8080:8080 \

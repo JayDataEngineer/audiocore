@@ -91,6 +91,15 @@ fi
 # command line, or is invoking a different binary (cli, inspect_gguf, sh),
 # we get out of the way (postgres/redis-style wrapper).
 case "${1:-}" in
+    # "docker run audiocore --model X --alias Y" — user passed server flags
+    # directly without naming the binary. Prepend it so exec gets a real
+    # command (postgres/redis entrypoint pattern).
+    -*)
+        set -- audiocore_server "$@"
+        ;;
+esac
+
+case "${1:-}" in
     audiocore_server|/opt/audiocore/bin/audiocore_server)
         has_config=0
         for a in "$@"; do
