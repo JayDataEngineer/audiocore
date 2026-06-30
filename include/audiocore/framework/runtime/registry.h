@@ -1,56 +1,152 @@
-// registry.h — model family registry.
-//
-// One place where a new model family is declared. Adding MOSS or ACE-Step
-// = one REGISTER_FAMILY call in their loader.cpp. The server / CLI / future
-// pool dispatcher all look up families through here.
-
 #ifndef AUDIOCORE_FRAMEWORK_RUNTIME_REGISTRY_H
 #define AUDIOCORE_FRAMEWORK_RUNTIME_REGISTRY_H
 
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace audiocore {
 
 class Session;
 
-// A FamilyFactory builds a fresh, unloaded Session for a given family.
-// The Session will then be handed a WeightLoader + Backend and asked to
-// load + run.
+// ── Capabilities (new interface, adapted from audio.cpp) ──────────────────
+
+enum class VoiceTaskKind {
+    Tts,
+    VoiceCloning,
+    MusicGen,
+    Sfx,
+    Alignment,
+};
+
+struct CapabilitySet {
+    std::vector<VoiceTaskKind> tasks;
+    std::vector<std::string> languages;
+    bool supports_voice_cloning = false;
+    bool supports_style = false;
+};
+
+struct ModelMetadata {
+    std::string family;
+    std::string variant;
+    std::string description;
+};
+
+struct ModelInspection {
+    ModelMetadata metadata;
+    CapabilitySet capabilities;
+    std::filesystem::path model_path;
+};
+
+struct ModelLoadRequest {
+    std::filesystem::path model_path;
+    std::string family_hint;
+    std::unordered_map<std::string, std::string> options;
+};
+
+// ── Session interfaces (new, adapted from audio.cpp) ──────────────────────
+
+struct TaskSpec {
+    VoiceTaskKind task = VoiceTaskKind::Tts;
+};
+
+struct SessionOptions {
+    std::unordered_map<std::string, std::string> options;
+};
+
+class ITaskSession {
+public:
+    virtual ~ITaskSession() = default;
+    virtual std::string family() const = 0;
+    virtual VoiceTaskKind task_kind() const = 0;
+};
+
+class IOfflineTaskSession : public virtual ITaskSession {
+public:
+    ~IOfflineTaskSession() override = default;
+    virtual bool run_tts(const void* request, void* response,
+                         std::string* error = nullptr) = 0;
+    virtual bool run_music(const void* request, void* response,
+                           std::string* error = nullptr) = 0;
+};
+
+// ── Loaded model interface (new, adapted from audio.cpp) ──────────────────
+
+class ILoadedModel {
+public:
+    virtual ~ILoadedModel() = default;
+    virtual const ModelMetadata& metadata() const noexcept = 0;
+    virtual const CapabilitySet& capabilities() const noexcept = 0;
+    virtual std::unique_ptr<IOfflineTaskSession> create_session(
+        const TaskSpec& task,
+        const SessionOptions& options) const = 0;
+};
+
+// ── Model loader interface (new, adapted from audio.cpp) ──────────────────
+
+class IModelLoader {
+public:
+    virtual ~IModelLoader() = default;
+    virtual std::string family() const = 0;
+    virtual bool can_load(const ModelLoadRequest& request) const = 0;
+    virtual ModelInspection inspect(const ModelLoadRequest& request) const = 0;
+    virtual std::unique_ptr<ILoadedModel> load(
+        const ModelLoadRequest& request) const = 0;
+};
+
+// ── ModelRegistry (new, adapted from audio.cpp) ───────────────────────────
+
+class ModelRegistry {
+public:
+    void register_loader(std::shared_ptr<IModelLoader> loader);
+
+    bool empty() const noexcept;
+    size_t size() const noexcept;
+    std::vector<std::string> families() const;
+    bool supports_family(const std::string& family) const noexcept;
+
+    ModelInspection inspect(const ModelLoadRequest& request) const;
+    std::unique_ptr<ILoadedModel> load(const ModelLoadRequest& request) const;
+    std::unique_ptr<ILoadedModel> load(const std::filesystem::path& model_path) const;
+
+private:
+    const IModelLoader* find_loader(const ModelLoadRequest& request) const;
+    std::vector<std::shared_ptr<IModelLoader>> loaders_;
+};
+
+// Build a registry wrapping all registered families.
+ModelRegistry make_default_registry();
+
+// ── OLD FamilyRegistry (backward compat — kept for existing family code) ──
+
 using FamilyFactory = std::function<std::unique_ptr<Session>()>;
 
 class FamilyRegistry {
 public:
     static FamilyRegistry& instance();
-
     void register_family(const std::string& name, FamilyFactory factory);
     std::unique_ptr<Session> create(const std::string& family) const;
     std::vector<std::string> list() const;
-
 private:
     std::unordered_map<std::string, FamilyFactory> families_;
 };
 
-// Static-registration helper. Place one of these in each family's
-// loader.cpp so the family is registered at static-init time. Pattern is
-// identical to llama.cpp's llama_model_loader register calls.
 struct FamilyRegistrar {
-    FamilyRegistrar(const std::string& name, FamilyFactory factory) {
-        FamilyRegistry::instance().register_family(name, std::move(factory));
-    }
+    FamilyRegistrar(const std::string& name, FamilyFactory factory);
 };
 
+}  // namespace audiocore
+
+// Static-registration macro (backward compat).
 #define AUDIOCORE_REGISTER_FAMILY(name, factory)               \
     namespace {                                                 \
     ::audiocore::FamilyRegistrar                                \
         g_register_##name(#name, factory);                     \
     }
 
-// Registration anchor that doubles as a linkage guard. Each family's loader.cpp
-// calls this after AUDIOCORE_REGISTER_FAMILY so main.cpp can force the
-// object file to be linked (static archives drop unreferenced TUs).
 #define AUDIOCORE_EXTERN_C_GUARD(name, factory)                               \
     extern "C" void audiocore_register_##name() {                             \
         static bool done_##name = false;                                      \
@@ -60,7 +156,5 @@ struct FamilyRegistrar {
             done_##name = true;                                               \
         }                                                                     \
     }
-
-}  // namespace audiocore
 
 #endif  // AUDIOCORE_FRAMEWORK_RUNTIME_REGISTRY_H
