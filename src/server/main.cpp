@@ -145,16 +145,19 @@ int main(int argc, char** argv) {
     std::string model_dir_override;
     std::string model_override;      // --model: llama.cpp-style primary path
     std::string family_override;     // --family: bypass family inference
+    std::string alias_override;      // --alias: rename the loaded model's id
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--config" && i + 1 < argc)        config_path        = argv[++i];
         else if (a == "--model-dir" && i + 1 < argc) model_dir_override = argv[++i];
         else if (a == "--model" && i + 1 < argc)     model_override     = argv[++i];
         else if (a == "--family" && i + 1 < argc)    family_override    = argv[++i];
+        else if (a == "--alias" && i + 1 < argc)     alias_override     = argv[++i];
     }
     if (config_path.empty()) {
         std::fprintf(stderr,
-            "usage: %s --config server.json [--model /path] [--family name] [--model-dir /path]\n",
+            "usage: %s --config server.json [--model /path] [--family name] "
+            "[--model-dir /path] [--alias name]\n",
             argv[0]);
         return 1;
     }
@@ -215,6 +218,24 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "audiocore_server: discovered %zu model(s) under %s\n",
                      cfg.models.size(), cfg.model_dir.c_str());
+    }
+
+    // Phase 4: --alias renames the loaded model's id. Matches llama.cpp's
+    // --alias: useful for OpenAI client compatibility where the client
+    // hardcodes a model name like "tts-1" or "whisper-1". Only meaningful
+    // in single-model mode — multi-model configs need per-entry ids and
+    // can't share one alias.
+    if (!alias_override.empty()) {
+        if (cfg.models.size() != 1) {
+            std::fprintf(stderr,
+                "--alias requires exactly one model; current config has %zu. "
+                "Drop the alias, or switch to --model for single-model mode.\n",
+                cfg.models.size());
+            return 1;
+        }
+        std::fprintf(stderr, "audiocore_server: aliasing '%s' → '%s'\n",
+                     cfg.models.front().id.c_str(), alias_override.c_str());
+        cfg.models.front().id = alias_override;
     }
 
     // Instantiate one Session per configured model id. Each lives behind a
