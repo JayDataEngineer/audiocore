@@ -1,5 +1,3 @@
-// server.cpp — HTTP server factory + WAV encoders (see server.h).
-
 #include "audiocore/server/server.h"
 
 #include <atomic>
@@ -13,10 +11,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include "audiocore/models/ace_step/family.h"
-#include "audiocore/models/moss_tts/family.h"
-#include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/framework/runtime/tasks.h"
+#include "audiocore/models/ace_step/family.h"    // MusicRequest / MusicResponse
 #ifdef AUDIOCORE_ENABLE_MP3
 #include "audiocore/framework/io/mp3_encoder.h"
 #endif
@@ -25,11 +21,8 @@ namespace audiocore {
 
 using nlohmann::json;
 
-// ---- WAV encoders --------------------------------------------------------
-// Tiny WAV writer for PCM16 → response body. Keeps the server binary
-// dependency-free; we encode MP3 only when libmp3lame is linked (Phase 2).
-
 namespace {
+
 std::string pcm_to_wav_impl(const std::vector<float>& pcm, int32_t sr,
                              uint16_t channels) {
     std::ostringstream o;
@@ -64,13 +57,8 @@ std::string pcm_stereo_to_wav(const std::vector<float>& pcm, int32_t sr) {
     return pcm_to_wav_impl(pcm, sr, 2);
 }
 
-// ---- HTTP server factory -------------------------------------------------
-
 namespace {
 
-// Parse JSON body, resolve model-id → slot, and lock. Returns nullopt (with
-// `res` set to the appropriate error) on failure, or a locked SlotGuard on
-// success. The lock is held for the lifetime of the SlotGuard.
 struct SlotGuard {
     json body;
     std::shared_ptr<ModelSlot> slot;
@@ -99,7 +87,6 @@ std::optional<SlotGuard> resolve_slot(
     return SlotGuard{std::move(body), slot, std::unique_lock<std::mutex>(slot->mtx)};
 }
 
-// Helper: set res to a 500 JSON error and log the failure.
 void fail_with(httplib::Response& res, const std::string& err) {
     res.status = 500;
     json e = {{"error", err}};
@@ -111,8 +98,6 @@ void fail_with(httplib::Response& res, const std::string& err) {
 std::shared_ptr<httplib::Server> build_server(
         std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots) {
     auto svr = std::make_shared<httplib::Server>();
-    // Capture the slots map by value (shared_ptr copy) so the lambda's
-    // lifetime matches the server's, not the caller's stack frame.
     auto slots_ref = slots;
 
     svr->Get("/health", [slots_ref](const httplib::Request&, httplib::Response& res) {
@@ -126,8 +111,8 @@ std::shared_ptr<httplib::Server> build_server(
             std::lock_guard<std::mutex> g(slot->mtx);
             arr.push_back({
                 {"id", id},
-                {"family", slot->session->family_name()},
-                {"loaded", slot->session->loaded()},
+                {"family", slot->session->family()},
+                {"loaded", true},
             });
         }
         res.set_content(json{{"object", "list"}, {"data", arr}}.dump(),
@@ -141,11 +126,6 @@ std::shared_ptr<httplib::Server> build_server(
         const auto& body = sg->body;
         auto& slot = sg->slot;
 
-        // One request shape for every TTS family. The unified TtsRequest is
-        // a strict superset of the old moss::TtsRequest and qwen3_tts::
-        // TtsRequest fields, so we parse everything the client might send
-        // and let the family read whatever subset it cares about. No more
-        // per-family if/else branch in the routing layer.
         TtsRequest tr;
         tr.text            = body.value("input", "");
         tr.language        = body.value("language", "");
@@ -167,7 +147,6 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("max_new_tokens"))      tr.max_new_tokens      = body["max_new_tokens"].get<int32_t>();
         if (body.contains("max_tokens"))          tr.max_new_tokens      = body["max_tokens"].get<int32_t>();
         if (body.contains("repetition_penalty"))  tr.repetition_penalty  = body["repetition_penalty"].get<float>();
-        // Parse pre-computed speaker embedding (base64-encoded float array)
         if (body.contains("speaker_embedding") && body["speaker_embedding"].is_string()) {
             std::string b64 = body["speaker_embedding"].get<std::string>();
             if (!b64.empty()) {
@@ -200,13 +179,11 @@ std::shared_ptr<httplib::Server> build_server(
                 }
                 if (nbuf >= 2) raw.push_back((buf[0] << 2) | (buf[1] >> 4));
                 if (nbuf >= 3) raw.push_back((buf[1] << 4) | (buf[2] >> 2));
-                // Interpret raw bytes as float array (little-endian)
                 size_t n_floats = raw.size() / sizeof(float);
                 tr.speaker_embedding.resize(n_floats);
                 std::memcpy(tr.speaker_embedding.data(), raw.data(), n_floats * sizeof(float));
             }
         }
-        // Parse multi-turn messages (OpenAI-compatible format)
         if (body.contains("messages") && body["messages"].is_array()) {
             for (const auto& m : body["messages"]) {
                 ChatMessage cm;
@@ -260,11 +237,9 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("temperature"))    mr.temperature       = body["temperature"].get<float>();
         if (body.contains("top_p"))          mr.top_p             = body["top_p"].get<float>();
 
-        // ── Parse input_audio from base64 WAV ─────────────────────────────
         if (body.contains("input_audio") && body["input_audio"].is_string()) {
             std::string b64 = body["input_audio"].get<std::string>();
             if (!b64.empty()) {
-                // Simple base64 decode (RFC 4648)
                 static const char kDec[256] = {
                     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
                     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -283,7 +258,7 @@ std::shared_ptr<httplib::Server> build_server(
                 for (char c : b64) {
                     if (c == '=') { pad++; continue; }
                     int v = kDec[static_cast<uint8_t>(c)];
-                    if (v < 0) continue;  // skip whitespace
+                    if (v < 0) continue;
                     buf[nbuf++] = static_cast<uint8_t>(v);
                     if (nbuf == 4) {
                         raw.push_back((buf[0] << 2) | (buf[1] >> 4));
@@ -295,7 +270,6 @@ std::shared_ptr<httplib::Server> build_server(
                 if (nbuf >= 2) raw.push_back((buf[0] << 2) | (buf[1] >> 4));
                 if (nbuf >= 3) raw.push_back((buf[1] << 4) | (buf[2] >> 2));
 
-                // Parse WAV: 44-byte header, PCM16 little-endian
                 if (raw.size() > 44) {
                     const uint8_t* d = raw.data();
                     uint16_t channels = d[22] | (static_cast<uint16_t>(d[23]) << 8);
@@ -303,8 +277,7 @@ std::shared_ptr<httplib::Server> build_server(
                                   (static_cast<uint32_t>(d[25]) << 8) |
                                   (static_cast<uint32_t>(d[26]) << 16) |
                                   (static_cast<uint32_t>(d[27]) << 24);
-                    // Find data chunk
-                    size_t data_off = 44;  // minimal header
+                    size_t data_off = 44;
                     for (size_t p = 44; p + 8 <= raw.size(); p += 4) {
                         if (raw[p] == 'd' && raw[p+1] == 'a' && raw[p+2] == 't' && raw[p+3] == 'a') {
                             data_off = p + 8;
@@ -320,13 +293,12 @@ std::shared_ptr<httplib::Server> build_server(
                     size_t n_samples = n_pcm_bytes / 2;
                     if (channels == 0) channels = 1;
                     size_t n_per_ch = n_samples / channels;
-                    mr.input_audio.resize(n_per_ch * 2);  // stereo interleaved
+                    mr.input_audio.resize(n_per_ch * 2);
                     for (size_t i = 0; i < n_per_ch * 2 && i < n_per_ch * channels; i++) {
                         int16_t s = static_cast<int16_t>(raw[data_off + i * 2]) |
                                     (static_cast<int16_t>(raw[data_off + i * 2 + 1]) << 8);
                         mr.input_audio[i] = s / 32768.0f;
                     }
-                    // If mono, duplicate to stereo
                     if (channels == 1 && n_per_ch > 0) {
                         mr.input_audio.resize(n_per_ch * 2);
                         for (size_t i = n_per_ch; i > 0; i--) {
@@ -334,8 +306,7 @@ std::shared_ptr<httplib::Server> build_server(
                             mr.input_audio[i * 2 - 2] = mr.input_audio[i - 1];
                         }
                     }
-                    // Resample if not 48kHz
-                    (void)sr;  // TODO: resample to 48kHz if needed
+                    (void)sr;
                 }
             }
         }
@@ -362,20 +333,7 @@ std::shared_ptr<httplib::Server> build_server(
         }
     });
 
-    // ── POST /v1/audio/speech/stream ────────────────────────────────────────
-    //
-    // Chunked-transfer variant of /v1/audio/speech. Two modes:
-    //
-    // 1. Streaming callback mode (preferred): the family calls
-    //    TtsRequest::stream::on_audio with PCM chunks as audio is produced.
-    //    Each chunk is WAV-encoded and emitted immediately via the chunked
-    //    content provider. This gives true progressive audio.
-    //
-    // 2. Fallback (no callback): the family generates the full PCM, then we
-    //    WAV-encode and chunk-emit the result.
-    //
-    // Mode 1 requires the session to run on a background thread so the
-    // callback can push data while the chunked content provider pumps it.
+    // ── POST /v1/audio/speech/stream ──────────────────────────────────────
     svr->Post("/v1/audio/speech/stream",
               [slots_ref](const httplib::Request& req, httplib::Response& res) {
         auto sg = resolve_slot(req, *slots_ref, res);
@@ -383,7 +341,6 @@ std::shared_ptr<httplib::Server> build_server(
         const auto& body = sg->body;
         auto& slot = sg->slot;
 
-        // Same field set as /v1/audio/speech.
         TtsRequest tr;
         tr.text            = body.value("input", "");
         tr.language        = body.value("language", "");
@@ -452,10 +409,9 @@ std::shared_ptr<httplib::Server> build_server(
             }
         }
 
-        // ── Streaming state shared between generation thread and HTTP pump ──
         struct StreamBuf {
             std::mutex              mtx;
-            std::string             buffer;  // WAV bytes ready to send
+            std::string             buffer;
             bool                    done    = false;
             bool                    ok      = true;
             std::string             error;
@@ -463,10 +419,6 @@ std::shared_ptr<httplib::Server> build_server(
         };
         auto sbuf = std::make_shared<StreamBuf>();
 
-        // ── Heap-allocated context for streaming ────────────────────────────
-        // Captures MUST be by value (shared_ptr) so they survive the route-
-        // handler return. Stack locals (tr, tresp, asc, slot-ref) would dangle
-        // once the detached worker thread starts running.
         struct StreamCtx {
             TtsRequest          tr;
             TtsResponse         tresp;
@@ -497,9 +449,6 @@ std::shared_ptr<httplib::Server> build_server(
         };
         ctx->tr.stream = &ctx->asc;
 
-        // Run inference on a background thread so the callback fires
-        // concurrently with the HTTP chunked provider pump.
-        // Capture slot by value (shared_ptr copy) so the slot stays alive.
         auto slot_guard = sg->slot;
         std::thread worker([slot = std::move(slot_guard), ctx, sbuf]() {
             std::string err;
@@ -512,23 +461,19 @@ std::shared_ptr<httplib::Server> build_server(
         });
         worker.detach();
 
-        // Chunked content provider: pumps WAV/MP3 bytes from StreamBuf
         const char* ct = (fmt == "mp3") ? "audio/mpeg" : "audio/wav";
         res.set_chunked_content_provider(
             ct,
             [sbuf](size_t /*offset*/, httplib::DataSink& sink) {
                 std::unique_lock<std::mutex> lk(sbuf->mtx);
-
                 sbuf->cv.wait(lk, [sbuf]() {
                     return !sbuf->buffer.empty() || sbuf->done;
                 });
-
                 if (!sbuf->buffer.empty()) {
                     if (!sink.write(sbuf->buffer.data(), sbuf->buffer.size()))
                         return false;
                     sbuf->buffer.clear();
                 }
-
                 if (sbuf->done) {
                     sink.done();
                     return sbuf->ok;
