@@ -32,7 +32,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libmp3lame-dev \
         ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so \
+    && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1
 
 WORKDIR /src
 
