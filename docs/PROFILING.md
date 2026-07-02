@@ -6,43 +6,69 @@
 
 ---
 
-## Summary Table
+## Summary — All Models, All Variants
 
-| Model | Backend | Load | Generate | Audio | RTF | VRAM | Notes |
-|-------|---------|------|----------|-------|-----|------|-------|
-| Qwen3-TTS 0.6B | ggml/CUDA f16 | 0.3 s | 26.2 s | 327.7 s | 0.08× | ~3 GB | 12.5× faster than realtime |
-| MOSS-TTS v1.5 Q8_0 | ggml/CUDA | 8.0 s | 9.7 s | 30.1 s | 0.32× | ~5 GB | 3.1× faster than realtime |
-| MOSS-VoiceGen Q8_0 | ggml/CUDA | 1.0 s | 2.5 s | 0.7 s | 3.53× | ~3 GB | Short clips, below realtime |
-| MOSS-SoundEffect v2 (3 s) | PyTorch bf16 | 9.9 s | 6.1 s | 3.0 s | 2.04× | 14.9 GB | 50 diffusion steps |
-| MOSS-SoundEffect v2 (10 s) | PyTorch bf16 | 8.0 s | 6.1 s | 10.0 s | 0.61× | 14.9 GB | 50 steps, faster than RT |
+### Qwen3-TTS Family (audiocore C++/ggml, f16 weights)
 
-**RTF** = Real-Time Factor (lower = faster). RTF < 1.0 means faster than realtime.
+| Variant | Params | Load | Generate | Audio out | SR | RTF | Speedup vs RT |
+|---------|--------|------|----------|-----------|------|------|---------------|
+| 0.6B Base (voice clone) | 0.6B | 0.32 s | 26.5 s | 327.7 s | 24 kHz | 0.081 | **12.4×** |
+| 1.7B CustomVoice | 1.7B | 0.51 s | 41.3 s | 327.7 s | 24 kHz | 0.126 | 7.9× |
+| 1.7B VoiceDesign | 1.7B | 10.1 s | 41.5 s | 327.7 s | 24 kHz | 0.127 | 7.9× |
+| 1.7B Base (voice clone) | 1.7B | — | — | — | — | — | *not on disk* |
+
+Three operating modes across the family:
+- **Base** — 3-second rapid voice clone from reference audio.
+- **CustomVoice** — style control via instruct text + 9 premium speakers (Vivian, Serena, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee, Uncle_Fu).
+- **VoiceDesign** — design voices from natural-language descriptions.
+
+### MOSS Family (audiocore C++/ggml)
+
+| Variant | Quant | Load | Generate | Audio out | SR | RTF | Speedup vs RT |
+|---------|-------|------|----------|-----------|------|------|---------------|
+| MOSS-TTS-Delay v1.5 | Q8_0 | 8.0 s | 9.7 s | 30.1 s | 24 kHz | 0.322 | **3.1×** |
+| MOSS-VoiceGenerator | Q8_0 | 0.96 s | 2.54 s | 0.72 s | 24 kHz | 3.53 | 0.3× |
+| MOSS-SoundEffect v1 | Q8_0 | — | — | — | — | — | *not converted to GGUF* |
+
+- **MOSS-TTS-Delay** — Qwen3-8B backbone + 32 RVQ audio codebooks + 1.6B transformer codec. Delay-pattern autoregressive generation. Supports voice cloning via `--reference`.
+- **MOSS-VoiceGenerator** — voice design from text descriptions (n_vq=2, shorter clips).
+- **MOSS-SoundEffect v1** — discrete-token AR SFX (n_vq=32). Weights in HF cache but not yet converted to GGUF. Superseded by v2 (below).
+
+### ACE-Step Family (audiocore C++/ggml, Q8_0)
+
+| Variant | LM | DiT steps | Load | Generate | Audio out | SR | RTF |
+|---------|-----|-----------|------|----------|-----------|------|------|
+| 1.5 Turbo | 1.7B | 8 | 1.3 s | 39.1 s | 10.0 s stereo | 48 kHz | 3.90 |
+| 1.5 SFT | 1.7B | 50 | 2.0 s | 108.1 s | 10.0 s stereo | 48 kHz | 10.81 |
+| XL Turbo | 4B | 8 | 4.2 s | 57.2 s | 10.0 s stereo | 48 kHz | 5.72 |
+| XL SFT | 4B | 50 | — | — | — | — | *not benchmarked* |
+| XL Base | 4B | 50 | — | — | — | — | *not benchmarked* |
+| SFT (1.7B) | 1.7B | 50 | — | — | — | — | *same as 1.5 SFT* |
+
+Text-to-music: Qwen3 text encoder → 5Hz music-code LM → DiT flow-matching diffusion → audio VAE → 48 kHz stereo PCM. Turbo variants use 8 diffusion steps (fast but lower quality); SFT uses 50 steps.
+
+### MOSS-SoundEffect v2 (standalone Python, PyTorch bf16)
+
+| Duration | Load | Generate | RTF | Peak VRAM | Diffusion rate |
+|----------|------|----------|-----|-----------|---------------|
+| 3 s | 9.9 s | 6.1 s | 2.04× | 14.9 GB | 10.2 it/s |
+| 10 s | 8.0 s | 6.1 s | **0.61×** | 14.9 GB | 10.2 it/s |
+
+Wan-audio DiT (1.3B) + DAC VAE + Qwen3 text encoder. Flow-matching diffusion at 50 steps. Runs in standalone project at `../moss-sfx-v2/`.
 
 ---
 
-## 1. Qwen3-TTS 0.6B (GGUF, audiocore)
+## Codec Decode — O(T²) → O(T) Fix
 
-**Path:** C++ ggml engine, f16 weights, CUDA backend.
-
-| Metric | Value |
-|--------|-------|
-| Load time | 0.29 s |
-| Best of 3 runs | 26.16 s |
-| Audio duration | 327.68 s (≈5.5 min) |
-| Samples | 7,864,320 @ 24 kHz |
-| RTF | 0.08 (12.5× faster than realtime) |
-
-### Codec decode — O(T²) → O(T) fix
-
-The codec decoder (WavTokenizer-class) previously used ggml's stock
+The Qwen3-TTS codec decoder (WavTokenizer-class) previously used ggml's stock
 `conv_transpose_1d` CUDA kernel, which is **O(T²)** in sequence length. At
 T=50 codec frames this alone took **29.4 s** — dominating the entire pipeline.
 
 **Fix:** Decomposed transposed conv1d into cuBLAS `mul_mat` + `col2im_1d`
 gather, making it **O(T)**.
 
-| Codec frame count | Stock kernel | Fixed (matmul + col2im) | Speedup |
-|-------------------|-------------|------------------------|---------|
+| Codec frames | Stock kernel | Fixed (matmul + col2im) | Speedup |
+|--------------|-------------|------------------------|---------|
 | T = 50 | 29.4 s | 0.042 s | **700×** |
 
 Correctness verified: 92 dB SNR vs stock kernel in isolated test.
@@ -61,60 +87,43 @@ audio with no crashes.
 
 ---
 
-## 2. MOSS-TTS v1.5 (GGUF Q8_0, audiocore)
+## ACE-Step GGML_MAX_NAME Fix
 
-| Metric | Value |
-|--------|-------|
-| Load time | 8.0 s |
-| Best of 3 runs | 9.67 s |
-| Audio duration | 30.08 s |
-| RTF | 0.32 (3.1× faster than realtime) |
+ACE-Step DiT GGUFs from Serveurperso/ACE-Step-1.5-GGUF contain tensor names
+up to 73 characters (e.g. `double_b.diffusion_model.input_blocks.1.1.transformer_blocks.0.norm1.norm.weight`).
+Stock `GGML_MAX_NAME=64` in ggml rejects these, preventing model load.
 
----
-
-## 3. MOSS-VoiceGen (GGUF Q8_0, audiocore)
-
-| Metric | Value |
-|--------|-------|
-| Load time | 0.96 s |
-| Best of 2 runs | 2.54 s |
-| Audio duration | 0.72 s |
-| RTF | 3.53 (below realtime — short-clip model) |
+**Fix:** `add_compile_definitions(GGML_MAX_NAME=128)` in CMakeLists.txt before
+`add_subdirectory(third_party/llama.cpp)`. The `#ifndef` guard in ggml.h picks
+up the override.
 
 ---
 
-## 4. MOSS-SoundEffect v2.0 (PyTorch, standalone project)
+## Cross-Model Comparison
 
-**Project:** `<MOSS_SFX_ROOT>/` (standalone
-uv-managed project, not part of audiocore C++ engine)
+### TTS / Speech Generation (RTF — lower is better)
 
-**Architecture:** Wan-audio DiT (1.3B params) + DAC VAE + Qwen3 text encoder,
-flow-matching diffusion, 48 kHz output.
+```
+Qwen3-TTS 0.6B Base      ████░░░░░░░░░░░░░░░░  0.081  (12.4× RT)
+Qwen3-TTS CustomVoice    ██████░░░░░░░░░░░░░░  0.126  ( 7.9× RT)
+Qwen3-TTS VoiceDesign    ██████░░░░░░░░░░░░░░  0.127  ( 7.9× RT)
+MOSS-TTS-Delay v1.5 Q8   ████████████████░░░░  0.322  ( 3.1× RT)
+```
 
-### Benchmark (RTX 4090, bf16, 50 steps)
+### Music Generation (RTF — lower is better)
 
-| Prompt length | Load | Generate | Diffusion rate | Peak VRAM |
-|---------------|------|----------|---------------|-----------|
-| 3 s audio | 9.9 s | 6.1 s | 10.2 it/s | 14.9 GB |
-| 10 s audio | 8.0 s | 6.1 s | 10.2 it/s | 14.9 GB |
+```
+ACE-Step 1.5 Turbo       ████████████████████  3.90
+ACE-Step XL Turbo        ████████████████████████░░░░  5.72
+ACE-Step 1.5 SFT         ████████████████████████████████  10.81  (50 steps)
+```
 
-Key observations:
-- **Diffusion rate is constant** (~10 it/s) regardless of audio length — the
-  per-step compute scales with latent frames but overhead dominates at short lengths.
-- **VRAM is constant** (14.9 GB) — the DiT parameters (10 GB) dominate; latent
-  frames are tiny relative to model size.
-- **10 s generation is faster than realtime** (RTF 0.61×). 3 s is not (RTF 2.04×)
-  because the 50-step loop overhead is fixed.
-- `TORCHDYNAMO_DISABLE=1` is set — torch.compile's first-run compilation cost
-  (minutes) isn't worth it for one-shot generation.
+### Sound Effects (RTF — lower is better)
 
-### Environment
-
-- Python 3.12, uv-managed (astral), **not conda**
-- torch 2.9.0+cu128, diffusers, transformers
-- `audiotools` stub replaces descript-audiotools (avoids protobuf≥6 conflict;
-  only `AudioSignal` and `ml.BaseModel` referenced, neither called during inference)
-- Dockerfile: CUDA 12.8 runtime + uv
+```
+MOSS-SFX v2 (10s)        █████████████░░░░░░░  0.61
+MOSS-SFX v2 (3s)         ████████████████████  2.04
+```
 
 ---
 
@@ -122,14 +131,19 @@ Key observations:
 
 ### audiocore (C++ GGUF models)
 
-- Build: `cmake --build build --target audiocore_server`
-- Backend: ggml CUDA backend, f16 weights (`--quant f16`)
+- Build: `cmake -B build -DENGINE_ENABLE_CUDA=ON && cmake --build build -j`
+- Backend: ggml CUDA, f16 weights for Qwen3-TTS, Q8_0 for MOSS/ACE-Step
 - Weights: GGUF format, mmap'd at runtime
+- Models under `/mnt/data/models/audio/`
 
 ### MOSS-SoundEffect v2 (Python)
 
+- Project: `../moss-sfx-v2/` (standalone, uv-managed)
+- Python 3.12, torch 2.9.0+cu128, bf16
+- `audiotools` stub replaces descript-audiotools (avoids protobuf≥6 conflict)
+
 ```bash
-cd <MOSS_SFX_ROOT>
+cd ../moss-sfx-v2
 uv sync --extra cu128
 MODEL_DIR=/mnt/data/models/audio/moss-soundeffect-v2 \
 TORCHDYNAMO_DISABLE=1 \
@@ -140,12 +154,69 @@ uv run python benchmark.py --model $MODEL_DIR --seconds 10 --steps 50
 
 ## Reproducing
 
-All benchmark scripts and raw results:
-
 | Artifact | Location |
 |----------|----------|
 | audiocore benchmark script | `/tmp/bench_audiocore.py` |
 | audiocore raw results (JSON) | `/tmp/audiocore_bench_results.json` |
-| MOSS-SFX v2 project | `<MOSS_SFX_ROOT>/` |
-| MOSS-SFX v2 benchmark | `moss-sfx-v2/benchmark.py` |
+| ACE-Step benchmark | `tests/test_acestep_e2e.cpp` (env: `ACESTEP_DIR`, `ACESTEP_DIT_VARIANT`, `ACESTEP_LM_VARIANT`) |
+| MOSS-SFX v2 project | `../moss-sfx-v2/benchmark.py` |
 | Codec fix source | `src/models/qwen3_tts/codec.cpp` |
+
+### Running ACE-Step benchmarks
+
+```bash
+export LD_LIBRARY_PATH=build:build/third_party/llama.cpp/build/src
+ACESTEP_DIR=/mnt/data/models/audio/acestep-cpp-converted/ \
+ACESTEP_DIT_VARIANT=turbo ACESTEP_LM_VARIANT=1.7B \
+ACESTEP_DURATION=10 \
+./build/tests/test_acestep_e2e
+```
+
+### Running Qwen3-TTS / MOSS benchmarks
+
+```bash
+# Via Python bindings
+PYTHONPATH=build-py/python python3 -c "
+import audiocore; audiocore.init()
+sess = audiocore.Session.create('qwen3_tts')
+sess.load('/mnt/data/models/audio/qwen3_tts/0.6b-base', backend='ggml_cuda', device=0)
+pcm, sr = sess.run_tts('Hello world', temperature=0.7, top_p=0.9, seed=42)
+print(f'{len(pcm)} samples @ {sr} Hz = {len(pcm)/sr:.1f}s')
+"
+```
+
+---
+
+## Codec / Audio Tokenizer Components
+
+These are not standalone generation models — they're codec components used
+by the TTS/SFX models above.
+
+| Component | Version | SR | Channels | On Disk | Notes |
+|-----------|---------|-----|----------|---------|-------|
+| MOSS-Audio-Tokenizer | v1 | 24 kHz | mono | ✅ `moss-audio-tokenizer/` | Used by MOSS-TTS-Delay. Codec encoder/decoder. |
+| MOSS-Audio-Tokenizer Nano | v1 | 24 kHz | mono | ✅ `moss-audio-tokenizer-nano/` | Smaller variant. |
+| MOSS-Audio-Tokenizer | **v2** | **48 kHz** | **stereo** | ❌ not downloaded | Released 2026-06-07. Native 48 kHz stereo I/O. |
+| Qwen3-TTS-Tokenizer-12Hz | — | 24 kHz | mono | ✅ `qwen3_tts/0.6b-base/tokenizer-f16.gguf` | Used by all Qwen3-TTS variants. GGUF port (codec decode fix above). |
+
+### Release Notes
+
+**MOSS-TTS v1.5** (2026-05-26): Stronger multilingual synthesis with language
+tags, more stable voice cloning, better long-reference short-text cloning,
+punctuation-following prosody, explicit pause control via `[pause X.Ys]`.
+
+**MOSS-Audio-Tokenizer v2** (2026-06-07): Natively supports 48 kHz stereo
+input and output (v1 was 24 kHz mono). Not yet integrated into audiocore.
+
+---
+
+## Models Not Yet Benchmarked
+
+| Model | Status | Blocker |
+|-------|--------|---------|
+| Qwen3-TTS 1.7B Base | No GGUF files | Directory exists but empty — needs conversion from HF |
+| MOSS-SoundEffect v1 | HF weights only | Not converted to GGUF; superseded by v2 |
+| MOSS-Audio-Tokenizer v2 | Not downloaded | Released 2026-06-07; 48 kHz stereo codec |
+| ACE-Step XL SFT / XL Base | Files on disk | Not yet run (same architecture as XL Turbo) |
+| TangoFlux | On disk | Not in manifest; PyTorch model, not ported to audiocore |
+| Zonos2 | On disk | Not in manifest; TVM/flashinfer-based, not ported |

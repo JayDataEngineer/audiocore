@@ -34,12 +34,18 @@ option(ENGINE_BUILD_CLI          "Build audiocore_cli"          ON)
 option(ENGINE_BUILD_SERVER       "Build audiocore_server"       ON)
 option(ENGINE_ENABLE_MP3        "Enable MP3 output via libmp3lame" ON)
 option(ENGINE_BUILD_TESTS        "Build unit tests"             OFF)
+option(ENGINE_BUILD_PYTHON       "Build Python bindings"        OFF)
 
 # ── llama.cpp (subtree in third_party/llama.cpp) ─────────────────────────
 # Pinned via git submodule. Provides libllama (Qwen3 inference) AND vendors
 # its own ggml under llama.cpp/ggml/. We use the llama.cpp copy and drop our
 # standalone third_party/ggml submodule to avoid symbol clashes.
 #
+# ACE-Step DiT GGUFs have tensor names up to 67 chars (e.g.
+# "double_b.diffusion_model.input_blocks.1.1.transformer_blocks.0.norm1.norm.weight"
+# = 73 chars). Stock GGML_MAX_NAME=64 rejects them. Bump to 128.
+add_compile_definitions(GGML_MAX_NAME=128)
+
 # Build flags passed through to llama.cpp's build:
 set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -53,6 +59,7 @@ endif()
 add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
 
 # ── audiocore framework library ──────────────────────────────────────────
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 add_library(audiocore_framework STATIC
     src/framework/io/gguf_reader.cpp
     src/framework/io/gguf_reader_ext.cpp
@@ -143,4 +150,24 @@ target_link_libraries(inspect_gguf PRIVATE audiocore_framework)
 if(ENGINE_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# ── Python bindings ────────────────────────────────────────────────────────
+if(ENGINE_BUILD_PYTHON)
+    include(FetchContent)
+    FetchContent_Declare(pybind11
+        GIT_REPOSITORY https://github.com/pybind/pybind11.git
+        GIT_TAG v2.12.0)
+    FetchContent_MakeAvailable(pybind11)
+
+    pybind11_add_module(audiocore
+        src/python/audiocore_bindings.cpp)
+    target_link_libraries(audiocore PRIVATE audiocore_framework)
+    target_include_directories(audiocore PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/third_party
+        ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/include
+        ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/ggml/include)
+    set_target_properties(audiocore PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python")
 endif()

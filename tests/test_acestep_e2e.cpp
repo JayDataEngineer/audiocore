@@ -24,6 +24,8 @@
 #include "audiocore/framework/runtime/registry.h"
 #include "audiocore/models/ace_step/family.h"
 
+#include <chrono>
+
 extern "C" void audiocore_register_ace_step();
 
 static const char* OUTPUT_WAV = "test_acestep_output.wav";
@@ -78,6 +80,7 @@ int main() {
 
     std::string load_err;
     std::fprintf(stderr, "[INFO] loading ACE-Step (DiT + LM + TE + VAE) ...\n");
+    auto t_load_start = std::chrono::steady_clock::now();
     bool loaded = sess->load(model_dir, opts, bc, &load_err);
     if (!loaded) {
         // Exit code 77 signals "skip" to CI runners.
@@ -85,6 +88,9 @@ int main() {
         return 77;
     }
     std::fprintf(stderr, "[INFO] model loaded\n");
+    auto t_load_end = std::chrono::steady_clock::now();
+    double load_s = std::chrono::duration<double>(t_load_end - t_load_start).count();
+    std::fprintf(stderr, "[BENCH] load_time: %.2fs\n", load_s);
 
     // ── Run text-to-music inference ───────────────────────────────────────
     // Env-var overrides let the same binary exercise many configurations:
@@ -115,7 +121,13 @@ int main() {
     MusicResponse resp;
     std::string run_err;
     std::fprintf(stderr, "[INFO] running text-to-music (this may take ~30s)...\n");
+    auto t_gen_start = std::chrono::steady_clock::now();
     bool ok = sess->run_music(&req, &resp, &run_err);
+    auto t_gen_end = std::chrono::steady_clock::now();
+    double gen_s = std::chrono::duration<double>(t_gen_end - t_gen_start).count();
+    double audio_s = static_cast<double>(resp.pcm_stereo.size() / 2) / resp.sampling_rate;
+    std::fprintf(stderr, "[BENCH] gen_time: %.2fs  audio: %.2fs  rtf: %.2f\n",
+                 gen_s, audio_s, gen_s / audio_s);
     CHECK(ok, ("run_music failed: " + run_err).c_str());
 
     CHECK(!resp.pcm_stereo.empty(), "output PCM stereo is empty");
