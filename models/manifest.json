@@ -16,12 +16,12 @@
       "license": "Apache-2.0",
       "homepage": "https://github.com/pwilkin/openmoss",
       "modes": {
-        "tts":          { "status": "partial",  "notes": "Backbone runs; codec→PCM is a silence stub pending a ggml port" },
-        "sfx":          { "status": "partial",  "notes": "Different system prompt + sampling defaults; codec stub" },
-        "voice_clone":  { "status": "partial",  "notes": "Reads voice_path as pre-encoded .codes; codec stub" },
-        "dialogue":     { "status": "partial",  "notes": "Stage 11: TTSD-style system prompt + dialogue sampling defaults. Single text becomes opening turn; true TTSD weights are a separate variant." },
-        "voice_design": { "status": "partial",  "notes": "Stage 11: voice description in instruct routes through flagship backbone with voice-design system prompt. Best-effort fallback for the dedicated VoiceGenerator model." },
-        "realtime":     { "status": "not_impl", "notes": "Fails fast with a pointer at GAPS.md §1.2. Streaming endpoint scaffold is GAPS.md §4." }
+        "tts":          { "status": "wired",    "notes": "Full pipeline: upstream <user_inst> template, codec encoder+decoder, voice clone via real WAV encode+splice. Requires codec-bearing GGUF (smcleod sidecar or moss.codec.* tensors)." },
+        "sfx":          { "status": "wired",    "notes": "Text→audio via MOSS-SoundEffect checkpoint (n_vq=16). Same AR path as tts mode — the model weights determine output type. Load the SFX GGUF and request mode='sfx'." },
+        "voice_clone":  { "status": "wired",    "notes": "Reads reference WAV, runs codec encoder, delay-pattern-splices into prompt grid. Requires codec-bearing GGUF." },
+        "dialogue":     { "status": "not_impl", "notes": "Fail-fast. Requires MOSS-TTSD checkpoint (not available)." },
+        "voice_design": { "status": "wired",    "notes": "Via MOSS-VoiceGenerator variant (n_vq=16, loaded as moss_tts). Fail-fast on flagship (n_vq=32) checkpoint." },
+        "streaming":    { "status": "wired",    "notes": "Per-frame codec decode during AR loop. ~cfg_.n_vq × 80ms cold-start, then 80ms/frame." }
       },
       "variants": {
         "moss-tts-q4-k-m": {
@@ -94,6 +94,50 @@
             }
           ],
           "status_note": "Reference ONNX weights for the ggml codec port (see GAPS.md §1.3 and docs/CODEC_PORTS.md §1). audiocore does not load ONNX directly — Stage 1 removed that surface. The port reads moss.codec.* tensors straight from the sidecar GGUF (smcleod/MOSS-TTS-v1.5-GGUF ships them pre-built)."
+        },
+        "moss-voicegen-q8_0": {
+          "display": "MOSS-VoiceGenerator (Q8_0, n_vq=16)",
+          "params_b": 8,
+          "min_vram_gb": 14,
+          "modes": ["voice_design"],
+          "files": [
+            {
+              "name": "firstclass_gguf",
+              "filename": "moss-voicegen-q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-VoiceGenerator",
+                "revision": "main",
+                "notes": "Convert from HF safetensors via pwilkin/openmoss/scripts/convert_hf_to_gguf.py: python scripts/convert_hf_to_gguf.py --moss-tts OpenMOSS-Team/MOSS-VoiceGenerator --codec OpenMOSS-Team/MOSS-Audio-Tokenizer --output weights/moss-voicegen.gguf --llama-cpp-dir /path/to/llama.cpp; then quantize: llama-quantize --token-embedding-type f16 weights/moss-voicegen.gguf weights/moss-voicegen-q8_0.gguf Q8_0"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "moss_tts",
+            "path": "${MODELS_DIR}/moss_tts/moss-voicegen-q8_0.gguf"
+          }
+        },
+        "moss-sfx-q8_0": {
+          "display": "MOSS-SoundEffect v1.0 (f16, n_vq=16)",
+          "params_b": 8,
+          "min_vram_gb": 14,
+          "modes": ["sfx"],
+          "files": [
+            {
+              "name": "firstclass_gguf",
+              "filename": "moss-sfx-q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
+                "revision": "main",
+                "notes": "Convert from HF safetensors via pwilkin/openmoss/scripts/convert_hf_to_gguf.py: python scripts/convert_hf_to_gguf.py --moss-tts OpenMOSS-Team/MOSS-SoundEffect --codec OpenMOSS-Team/MOSS-Audio-Tokenizer --output weights/moss-sfx.gguf --llama-cpp-dir /path/to/llama.cpp; then quantize: llama-quantize --token-embedding-type f16 weights/moss-sfx.gguf weights/moss-sfx-q8_0.gguf Q8_0"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "moss_tts",
+            "path": "${MODELS_DIR}/moss_tts/moss-sfx-q8_0.gguf"
+          }
         }
       }
     },
@@ -117,24 +161,22 @@
           "min_vram_gb": 4,
           "files": [
             {
-              "name": "talker_safetensors",
-              "filename": "qwen3_tts_talker.gguf",
+              "name": "talker_gguf",
+              "filename": "qwen3tts-talker-1b7-f16.gguf",
               "source": {
                 "provider": "huggingface",
-                "repo": "QwenLM/Qwen3-TTS",
+                "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
                 "revision": "main",
-                "subpath": "talker",
                 "convert_with": "convert_qwen3tts"
               }
             },
             {
-              "name": "predictor_safetensors",
-              "filename": "qwen3_tts_predictor.gguf",
+              "name": "predictor_gguf",
+              "filename": "qwen3tts-predictor-1b7-f16.gguf",
               "source": {
                 "provider": "huggingface",
-                "repo": "QwenLM/Qwen3-TTS",
+                "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
                 "revision": "main",
-                "subpath": "code_predictor",
                 "convert_with": "convert_qwen3tts"
               }
             }
@@ -143,8 +185,8 @@
             "family": "qwen3_tts",
             "path": "${MODELS_DIR}/qwen3_tts/1.7b-base/",
             "extras": {
-              "talker_path":    "qwen3_tts_talker.q5_k.gguf",
-              "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+              "talker_path":    "qwen3tts-talker-1b7-f16.gguf",
+              "predictor_path": "qwen3tts-predictor-1b7-f16.gguf",
               "n_gpu_layers":   "99"
             }
           }
@@ -155,24 +197,22 @@
           "min_vram_gb": 4,
           "files": [
             {
-              "name": "talker_safetensors",
-              "filename": "qwen3_tts_talker.gguf",
+              "name": "talker_gguf",
+              "filename": "qwen3tts-talker-1b7-f16.gguf",
               "source": {
                 "provider": "huggingface",
-                "repo": "QwenLM/Qwen3-TTS-For-CustomVoice",
+                "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
                 "revision": "main",
-                "subpath": "talker",
                 "convert_with": "convert_qwen3tts"
               }
             },
             {
-              "name": "predictor_safetensors",
-              "filename": "qwen3_tts_predictor.gguf",
+              "name": "predictor_gguf",
+              "filename": "qwen3tts-predictor-1b7-f16.gguf",
               "source": {
                 "provider": "huggingface",
-                "repo": "QwenLM/Qwen3-TTS-For-CustomVoice",
+                "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
                 "revision": "main",
-                "subpath": "code_predictor",
                 "convert_with": "convert_qwen3tts"
               }
             }
@@ -182,8 +222,8 @@
             "family": "qwen3_tts",
             "path": "${MODELS_DIR}/qwen3_tts/1.7b-customvoice/",
             "extras": {
-              "talker_path":    "qwen3_tts_talker.q5_k.gguf",
-              "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+              "talker_path":    "qwen3tts-talker-1b7-f16.gguf",
+              "predictor_path": "qwen3tts-predictor-1b7-f16.gguf",
               "n_gpu_layers":   "99"
             }
           }
@@ -194,24 +234,22 @@
           "min_vram_gb": 4,
           "files": [
             {
-              "name": "talker_safetensors",
-              "filename": "qwen3_tts_talker.gguf",
+              "name": "talker_gguf",
+              "filename": "qwen3tts-talker-1b7-f16.gguf",
               "source": {
                 "provider": "huggingface",
-                "repo": "QwenLM/Qwen3-TTS-For-VoiceDesign",
+                "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
                 "revision": "main",
-                "subpath": "talker",
                 "convert_with": "convert_qwen3tts"
               }
             },
             {
-              "name": "predictor_safetensors",
-              "filename": "qwen3_tts_predictor.gguf",
+              "name": "predictor_gguf",
+              "filename": "qwen3tts-predictor-1b7-f16.gguf",
               "source": {
                 "provider": "huggingface",
-                "repo": "QwenLM/Qwen3-TTS-For-VoiceDesign",
+                "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
                 "revision": "main",
-                "subpath": "code_predictor",
                 "convert_with": "convert_qwen3tts"
               }
             }
@@ -220,8 +258,8 @@
             "family": "qwen3_tts",
             "path": "${MODELS_DIR}/qwen3_tts/1.7b-voicedesign/",
             "extras": {
-              "talker_path":    "qwen3_tts_talker.q5_k.gguf",
-              "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+              "talker_path":    "qwen3tts-talker-1b7-f16.gguf",
+              "predictor_path": "qwen3tts-predictor-1b7-f16.gguf",
               "n_gpu_layers":   "99"
             }
           }
@@ -232,24 +270,22 @@
           "min_vram_gb": 2,
           "files": [
             {
-              "name": "talker_safetensors",
-              "filename": "qwen3_tts_talker.gguf",
+              "name": "talker_gguf",
+              "filename": "qwen3tts-talker-0b6-f16.gguf",
               "source": {
                 "provider": "huggingface",
-                "repo": "QwenLM/Qwen3-TTS-0.6B",
+                "repo": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
                 "revision": "main",
-                "subpath": "talker",
                 "convert_with": "convert_qwen3tts"
               }
             },
             {
-              "name": "predictor_safetensors",
-              "filename": "qwen3_tts_predictor.gguf",
+              "name": "predictor_gguf",
+              "filename": "qwen3tts-predictor-0b6-f16.gguf",
               "source": {
                 "provider": "huggingface",
-                "repo": "QwenLM/Qwen3-TTS-0.6B",
+                "repo": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
                 "revision": "main",
-                "subpath": "code_predictor",
                 "convert_with": "convert_qwen3tts"
               }
             }
@@ -258,8 +294,8 @@
             "family": "qwen3_tts",
             "path": "${MODELS_DIR}/qwen3_tts/0.6b-base/",
             "extras": {
-              "talker_path":    "qwen3_tts_talker.q5_k.gguf",
-              "predictor_path": "qwen3_tts_predictor.q8_0.gguf",
+              "talker_path":    "qwen3tts-talker-0b6-f16.gguf",
+              "predictor_path": "qwen3tts-predictor-0b6-f16.gguf",
               "n_gpu_layers":   "99"
             }
           }

@@ -28,11 +28,11 @@ Three operating modes across the family:
 |---------|-------|------|----------|-----------|------|------|---------------|
 | MOSS-TTS-Delay v1.5 | Q8_0 | 8.0 s | 9.7 s | 30.1 s | 24 kHz | 0.322 | **3.1×** |
 | MOSS-VoiceGenerator | Q8_0 | 0.96 s | 2.54 s | 0.72 s | 24 kHz | 3.53 | 0.3× |
-| MOSS-SoundEffect v1 | Q8_0 | — | — | — | — | — | *not converted to GGUF* |
+| MOSS-SoundEffect v1 | f16 | 2.8 s | 9.7 s | 11.7 s | 24 kHz | 0.83 | 1.2× |
 
 - **MOSS-TTS-Delay** — Qwen3-8B backbone + 32 RVQ audio codebooks + 1.6B transformer codec. Delay-pattern autoregressive generation. Supports voice cloning via `--reference`.
-- **MOSS-VoiceGenerator** — voice design from text descriptions (n_vq=2, shorter clips).
-- **MOSS-SoundEffect v1** — discrete-token AR SFX (n_vq=32). Weights in HF cache but not yet converted to GGUF. Superseded by v2 (below).
+- **MOSS-VoiceGenerator** — voice design from text descriptions (n_vq=16, shorter clips).
+- **MOSS-SoundEffect v1** — discrete-token AR SFX (n_vq=16). Same delay-pattern architecture as TTS-Delay, trained for sound effects. Same AR code path as `tts` mode — the checkpoint weights determine the output type. Superseded in quality by v2 (below), but runs entirely in audiocore's C++/ggml stack (no Python/PyTorch dependency).
 
 ### ACE-Step Family (audiocore C++/ggml, Q8_0)
 
@@ -124,6 +124,7 @@ ACE-Step XL SFT (4B, 50-step)   ████████████████
 
 ```
 MOSS-SFX v2 (10s)        █████████████░░░░░░░  0.61
+MOSS-SFX v1 (f16)        █████████████████░░░  0.83
 MOSS-SFX v2 (3s)         ████████████████████  2.04
 ```
 
@@ -216,5 +217,4 @@ input and output (v1 was 24 kHz mono). Not yet integrated into audiocore.
 
 | Model | Status | Blocker |
 |-------|--------|---------|
-| MOSS-SoundEffect v1 | HF weights only | Not converted to GGUF; superseded by v2 (see MODEL-GAPS.md Gap 3) |
 | MOSS-Audio-Tokenizer v2 | Downloaded, not ported | Needs GGML port for 6-stage 48 kHz stereo codec (see MODEL-GAPS.md Gap 4) |

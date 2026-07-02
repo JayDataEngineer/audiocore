@@ -39,7 +39,7 @@
 //
 // Per-frame streaming (mode="streaming" with a non-null req->stream callback):
 // the AR loop decodes newly available codec frames incrementally and emits
-// PCM through the callback. The first frame becomes available after N_VQ
+// PCM through the callback. The first frame becomes available after n_vq
 // delay steps (~1.3 s at 80 ms/frame) — this is the cold-start of the Delay
 // architecture. It is NOT the upstream MossTTSRealtime architecture, which
 // we do not ship (see GAPS.md §1.1).
@@ -248,7 +248,7 @@ std::vector<int32_t> build_prompt_grid(qwen3::Runner* backbone,
 bool MossSession::embed_one_step(const int32_t* tokens,
                                   std::vector<float>* embd_out,
                                   std::string* error) {
-    // tokens[0] = text token, tokens[1..N_VQ] = audio codec tokens.
+    // tokens[0] = text token, tokens[1..n_vq] = audio codec tokens.
     const int32_t hs = backbone_->hidden_size();
     (void)error;
     embd_out->assign(static_cast<size_t>(hs), 0.0f);
@@ -351,19 +351,45 @@ bool MossSession::run_tts(const void* request, void* response,
         return false;
     }
 
-    // ── Mode dispatch — no fraud system-prompt impersonation ────────────────
-    const bool is_clone = (req->mode == "voice_clone");
+    // ── Mode dispatch ──────────────────────────────────────────────────────
+    const bool is_clone  = (req->mode == "voice_clone");
     const bool is_stream = (req->mode == "streaming");
+    // moss_tts is the single family for all Delay-architecture checkpoints
+    // (flagship TTS, VoiceGenerator, SoundEffect-v1, TTSD — they all share
+    // the same code path). Each checkpoint supports its own mode:
+    //
+    //   n_vq=32 (MOSS-TTS-Delay v1.5):  tts / voice_clone / streaming
+    //   n_vq=16 (MOSS-SoundEffect v1):  sfx (text→audio, same AR path as tts)
+    //   n_vq=16 (MOSS-VoiceGenerator):  voice_design (via npy-loaded audio heads)
+    //
+    // SFX mode uses the identical generation path as TTS mode (text-to-audio,
+    // no reference, non-streaming). The only difference is which checkpoint
+    // is loaded — the model weights, not the mode string, determine the
+    // output quality.
+    //
+    // Requesting a mode that the loaded checkpoint wasn't trained for is
+    // a hard error.
+    bool mode_ok = (req->mode == "tts" ||
+                    req->mode == "voice_clone" ||
+                    req->mode == "streaming" ||
+                    req->mode == "sfx");
+    if (cfg_.n_vq != 32) {
+        // Non-flagship checkpoint — restrict to its intended modes.
+        // SFX and VoiceGenerator both use n_vq=16; the user selects the
+        // appropriate mode for the loaded checkpoint.
+        mode_ok = (req->mode == "voice_design" || req->mode == "sfx");
+    }
 
-    if (req->mode != "tts" && !is_clone && !is_stream) {
+    if (!mode_ok) {
         if (error) *error =
-            std::string("moss_tts: mode '") + req->mode + "' is not supported. "
-            "This build only ships the flagship MOSS-TTS backbone, which "
-            "implements tts / voice_clone / streaming. The requested mode "
-            "needs a dedicated checkpoint that is not loaded — see "
-            "GAPS.md §1.2 for the mapping (sfx→MOSS-SoundEffect, "
-            "dialogue→MOSS-TTSD, voice_design→MOSS-VoiceGenerator, "
-            "realtime→MOSS-TTS-Realtime).";
+            std::string("moss_tts: mode '") + req->mode
+            + "' is not supported by this checkpoint (n_vq="
+            + std::to_string(cfg_.n_vq) + "). "
+            "Supported modes: "
+            + (cfg_.n_vq == 32
+                ? "tts, voice_clone, streaming"
+                : "sfx (MOSS-SoundEffect), voice_design (MOSS-VoiceGenerator)")
+            + ".";
         return false;
     }
 
@@ -479,11 +505,11 @@ bool MossSession::run_tts(const void* request, void* response,
         return false;
     }
 
-    // Re-pack grid into the (S, 1+N_VQ) vector-of-vectors that init_delay_state
+    // Re-pack grid into the (S, 1+n_vq) vector-of-vectors that init_delay_state
     // expects.
     const int32_t total_S = n_text;
     std::vector<std::vector<int32_t>> all_ids(static_cast<size_t>(total_S),
-        std::vector<int32_t>(1 + N_VQ, AUDIO_PAD_CODE));
+        std::vector<int32_t>(1 + cfg_.n_vq, AUDIO_PAD_CODE));
     const int32_t cols = 1 + cfg_.n_vq;
     for (int32_t r = 0; r < total_S; ++r) {
         for (int32_t c = 0; c < cols; ++c) {
@@ -516,7 +542,7 @@ bool MossSession::run_tts(const void* request, void* response,
         }
 
         // Sum audio embeddings for each stream (reference-audio rows only).
-        // The text rows have AUDIO_PAD_CODE in channels 1..N_VQ.
+        // The text rows have AUDIO_PAD_CODE in channels 1..n_vq.
         const bool is_ref_row = (text_tok == cfg_.tok_user_slot);
         if (!is_ref_row) continue;
         for (int s = 0; s < cfg_.n_vq; ++s) {
@@ -556,7 +582,7 @@ bool MossSession::run_tts(const void* request, void* response,
     }
 
     // ── 4. Delay state from full multi-channel prompt ──────────────────────
-    DelayState state = init_delay_state(all_ids);
+    DelayState state = init_delay_state(all_ids, cfg_.n_vq);
 
     SamplingConfig samp_cfg;
     samp_cfg.text_temperature  = req->text_temperature > 0.0f ? req->text_temperature : 1.5f;
@@ -641,12 +667,12 @@ bool MossSession::run_tts(const void* request, void* response,
         // ── Per-frame streaming: decode newly available frames ────────────
         if (streaming && codec_graphs_.is_present()) {
             const int32_t n_delayed = static_cast<int32_t>(state.audio_buf.size());
-            if (n_delayed >= N_VQ) {
-                auto dedelayed = apply_de_delay_pattern(state.audio_buf);
+            if (n_delayed >= cfg_.n_vq) {
+                auto dedelayed = apply_de_delay_pattern(state.audio_buf, cfg_.n_vq);
                 const int32_t n_available = static_cast<int32_t>(dedelayed.size());
                 if (n_available > decoded_frames) {
                     for (int32_t i = decoded_frames; i < n_available; i++) {
-                        for (int32_t s = 0; s < N_VQ; s++) {
+                        for (int32_t s = 0; s < cfg_.n_vq; s++) {
                             if (dedelayed[size_t(i)][size_t(s)] >= cfg_.audio_vocab_size)
                                 dedelayed[size_t(i)][size_t(s)] = 0;
                         }
@@ -686,13 +712,13 @@ bool MossSession::run_tts(const void* request, void* response,
 
     // ── 6. Extract audio from generation output ────────────────────────────
     auto audio_channels = state.audio_buf;
-    auto segments = extract_audio_segments(audio_channels);
+    auto segments = extract_audio_segments(audio_channels, cfg_.n_vq);
 
     if (streaming && codec_graphs_.is_present() && !segments.empty()) {
         const int32_t n_remaining = static_cast<int32_t>(segments.size()) - decoded_frames;
         if (n_remaining > 0) {
             for (int32_t i = decoded_frames; i < static_cast<int32_t>(segments.size()); i++) {
-                for (int32_t s = 0; s < N_VQ; s++) {
+                for (int32_t s = 0; s < cfg_.n_vq; s++) {
                     if (segments[size_t(i)][size_t(s)] >= cfg_.audio_vocab_size)
                         segments[size_t(i)][size_t(s)] = 0;
                 }
