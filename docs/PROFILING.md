@@ -13,6 +13,7 @@
 | Variant | Params | Load | Generate | Audio out | SR | RTF | Speedup vs RT |
 |---------|--------|------|----------|-----------|------|------|---------------|
 | 0.6B Base (voice clone) | 0.6B | 0.32 s | 26.5 s | 327.7 s | 24 kHz | 0.081 | **12.4×** |
+| 0.6B CustomVoice | 0.6B | 0.28 s | 26.5 s | 327.7 s | 24 kHz | 0.081 | **12.4×** |
 | 1.7B Base (voice clone) | 1.7B | 0.62 s | 41.7 s | 327.7 s | 24 kHz | 0.127 | 7.9× |
 | 1.7B CustomVoice | 1.7B | 0.51 s | 41.3 s | 327.7 s | 24 kHz | 0.126 | 7.9× |
 | 1.7B VoiceDesign | 1.7B | 10.1 s | 41.5 s | 327.7 s | 24 kHz | 0.127 | 7.9× |
@@ -103,11 +104,12 @@ up the override.
 ### TTS / Speech Generation (RTF — lower is better)
 
 ```
-Qwen3-TTS 0.6B Base      ████░░░░░░░░░░░░░░░░  0.081  (12.4× RT)
-Qwen3-TTS 1.7B Base      ██████░░░░░░░░░░░░░░  0.127  ( 7.9× RT)
-Qwen3-TTS CustomVoice    ██████░░░░░░░░░░░░░░  0.126  ( 7.9× RT)
-Qwen3-TTS VoiceDesign    ██████░░░░░░░░░░░░░░  0.127  ( 7.9× RT)
-MOSS-TTS-Delay v1.5 Q8   ████████████████░░░░  0.322  ( 3.1× RT)
+Qwen3-TTS 0.6B Base        ████░░░░░░░░░░░░░░░░  0.081  (12.4× RT)
+Qwen3-TTS 0.6B CustomVoice ████░░░░░░░░░░░░░░░░  0.081  (12.4× RT)
+Qwen3-TTS 1.7B Base        ██████░░░░░░░░░░░░░░  0.127  ( 7.9× RT)
+Qwen3-TTS 1.7B CustomVoice ██████░░░░░░░░░░░░░░  0.126  ( 7.9× RT)
+Qwen3-TTS 1.7B VoiceDesign ██████░░░░░░░░░░░░░░  0.127  ( 7.9× RT)
+MOSS-TTS-Delay v1.5 Q8     ████████████████░░░░  0.322  ( 3.1× RT)
 ```
 
 ### Music Generation (RTF — lower is better)
@@ -213,7 +215,7 @@ by the TTS/SFX models above.
 |-----------|---------|-----|----------|---------|-------|
 | MOSS-Audio-Tokenizer | v1 | 24 kHz | mono | ✅ `moss-audio-tokenizer/` | Used by MOSS-TTS-Delay. Codec encoder/decoder. |
 | MOSS-Audio-Tokenizer Nano | v1 | 24 kHz | mono | ✅ `moss-audio-tokenizer-nano/` | Smaller variant. |
-| MOSS-Audio-Tokenizer | **v2** | **48 kHz** | **stereo** | ✅ downloaded | 8.1 GB safetensors. Needs GGML port (6-stage codec). See MODEL-GAPS.md |
+| MOSS-Audio-Tokenizer | **v2** | **48 kHz** | **stereo** | ✅ downloaded | Used internally by MOSS-SFX v2 Python project (48 kHz stereo output). Not ported to GGML — see MODEL-GAPS.md Gap B for why a port would be needed (MOSS-TTS-Local-Transformer-v1.5). |
 | Qwen3-TTS-Tokenizer-12Hz | — | 24 kHz | mono | ✅ `qwen3_tts/0.6b-base/tokenizer-f16.gguf` | Used by all Qwen3-TTS variants. GGUF port (codec decode fix above). |
 
 ### Release Notes
@@ -231,4 +233,7 @@ input and output (v1 was 24 kHz mono). Not yet integrated into audiocore.
 
 | Model | Status | Blocker |
 |-------|--------|---------|
-| MOSS-Audio-Tokenizer v2 | Downloaded, not ported | Needs GGML port for 6-stage 48 kHz stereo codec (see MODEL-GAPS.md Gap 4) |
+| MOSS-TTSD (dialogue) | Not downloaded | Same Delay architecture — needs HF download + GGUF conversion. See MODEL-GAPS.md Gap A |
+| MOSS-TTS-Local-Transformer-v1.5 | Not downloaded | New MossTTSLocal architecture (4B backbone, 48 kHz stereo). See MODEL-GAPS.md Gap B |
+| MOSS-TTS-Realtime | Not downloaded | MossTTSRealtime architecture — needs new code path. See MODEL-GAPS.md Gap C |
+| MOSS-TTS-Nano | Not downloaded | MossTTSNano architecture (~100M, CPU-first). See MODEL-GAPS.md Gap D |
