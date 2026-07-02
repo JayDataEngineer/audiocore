@@ -161,6 +161,7 @@ uv run python benchmark.py --model $MODEL_DIR --seconds 10 --steps 50
 |----------|----------|
 | audiocore benchmark script | `/tmp/bench_audiocore.py` |
 | audiocore raw results (JSON) | `/tmp/audiocore_bench_results.json` |
+| MOSS-SFX v1 benchmark results | `/tmp/moss_sfx_v1_bench.json` |
 | ACE-Step benchmark | `tests/test_acestep_e2e.cpp` (env: `ACESTEP_DIR`, `ACESTEP_DIT_VARIANT`, `ACESTEP_LM_VARIANT`) |
 | MOSS-SFX v2 project | `../moss-sfx-v2/benchmark.py` |
 | Codec fix source | `src/models/qwen3_tts/codec.cpp` |
@@ -184,6 +185,19 @@ import audiocore; audiocore.init()
 sess = audiocore.Session.create('qwen3_tts')
 sess.load('/mnt/data/models/audio/qwen3_tts/0.6b-base', backend='ggml_cuda', device=0)
 pcm, sr = sess.run_tts('Hello world', temperature=0.7, top_p=0.9, seed=42)
+print(f'{len(pcm)} samples @ {sr} Hz = {len(pcm)/sr:.1f}s')
+"
+```
+
+### Running MOSS-SoundEffect v1 benchmark
+
+```bash
+export LD_LIBRARY_PATH=build:build/third_party/llama.cpp/build/src
+PYTHONPATH=build-py/python python3 -c "
+import audiocore; audiocore.init()
+sess = audiocore.Session.create('moss_tts')
+sess.load('/mnt/data/models/audio/moss-sfx', backend='ggml_cuda', device=0)
+pcm, sr = sess.run_tts('heavy rain on tin roof', mode='sfx', temperature=0.8, top_p=0.9, seed=42)
 print(f'{len(pcm)} samples @ {sr} Hz = {len(pcm)/sr:.1f}s')
 "
 ```
