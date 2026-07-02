@@ -205,11 +205,15 @@ private:
     // Called inside decode() after galloc allocates the graph.
     void upload_weights_();
 
+    // Clear the persistent weight tensors' device data/buffer pointers so
+    // the next gallocr_alloc_graph allocates fresh memory instead of reusing
+    // dangling pointers from the previous decode()/encode() call.
+    void reset_weight_data_();
+
     // ── State ───────────────────────────────────────────────────────────
     bool            present_    = false;
     ggml_context*   source_ctx_ = nullptr;  // not owned
     ggml_backend_t  backend_    = nullptr;  // not owned
-    ggml_gallocr_t  galloc_     = nullptr;  // owned
 
     // RVQ front-end.
     ggml_tensor*    rvq_first_cb_     = nullptr;

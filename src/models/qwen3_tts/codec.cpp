@@ -65,6 +65,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -89,9 +90,7 @@ constexpr uint16_t F16_NEG_INF = 0xFC00;
 // Lifecycle
 // ───────────────────────────────────────────────────────────────────────────
 
-Qwen3TtsCodecGraphs::~Qwen3TtsCodecGraphs() {
-    if (galloc_) ggml_gallocr_free(galloc_);
-}
+Qwen3TtsCodecGraphs::~Qwen3TtsCodecGraphs() = default;
 
 ggml_tensor* Qwen3TtsCodecGraphs::tensor_(const std::string& name) const {
     ggml_tensor* t = ggml_get_tensor(source_ctx_, name.c_str());
@@ -223,11 +222,6 @@ bool Qwen3TtsCodecGraphs::bind(ggml_context* source_ctx,
         if (error) *error = std::string("Qwen3TtsCodecGraphs::bind: ") + e.what();
         return false;
     }
-    galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
-    if (!galloc_) {
-        if (error) *error = "Qwen3TtsCodecGraphs::bind: gallocr_new failed";
-        return false;
-    }
     present_ = true;
     return true;
 }
@@ -259,7 +253,15 @@ ggml_tensor* Qwen3TtsCodecGraphs::causal_conv1d_(ggml_context* ctx,
         // ggml_conv_1d's internal im2col step sees a standard 2D input.
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
     }
-    x = ggml_conv_1d(ctx, w, x, stride, /*p0=*/0, dilation);
+    // Decompose conv1d into im2col + mul_mat (F32 output avoids F16 conversion
+    // overhead in the CUDA backend vs ggml_conv_1d's hardcoded GGML_TYPE_F16).
+    {
+        auto ci = ggml_im2col(ctx, w, x, stride, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
+        auto ci_2d = ggml_reshape_2d(ctx, ci, ci->ne[0], ci->ne[2] * ci->ne[1]);
+        auto w_2d = ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]);
+        x = ggml_mul_mat(ctx, w_2d, ci_2d);
+        x = ggml_reshape_3d(ctx, x, ci->ne[1], w->ne[2], ci->ne[2]);
+    }
     x = ggml_cont(ctx, ggml_transpose(ctx, x));                    // [C_out, T_out]
     if (b) x = ggml_add(ctx, x, b);
     return x;
@@ -279,7 +281,13 @@ ggml_tensor* Qwen3TtsCodecGraphs::dw_causal_conv1d_(ggml_context* ctx,
         x = ggml_pad_ext(ctx, x, pad_left, 0, 0, 0, 0, 0, 0, 0);
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
     }
-    x = ggml_conv_1d_dw(ctx, w, x, /*s0=*/1, /*p0=*/0, /*d0=*/1);
+    // Decompose depthwise conv1d into im2col + mul_mat (F32 output).
+    {
+        auto dw_x4 = ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], 1);
+        auto dw_ci = ggml_im2col(ctx, w, dw_x4, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
+        x = ggml_mul_mat(ctx, dw_ci, w);
+        x = ggml_reshape_3d(ctx, x, x->ne[0], x->ne[2], 1);
+    }
     if (ggml_n_dims(x) > 2) {
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2]);
     }
@@ -288,9 +296,14 @@ ggml_tensor* Qwen3TtsCodecGraphs::dw_causal_conv1d_(ggml_context* ctx,
     return x;
 }
 
-// Causal transposed Conv1d (crop path). CrispASR codec_transposed_conv1d
-// fallback → core_convt::convt1d_crop. Crops K-stride samples from the right
-// tail so output time = T_in * stride.
+// Transposed Conv1d via mul_mat + col2im_1d.  The stock ggml_conv_transpose_1d
+// CUDA kernel (conv-transpose-1d.cu) is O(T_in × T_out) — it loops over ALL
+// input positions per output element with a branch check.  Replacing it with
+// a matmul (W · x) → col2im_1d avoids the O(T²) blowup, uses the fast cuBLAS
+// matmul, and the existing col2im CUDA kernel which only visits the K/s
+// contributing positions per output element.
+//
+// Crops K−stride samples from the right tail so output time = T_in × stride.
 ggml_tensor* Qwen3TtsCodecGraphs::transposed_conv1d_(ggml_context* ctx,
                                                         ggml_tensor* x,
                                                         ggml_tensor* w,
@@ -299,34 +312,51 @@ ggml_tensor* Qwen3TtsCodecGraphs::transposed_conv1d_(ggml_context* ctx,
     const int K = (int)w->ne[0];
     const int crop_right = (K > stride) ? (K - stride) : 0;
     const int Cout = (int)w->ne[1];
+    const int Cin  = (int)w->ne[2];
 
-    // CUDA ggml_conv_transpose_1d requires F32 weights (asserts in
-    // conv-transpose-1d.cu:67). The codec GGUF stores most tensors quantized
-    // (Q8_0 for the q8_0 variant). Dequantize on-the-fly via a graph-level
-    // ggml_cpy — the CUDA backend handles Q8_0→F32 conversion natively
-    // (ggml_cuda_cpy at cpy.cu:506-508).
-    //
-    // Preserve all weight dimensions (some conv weights are 3D [K, C_out, C_in]
-    // while others are 2D [K, C_out]) so the nelements match assertion in
-    // ggml_cpy passes.
+    // Dequantize to F32 if needed (col2im_1d supports F32/F16/BF16, but the
+    // matmul below works in F32 regardless — keep weight F32 for simplicity).
     if (w->type != GGML_TYPE_F32) {
         const int nd = ggml_n_dims(w);
         w = ggml_cpy(ctx, w, ggml_new_tensor(ctx, GGML_TYPE_F32, nd, w->ne));
     }
 
-    ggml_tensor* xT = ggml_cont(ctx, ggml_transpose(ctx, x));      // [T_in, Cin]
-    ggml_tensor* y  = ggml_conv_transpose_1d(ctx, w, xT, stride, /*p0=*/0, /*d0=*/1);
+    // x shape: [C_in, T_in]  (codec convention: channels × time)
+    //   GGML memory layout: ne[0]=C_in, ne[1]=T_in  (channels fastest)
+    //
+    // w shape (3D): ne = [K, C_out, C_in]   (K fastest, C_in slowest)
+    //   flat[k + K*cout + K*Cout*cin]
+    //   For fixed cin, the (k, cout) plane has k fast and cout slow — exactly
+    //   the i = cout*K + k packing that col2im_1d's column index uses.
+
+    // ── Step 1: columns = W · x  →  [K*C_out, T_in] ─────────────────────
+    //   columns[i = cout*K + k, t_in] = Σ_cin w[k, cout, cin] · x[cin, t_in]
+    //
+    // ggml_mul_mat(A, B) computes result[i,j] = Σ_l A[l,i] · B[l,j]
+    //   with reduction over A->ne[0] == B->ne[0].  We need:
+    //     A[l=cin, i]        = w[i, cin]  →  A = w_2dᵀ  (ne[0]=Cin, ne[1]=K*Cout)
+    //     B[l=cin, j=t_in]   = x[cin, t_in]
+    //   Reshape w [K, Cout, Cin] → w_2d [K*Cout, Cin] (memory-compatible:
+    //   row i = cout*K + k).  Transpose to put Cin as ne[0] for cuBLAS.
+    auto w_2d  = ggml_reshape_2d(ctx, w, K * Cout, Cin);            // [K*Cout, Cin]
+    auto w_mat = ggml_cont(ctx, ggml_transpose(ctx, w_2d));         // [Cin, K*Cout]
+    auto columns = ggml_mul_mat(ctx, w_mat, x);                      // [K*Cout, T_in]
+
+    // ── Step 2: col2im_1d — scatter columns into output signal ──────────
+    auto y = ggml_col2im_1d(ctx, columns, stride, Cout, /*p0=*/0);
+
+    // ── Step 3: crop right tail ─────────────────────────────────────────
     const int64_t T_unpad = y->ne[0];
     const int64_t T_out   = T_unpad - crop_right;
-    y = ggml_reshape_2d(ctx, y, T_unpad, Cout);
     if (crop_right > 0) {
-        // View [T_out, Cout] from the uncropped buffer, offset 0 (left aligned).
         y = ggml_view_2d(ctx, y, T_out, Cout,
                          (size_t)T_unpad * sizeof(float),
                          /*offset=*/0);
-        y = ggml_cont(ctx, y);                                      // [T_out, Cout]
+        y = ggml_cont(ctx, y);
     }
-    y = ggml_cont(ctx, ggml_transpose(ctx, y));                    // [Cout, T_out]
+
+    // ── Step 4: restore codec convention [C_out, T_out] + bias ──────────
+    y = ggml_cont(ctx, ggml_transpose(ctx, y));
     if (b) y = ggml_add(ctx, y, b);
     return y;
 }
@@ -501,6 +531,20 @@ void Qwen3TtsCodecGraphs::upload_weights_() {
     }
 }
 
+// Clear the device-data / buffer back-pointers that the previous gallocr set
+// on the persistent weight tensors (which live in source_ctx_, not the
+// per-call ctx).  ggml_gallocr_is_allocated() treats t->data != NULL as
+// "already allocated externally" and skips reallocation — so without this
+// reset, the second decode() call's fresh gallocr would leave the weight
+// tensors pointing at the first call's freed device memory, and the next
+// upload_weights_() would cudaMemcpyAsync into a dangling pointer.
+void Qwen3TtsCodecGraphs::reset_weight_data_() {
+    for (auto& ws : weight_srcs_) {
+        ws.tensor->data   = nullptr;
+        ws.tensor->buffer = nullptr;
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Decode entry point (CrispASR build_graph_codec_decode + codec_decode_window
 // fused into a single-pass entry — lines 3660-3807 + 4192-4274).
@@ -536,6 +580,7 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
     }
 
     const int n_samples = T_codec * 1920;
+    auto codec_t0 = std::chrono::steady_clock::now();
 
     // ── Build graph ─────────────────────────────────────────────────────
     ggml_init_params ip{};
@@ -636,10 +681,23 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
     ggml_cgraph* graph = ggml_new_graph_custom(ctx, 65536, false);
     ggml_build_forward_expand(graph, waveform);
 
-    if (!ggml_gallocr_alloc_graph(galloc_, graph)) {
+    auto t_alloc = std::chrono::steady_clock::now();
+    // Per-call gallocr: a persistent gallocr retains stale device pointers in
+    // the weight tensors across decode() calls (each call frees its ctx and
+    // builds a new graph), so the second chunk's upload_weights_() would
+    // cudaMemcpyAsync into freed memory. A fresh gallocr per call avoids this.
+    reset_weight_data_();
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    if (!galloc) {
+        ggml_free(ctx);
+        throw std::runtime_error("Qwen3TtsCodecGraphs::decode: gallocr_new failed");
+    }
+    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx);
         throw std::runtime_error("Qwen3TtsCodecGraphs::decode: gallocr_alloc_graph failed");
     }
+    auto t_wup = std::chrono::steady_clock::now();
 
     // ── Upload weight data from GGUF mmap to device memory ──────────────
     // The weight tensors from meta_ctx_ have data==NULL (no_alloc=true).
@@ -647,6 +705,7 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
     // uninitialized. Copy the actual weight data from the GGUF mmap into
     // the freshly-allocated device buffers before compute.
     upload_weights_();
+    auto t_input = std::chrono::steady_clock::now();
 
     // ── Upload inputs ───────────────────────────────────────────────────
     // codes is already (n_q, T_codec) row-major, which matches codes_inp's
@@ -660,16 +719,37 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
                              pos_vals.size() * sizeof(int32_t));
 
     fill_causal_mask_(mask);
+    auto t_compute = std::chrono::steady_clock::now();
 
     if (ggml_backend_graph_compute(backend_, graph) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx);
         throw std::runtime_error("Qwen3TtsCodecGraphs::decode: graph_compute failed");
     }
+    auto t_read = std::chrono::steady_clock::now();
 
     std::vector<float> wav;
     wav.resize(size_t(n_samples));
     ggml_backend_tensor_get(waveform, wav.data(), 0, wav.size() * sizeof(float));
+    auto t_end = std::chrono::steady_clock::now();
 
+    auto dur_alloc = std::chrono::duration<double>(t_wup - t_alloc).count();
+    auto dur_wup   = std::chrono::duration<double>(t_input - t_wup).count();
+    auto dur_input = std::chrono::duration<double>(t_compute - t_input).count();
+    auto dur_compute = std::chrono::duration<double>(t_read - t_compute).count();
+    auto dur_read  = std::chrono::duration<double>(t_end - t_read).count();
+    auto dur_total = std::chrono::duration<double>(t_end - codec_t0).count();
+    int n_nodes = ggml_graph_n_nodes(graph);
+    int n_compute = 0;
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor* n = ggml_graph_node(graph, i);
+        if (!(n->flags & GGML_TENSOR_FLAG_COMPUTE)) continue;
+        n_compute++;
+    }
+    std::fprintf(stderr, "qwen3_tts: codec T=%d: backend=%s nodes=%d/%d alloc=%.3fs wup=%.3fs input=%.3fs compute=%.3fs read=%.3fs total=%.3fs\n",
+                 T_codec, ggml_backend_name(backend_), n_compute, n_nodes, dur_alloc, dur_wup, dur_input, dur_compute, dur_read, dur_total);
+
+    ggml_gallocr_free(galloc);
     ggml_free(ctx);
     return wav;
 }
@@ -947,7 +1027,14 @@ std::vector<int32_t> Qwen3TtsCodecGraphs::encode(const float* pcm,
     ggml_build_forward_expand(graph, h);
 
     // Allocate + compute
-    if (!ggml_gallocr_alloc_graph(galloc_, graph)) {
+    reset_weight_data_();
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+    if (!galloc) {
+        ggml_free(ctx);
+        throw std::runtime_error("Qwen3TtsCodecGraphs::encode: gallocr_new failed");
+    }
+    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx);
         throw std::runtime_error("Qwen3TtsCodecGraphs::encode: gallocr_alloc_graph failed");
     }
@@ -959,6 +1046,7 @@ std::vector<int32_t> Qwen3TtsCodecGraphs::encode(const float* pcm,
                                 size_t(T_pad - n_samples) * sizeof(float));
     }
     if (ggml_backend_graph_compute(backend_, graph) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx);
         throw std::runtime_error("Qwen3TtsCodecGraphs::encode: graph_compute failed");
     }
@@ -969,6 +1057,7 @@ std::vector<int32_t> Qwen3TtsCodecGraphs::encode(const float* pcm,
     std::vector<float> h_cpu(size_t(C_latent) * size_t(T_frames));
     ggml_backend_tensor_get(h, h_cpu.data(), 0, h_cpu.size() * sizeof(float));
 
+    ggml_gallocr_free(galloc);
     ggml_free(ctx);
 
     // RVQ quantize to codes
