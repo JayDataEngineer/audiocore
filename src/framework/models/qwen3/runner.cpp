@@ -120,6 +120,7 @@ Runner::~Runner() {
     delete[] small_to_mtp_b_;
     if (ctx_)   llama_free(ctx_);
     if (model_) llama_model_free(model_);
+    if (tokenizer_model_) llama_model_free(tokenizer_model_);
 }
 
 std::unique_ptr<Runner> Runner::load(const std::string& gguf_path,
@@ -161,6 +162,18 @@ std::unique_ptr<Runner> Runner::load(const std::string& gguf_path,
     self->hidden_size_ = llama_model_n_embd(self->model_);
     const llama_vocab* vocab = llama_model_get_vocab(self->model_);
     self->vocab_size_  = vocab ? llama_vocab_n_tokens(vocab) : 0;
+    // RoPE type: both talker and predictor use NEOX (1 pos per embd) in TTS-only
+    // mode. The talker's config says rope_scaling.interleaved=true with
+    // mrope_section=[24,20,20], but the actual rotation is rotate_half (NEOX
+    // pairs (i, i+n/2)) after a cos/sin reorder. In TTS-only mode where all 3
+    // multimodal axes share the same position id, IMROPE and NEOX produce
+    // identical results. We force rope_type=NEOX in llama-model.cpp and use
+    // standard 1D positions here. See MODEL-GAPS.md Gap Q.
+    {
+        const auto rt = llama_model_rope_type(self->model_);
+        self->n_pos_per_embd_ = (rt == LLAMA_ROPE_TYPE_MROPE ||
+                                  rt == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
+    }
     return self;
 }
 
@@ -169,9 +182,13 @@ std::unique_ptr<Runner> Runner::load(const std::string& gguf_path,
 // output so callers can read per-row logits/embeddings. Pass
 // `last_only=true` to mark only the final position for output — used for
 // intermediate prefill chunks where intermediate hidden states are not needed.
+//
+// n_pos_per_embd: from llama_model_rope_type(). M-RoPE/IM-RoPE → 4, else 1.
+// For embedding input with M-RoPE, the pos array must hold n_pos_per_embd
+// contiguous copies of the position sequence (one per RoPE section).
 static llama_batch make_batch(int32_t n_tokens, int32_t n_pos, bool is_embd,
                               const float* embd, const llama_token* tokens,
-                              bool last_only = false) {
+                              bool last_only, uint32_t n_pos_per_embd) {
     llama_batch b = llama_batch_init(n_tokens,
                                      /*embd=*/ is_embd ? 1 : 0,
                                      /*n_seq_max=*/ 1);
@@ -179,11 +196,28 @@ static llama_batch make_batch(int32_t n_tokens, int32_t n_pos, bool is_embd,
     if (is_embd) {
         b.token = nullptr;
         b.embd  = const_cast<float*>(embd);
+        // For M-RoPE (n_pos_per_embd > 1) with embedding input, llama.cpp's
+        // batch allocator reads batch.pos[j * n_tokens + i] for each RoPE
+        // section j. The default pos allocation (n_tokens entries) is too
+        // small — realloc to n_pos_per_embd * n_tokens and fill all sections
+        // with the same monotonically increasing positions.
+        if (n_pos_per_embd > 1) {
+            b.pos = (llama_pos*) realloc(b.pos,
+                        sizeof(llama_pos) * n_tokens * n_pos_per_embd);
+            for (uint32_t j = 0; j < n_pos_per_embd; j++) {
+                for (int32_t i = 0; i < n_tokens; i++)
+                    b.pos[j * n_tokens + i] = n_pos + i;
+            }
+        } else {
+            for (int32_t i = 0; i < n_tokens; i++) b.pos[i] = n_pos + i;
+        }
     } else {
         b.token = const_cast<llama_token*>(tokens);
         b.embd  = nullptr;
+        // Token input: batch.token is non-null, so ubatch_add broadcasts
+        // pos[i] across all RoPE sections — no extended array needed.
+        for (int32_t i = 0; i < n_tokens; i++) b.pos[i] = n_pos + i;
     }
-    for (int32_t i = 0; i < n_tokens; i++) b.pos[i] = n_pos + i;
     // Mark output positions. last_only=true: only the final row is live,
     // which avoids allocating/computing output for prefill chunks.
     for (int32_t i = 0; i < n_tokens; i++)
@@ -216,7 +250,7 @@ bool Runner::forward_embeddings(const float* embd, int32_t n_tokens, int32_t n_p
 
         llama_batch b = make_batch(chunk_size, n_pos + chunk_start,
                                    /*is_embd=*/true, chunk_embd, nullptr,
-                                   /*last_only=*/true);
+                                   /*last_only=*/true, n_pos_per_embd_);
         const bool ok = (llama_decode(ctx_, b) == 0);
         b.token = nullptr;
         b.embd  = nullptr;
@@ -248,7 +282,8 @@ bool Runner::forward_embeddings(const float* embd, int32_t n_tokens, int32_t n_p
 bool Runner::forward_tokens(const int32_t* tokens, int32_t n_tokens, int32_t n_pos,
                             float* logits, std::string* error) {
     llama_batch b = make_batch(n_tokens, n_pos, /*is_embd=*/false,
-                               nullptr, reinterpret_cast<const llama_token*>(tokens));
+                               nullptr, reinterpret_cast<const llama_token*>(tokens),
+                               /*last_only=*/false, n_pos_per_embd_);
     const int32_t n_vocab = vocab_size_;
     bool ok = (llama_decode(ctx_, b) == 0);
     if (!ok) {
@@ -278,7 +313,8 @@ bool Runner::forward_get_embeddings(const int32_t* tokens, int32_t n_tokens,
                                      int32_t n_pos, float* hidden,
                                      std::string* error) {
     llama_batch b = make_batch(n_tokens, n_pos, /*is_embd=*/false,
-                               nullptr, reinterpret_cast<const llama_token*>(tokens));
+                               nullptr, reinterpret_cast<const llama_token*>(tokens),
+                               /*last_only=*/false, n_pos_per_embd_);
     const int32_t n_embd = hidden_size_;
     bool ok = (llama_decode(ctx_, b) == 0);
     if (!ok) {
@@ -315,7 +351,10 @@ const float* Runner::get_logits_ith(int32_t i) const {
 bool Runner::tokenize(const std::string& text, bool add_special,
                       bool parse_special, std::vector<int32_t>* tokens,
                       int32_t* needed, std::string* error) const {
-    const llama_vocab* vocab = model_ ? llama_model_get_vocab(model_) : nullptr;
+    // Prefer the tokenizer sidecar (real Qwen3 BPE) when loaded; fall back
+    // to the talker model's built-in tokenizer (the dummy codec-vocab stub).
+    llama_model* tok_model = tokenizer_model_ ? tokenizer_model_ : model_;
+    const llama_vocab* vocab = tok_model ? llama_model_get_vocab(tok_model) : nullptr;
     if (!vocab) {
         if (error) *error = "model has no vocab";
         return false;
@@ -349,9 +388,39 @@ bool Runner::tokenize(const std::string& text, bool add_special,
     return true;
 }
 
+bool Runner::load_tokenizer(const std::string& gguf_path,
+                            std::string* error) {
+    if (tokenizer_model_) {
+        llama_model_free(tokenizer_model_);
+        tokenizer_model_ = nullptr;
+    }
+    llama_model_params mp = llama_model_default_params();
+    mp.vocab_only  = true;   // no weights, just the tokenizer
+    mp.use_mmap    = true;
+    mp.n_gpu_layers = 0;
+
+    tokenizer_model_ = llama_model_load_from_file(gguf_path.c_str(), mp);
+    if (!tokenizer_model_) {
+        if (error) *error = "load_tokenizer: llama_model_load_from_file failed: " + gguf_path;
+        return false;
+    }
+    // Quick sanity: verify the vocab size matches what we expect.
+    const llama_vocab* vocab = llama_model_get_vocab(tokenizer_model_);
+    int32_t n = vocab ? llama_vocab_n_tokens(vocab) : 0;
+    if (n < 1000) {
+        if (error) *error = "load_tokenizer: vocab too small (" + std::to_string(n) + " tokens)";
+        llama_model_free(tokenizer_model_);
+        tokenizer_model_ = nullptr;
+        return false;
+    }
+    std::fprintf(stderr, "qwen3_tts: tokenizer sidecar loaded (%d tokens)\n", n);
+    return true;
+}
+
 bool Runner::token_to_piece(int32_t token, std::string* out,
                             std::string* error) const {
-    const llama_vocab* vocab = model_ ? llama_model_get_vocab(model_) : nullptr;
+    llama_model* tok_model = tokenizer_model_ ? tokenizer_model_ : model_;
+    const llama_vocab* vocab = tok_model ? llama_model_get_vocab(tok_model) : nullptr;
     if (!vocab) {
         if (error) *error = "model has no vocab";
         return false;
@@ -377,19 +446,22 @@ bool Runner::token_to_piece(int32_t token, std::string* out,
 }
 
 bool Runner::is_eog(int32_t token) const {
-    const llama_vocab* vocab = model_ ? llama_model_get_vocab(model_) : nullptr;
+    llama_model* tok_model = tokenizer_model_ ? tokenizer_model_ : model_;
+    const llama_vocab* vocab = tok_model ? llama_model_get_vocab(tok_model) : nullptr;
     if (!vocab) return false;
     return llama_vocab_is_eog(vocab, static_cast<llama_token>(token));
 }
 
 int32_t Runner::bos_token_id() const {
-    const llama_vocab* vocab = model_ ? llama_model_get_vocab(model_) : nullptr;
+    llama_model* tok_model = tokenizer_model_ ? tokenizer_model_ : model_;
+    const llama_vocab* vocab = tok_model ? llama_model_get_vocab(tok_model) : nullptr;
     if (!vocab) return 151644;
     return llama_vocab_bos(vocab);
 }
 
 int32_t Runner::eos_token_id() const {
-    const llama_vocab* vocab = model_ ? llama_model_get_vocab(model_) : nullptr;
+    llama_model* tok_model = tokenizer_model_ ? tokenizer_model_ : model_;
+    const llama_vocab* vocab = tok_model ? llama_model_get_vocab(tok_model) : nullptr;
     if (!vocab) return 151645;
     return llama_vocab_eos(vocab);
 }
@@ -546,14 +618,22 @@ bool Runner::load_predictor_extras(const std::string& gguf_path,
 
     // Detect MTP tensors — if none, this is a Lunavox-style predictor that
     // only uses the libllama-loaded weights via forward_tokens.
-    int found = 0;
+    // Count the ACTUAL number of codec_embd.{i}.weight tensors in the GGUF,
+    // which may be less than the requested n_fine_books_ (e.g. 15 vs 31).
+    int detected_books = 0;
     for (int i = 0; i < n_fine_books_; i++) {
         char name[256];
         std::snprintf(name, sizeof(name), "codec_embd.%d.weight", i);
-        if (reader.find(name)) ++found;
+        if (reader.find(name)) ++detected_books;
+        else break;   // tensors are contiguous; stop at first gap
     }
-    if (found == 0) return true;   // Lunavox-style GGUF; no MTP
+    if (detected_books == 0) return true;   // Lunavox-style GGUF; no MTP
 
+    // Update n_fine_books_ to the actual count from the GGUF.
+    if (detected_books < n_fine_books_) {
+        n_fine_books_  = detected_books;
+        n_codebooks_   = n_fine_books_ + 1;
+    }
     has_mtp_ = true;
     fine_embd_ = new float*[static_cast<size_t>(n_fine_books_)]();
     fine_head_ = new float*[static_cast<size_t>(n_fine_books_)]();
@@ -583,6 +663,31 @@ bool Runner::load_predictor_extras(const std::string& gguf_path,
 
     small_to_mtp_w_ = materialize_f32(reader, "small_to_mtp.weight");
     small_to_mtp_b_ = materialize_f32(reader, "small_to_mtp.bias");
+    // Capture the small_to_mtp weight shape so the projection loop knows
+    // the talker hidden dim (input). Without this, the loop would use
+    // `hidden_size_` (predictor dim) for both dims, which only works on
+    // 0.6B where talker==predictor==1024. On 1.7B (talker=2048,
+    // predictor=1024) the mismatch drops half the input and uses the wrong
+    // row stride → garbage fine codebooks → unintelligible audio.
+    if (small_to_mtp_w_) {
+        const TensorStorage* ts = reader.find("small_to_mtp.weight");
+        if (ts && ts->n_dims >= 2) {
+            // ggml shape convention: ne[0] = innermost (input/features),
+            // ne[1] = outermost (output/rows). The Linear is stored as
+            // [in_features, out_features] (column-major) = ne[0]=in, ne[1]=out.
+            small_to_mtp_in_  = static_cast<int32_t>(ts->ne[0]);
+            small_to_mtp_out_ = static_cast<int32_t>(ts->ne[1]);
+        }
+        // Safety fallback: if shape lookup failed, assume square (0.6B case).
+        if (small_to_mtp_in_ == 0 || small_to_mtp_out_ == 0) {
+            small_to_mtp_in_  = hidden_size_;
+            small_to_mtp_out_ = hidden_size_;
+        }
+        std::fprintf(stderr,
+            "qwen3::Runner: small_to_mtp shape = [%d in → %d out] "
+            "(predictor hidden=%d)\n",
+            small_to_mtp_in_, small_to_mtp_out_, hidden_size_);
+    }
 
     // Pre-allocate workspace for predict_one_step.
     scratch_embd_.resize(static_cast<size_t>(8192) *
@@ -741,10 +846,14 @@ bool Runner::project_single_token(int32_t token_id, float* out_embd,
 // on the talker's projected hidden state + all previously emitted codes.
 
 bool Runner::predict_one_step(const float* talker_hidden,
-                                const int32_t* prev_codes,
+                                const float* layer0_embed,
+                                int32_t code_0,
                                 int32_t n_fine_books,
                                 int32_t* out_codes,
-                                std::string* error) {
+                                std::string* error,
+                                float temperature,
+                                float top_p,
+                                int32_t top_k) {
     if (!has_mtp_) {
         if (error) *error = "runner: MTP tensors not loaded";
         return false;
@@ -754,18 +863,26 @@ bool Runner::predict_one_step(const float* talker_hidden,
         return false;
     }
 
-    const int32_t ne = hidden_size_;
-    const int32_t fv = fine_vocab_;
-    const int32_t nf = n_fine_books_;
+    const int32_t ne = hidden_size_;   // predictor hidden_size
+    const int32_t fv = fine_vocab_;    // 2048
+    const int32_t nf = n_fine_books_;  // 15 (num_code_groups - 1)
 
-    // Project talker hidden through small_to_mtp.
+    // Project talker hidden through small_to_mtp → position 0.
+    // The weight is stored as [in_features=talker_n_embd, out_features=ne]
+    // in ggml's ne[0]=innermost convention — so the flat row-major layout
+    // is `out_features` rows of `in_features` elements each. For 1.7B that
+    // is [2048 in → 1024 out]; for 0.6B it is [1024 → 1024]. Using `ne` for
+    // both dims is the historic 1.7B bug.
     std::vector<float> proj(static_cast<size_t>(ne));
     if (small_to_mtp_w_) {
-        for (int j = 0; j < ne; j++) {
+        const int32_t in_dim  = small_to_mtp_in_;   // talker hidden
+        const int32_t out_dim = small_to_mtp_out_;  // predictor hidden (== ne)
+        for (int j = 0; j < out_dim; j++) {
             float s = small_to_mtp_b_ ? small_to_mtp_b_[j] : 0.0f;
-            for (int k = 0; k < ne; k++)
-                s += talker_hidden[k] *
-                     small_to_mtp_w_[static_cast<size_t>(j) * ne + k];
+            const float* w_row = small_to_mtp_w_ +
+                                 static_cast<size_t>(j) * in_dim;
+            for (int k = 0; k < in_dim; k++)
+                s += talker_hidden[k] * w_row[k];
             proj[static_cast<size_t>(j)] = s;
         }
     } else {
@@ -776,33 +893,91 @@ bool Runner::predict_one_step(const float* talker_hidden,
     seq.reserve(static_cast<size_t>(nf + 2) * ne);
 
     PhiloxRng rng{42};
-    std::vector<int32_t> cur_codes(prev_codes, prev_codes + nf);
+
+    // cur_codes stores fine codes generated WITHIN this MTP step.
+    // cur_codes[k] = fine[k], the k-th fine codebook sampled at sub-step k.
+    // The predictor is purely within-step autoregressive: it does NOT use
+    // previous AR steps' fine codes. Only code_0 (from the talker) conditions
+    // the sequence via layer0_embed at position 1.
+    std::vector<int32_t> cur_codes(static_cast<size_t>(nf), 0);
+
+    static const bool dbg = std::getenv("QWEN3TTS_DEBUG");
+
+    // Helper: project a talker-hidden vector through small_to_mtp down to the
+    // predictor's hidden size (ne). For 0.6B talker and predictor hidden are
+    // both 1024 and small_to_mtp is absent, so this is identity. For 1.7B the
+    // talker is 2048-d and the predictor is 1024-d; without this projection
+    // every layer0_embed / fine_embd row is fed at the wrong dimension and
+    // the predictor emits garbage fine codes that destabilize the talker AR
+    // loop. Matches the canonical vllm-omni CodePredictorWrapper.forward:
+    //   proj_buf[:,0]   = projection(last_talker_hidden)
+    //   proj_buf[:,1]   = projection(layer0_embed)
+    //   proj_buf[:,s+1] = projection(codec_embeds[s-1](fine[s-1]))
+    auto project_down = [&](const float* src, std::vector<float>* out) {
+        out->assign(static_cast<size_t>(ne), 0.0f);
+        if (small_to_mtp_w_) {
+            const int32_t in_dim = small_to_mtp_in_;   // talker hidden
+            for (int j = 0; j < ne; j++) {
+                float s = small_to_mtp_b_ ? small_to_mtp_b_[j] : 0.0f;
+                const float* w_row = small_to_mtp_w_ +
+                                     static_cast<size_t>(j) * in_dim;
+                for (int k2 = 0; k2 < in_dim; k2++)
+                    s += src[k2] * w_row[k2];
+                (*out)[static_cast<size_t>(j)] = s;
+            }
+        } else {
+            // No projection needed (talker and predictor share hidden size).
+            for (int j = 0; j < ne; j++)
+                (*out)[static_cast<size_t>(j)] = src[j];
+        }
+    };
+
+    // layer0_embed is constant across sub-steps — project once outside the
+    // k-loop. Its true dimension is the talker's codec_embd_dim (== talker
+    // hidden), NOT the predictor hidden. Copying only `ne` floats without
+    // projecting (the old behaviour) fed a truncated, unprojected vector.
+    std::vector<float> layer0_proj;
+    project_down(layer0_embed, &layer0_proj);
+
+    // fine_embd rows are at fine_embd_dim_ (talker hidden for 1.7B), NOT at
+    // `ne`. Use fine_embd_dim_ as the row stride, then project before append.
+    const int32_t fe_dim = fine_embd_dim_;
 
     for (int k = 0; k < nf; k++) {
+        // Build the predictor input sequence (all rows at predictor hidden):
+        //   Position 0: proj(talker_hidden)
+        //   Position 1: proj(layer0_embed)
+        //   Position 2..k+1: proj(fine_embd_[i](fine[i]))  for i in [0,k)
         seq.clear();
-        seq.insert(seq.end(), proj.begin(), proj.end());
-
-        for (int i = 0; i <= k; i++) {
+        seq.insert(seq.end(), proj.begin(), proj.end());              // pos 0
+        seq.insert(seq.end(), layer0_proj.begin(), layer0_proj.end());// pos 1
+        for (int i = 0; i < k; i++) {                                  // pos 2..k+1
             int32_t cid = cur_codes[static_cast<size_t>(i)];
             if (cid < 0) cid = 0;
             if (cid >= fv) cid %= fv;
-            const float* row = fine_embd_[i] + static_cast<size_t>(cid) * ne;
-            seq.insert(seq.end(), row, row + ne);
+            const float* row = fine_embd_[static_cast<size_t>(i)] +
+                               static_cast<size_t>(cid) * fe_dim;
+            std::vector<float> row_proj;
+            project_down(row, &row_proj);
+            seq.insert(seq.end(), row_proj.begin(), row_proj.end());
         }
 
-        const int32_t seq_len = k + 2;   // proj + (k+1) code embeddings
-        llama_batch b = llama_batch_init(seq_len, /*embd=*/seq_len, /*n_seq_max=*/1);
-        b.n_tokens = seq_len;
-        b.token = nullptr;
-        b.embd  = const_cast<float*>(seq.data());
-        for (int32_t i = 0; i < seq_len; i++) {
-            b.pos[i] = i;
-            b.logits[i] = (i == seq_len - 1) ? 1 : 0;
-            b.n_seq_id[i] = 1;
-            b.seq_id[i][0] = 0;
+        const int32_t seq_len = k + 2;   // proj + layer0 + k fine codes
+
+        if (dbg) std::fprintf(stderr, "  mtp[%d/%d]: seq_len=%d, clearing KV...\n", k, nf, seq_len);
+        // Clear KV cache for each sub-step — the MTP loop rebuilds the full
+        // sequence from position 0 each time, so stale KV entries from the
+        // previous sub-step would conflict.
+        {
+            llama_memory_t mem = llama_get_memory(ctx_);
+            if (mem) llama_memory_clear(mem, /*partial=*/false);
         }
+
+        llama_batch b = make_batch(seq_len, /*n_pos=*/0,
+                                   /*is_embd=*/true, seq.data(), nullptr,
+                                   /*last_only=*/true, n_pos_per_embd_);
         const bool ok = (llama_decode(ctx_, b) == 0);
-        b.embd = nullptr;
+        b.embd = nullptr;  // caller-owned
         llama_batch_free(b);
         if (!ok) {
             if (error) *error = "runner: MTP sub-step decode failed";
@@ -815,8 +990,20 @@ bool Runner::predict_one_step(const float* talker_hidden,
             return false;
         }
 
+        // Debug: dump prefill output (k=0) for comparison with Python
+        if (std::getenv("QWEN3TTS_PRED_DUMP") && k == 0) {
+            std::fprintf(stderr, "  [predict k=0] in_pos0[0:6]=[");
+            for (int i = 0; i < 6; i++) std::fprintf(stderr, "%s%.4f", i?",":"", seq[i]);
+            std::fprintf(stderr, "] in_pos1[0:6]=[");
+            for (int i = 0; i < 6; i++) std::fprintf(stderr, "%s%.4f", i?",":"", seq[ne + i]);
+            std::fprintf(stderr, "] out_last_h[0:6]=[");
+            for (int i = 0; i < 6; i++) std::fprintf(stderr, "%s%.4f", i?",":"", last_h[i]);
+            std::fprintf(stderr, "]\n");
+        }
+
+        // Predict fine[k] via fine_head_[k]
         std::vector<float> logits(static_cast<size_t>(fv));
-        const float* head_w = fine_head_[k];
+        const float* head_w = fine_head_[static_cast<size_t>(k)];
         for (int j = 0; j < fv; j++) {
             float s = 0.0f;
             for (int d = 0; d < ne; d++)
@@ -824,15 +1011,39 @@ bool Runner::predict_one_step(const float* talker_hidden,
             logits[static_cast<size_t>(j)] = s;
         }
 
+        if (dbg) {
+            // Find top-5 logits for diagnostics
+            std::vector<std::pair<float,int32_t>> sorted;
+            for (int j = 0; j < fv; j++)
+                sorted.emplace_back(logits[static_cast<size_t>(j)], j);
+            std::partial_sort(sorted.begin(), sorted.begin()+5, sorted.end(),
+                              [](auto& a, auto& b){ return a.first > b.first; });
+            std::fprintf(stderr, "  mtp[%d/%d]: top-5:", k, nf);
+            for (int kk = 0; kk < 5; kk++)
+                std::fprintf(stderr, " [%d]=%.3f", sorted[kk].second, sorted[kk].first);
+            std::fprintf(stderr, "\n");
+        }
+
+        // Sample: use caller-supplied params (default greedy). The reference
+        // Python code_predictor.generate defaults to do_sample=True with
+        // temperature=0.9, top_k=50, top_p=1.0, but those random fine codes
+        // destabilize the talker's AR feedback loop in C++ inference and
+        // collapse it into cb0 repetition. Greedy (temp=0) matches Python's
+        // do_sample=False and produces stable, intelligible output.
         const int32_t sampled = [&] {
             Params sp;
-            sp.temperature = 0.7f;
-            sp.top_p       = 0.9f;
+            sp.temperature = temperature;
+            sp.top_k       = top_k;
+            sp.top_p       = top_p;
             return sample_token(logits.data(), fv, sp,
                                 /*prev_tokens=*/nullptr, /*n_prev=*/0, &rng);
         }();
-        out_codes[k] = sampled;
+        out_codes[static_cast<size_t>(k)] = sampled;
         cur_codes[static_cast<size_t>(k)] = sampled;
+        // Debug: dump first frame's per-step code
+        if (std::getenv("QWEN3TTS_CODES") && k < 5) {
+            std::fprintf(stderr, "  [predict k=%d] c_%d=%d\n", k, k+1, sampled);
+        }
     }
 
     return true;

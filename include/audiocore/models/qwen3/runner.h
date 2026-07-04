@@ -145,15 +145,26 @@ public:
     // ── Predictor extras (load_extras(ExtraKind::Predictor)) ──────────────
 
     bool has_mtp() const { return has_mtp_; }
+    int32_t n_fine_books() const { return n_fine_books_; }
 
-    // Run one MTP step: condition on the talker's last hidden state and the
-    // previously-sampled codes, autoregressively emit n_fine_books fine
-    // codebook IDs. n_fine_books must match the value passed to load_extras.
+    // Run one MTP step: condition on the talker's last hidden state and
+    // layer0_embed (the talker's codec_embedding[code_0]) to autoregressively
+    // emit n_fine_books fine codebook IDs. prev_codes[0] must be code_0.
+    // n_fine_books must match the value passed to load_extras.
+    //
+    // Sampling params (temperature, top_p, top_k) default to greedy (temp=0)
+    // which matches Python's reference behavior when do_sample=False. Without
+    // greedy, the predictor emits random fine codes that destabilize the
+    // talker's AR feedback loop and collapse it into repetition.
     bool predict_one_step(const float* talker_hidden,
-                          const int32_t* prev_codes,
+                          const float* layer0_embed,
+                          int32_t code_0,
                           int32_t n_fine_books,
                           int32_t* out_codes,
-                          std::string* error = nullptr);
+                          std::string* error = nullptr,
+                          float temperature = 0.0f,
+                          float top_p = 1.0f,
+                          int32_t top_k = 1);
 
     // Per-codebook embedding table for fine codebook i ∈ [0, n_fine_books).
     const float* fine_embedding(int i) const {
@@ -173,6 +184,14 @@ public:
     bool tokenize(const std::string& text, bool add_special, bool parse_special,
                   std::vector<int32_t>* tokens, int32_t* needed = nullptr,
                   std::string* error = nullptr) const;
+
+    // Load a vocab-only tokenizer GGUF (produced by convert_qwen3tts
+    // write_tokenizer). The sidecar carries the real Qwen3 BPE tokenizer
+    // (151 936 tokens, 151 291 merges, pre=qwen2). tokenize() will use it
+    // automatically once loaded. Safe to call multiple times.
+    bool load_tokenizer(const std::string& gguf_path,
+                        std::string* error = nullptr);
+    bool has_tokenizer() const { return tokenizer_model_ != nullptr; }
 
     // Inverse: token id → byte piece (no null terminator appended).
     bool token_to_piece(int32_t token, std::string* out,
@@ -222,6 +241,11 @@ private:
     int32_t        hidden_size_ = 0;
     int32_t        vocab_size_  = 0;
     int32_t        n_codebooks_ = 32;       // Qwen3-TTS default
+    uint32_t       n_pos_per_embd_ = 1;     // M-RoPE: 4, normal RoPE: 1
+
+    // Tokenizer sidecar (vocab-only llama_model loaded from the text BPE GGUF).
+    // When non-null, tokenize() uses this instead of model_'s built-in vocab.
+    llama_model*   tokenizer_model_ = nullptr;
 
     // ── Talker extras (owned; raw GGUF bytes copied into these buffers) ──
     bool    has_text_embd_ = false;
@@ -244,8 +268,17 @@ private:
     int32_t  fine_vocab_    = 0;
     int32_t  fine_embd_dim_ = 0;
     int32_t  n_fine_books_  = 0;
-    float*   small_to_mtp_w_ = nullptr;     // [n_embd, n_embd]
-    float*   small_to_mtp_b_ = nullptr;     // [n_embd]
+    float*   small_to_mtp_w_ = nullptr;     // [small_to_mtp_in_, small_to_mtp_out_]
+    float*   small_to_mtp_b_ = nullptr;     // [small_to_mtp_out_]
+    // Input/output dims of small_to_mtp. For 0.6B talker+predictor are both
+    // 1024, so in_==out_==1024. For 1.7B the talker is 2048-d and the
+    // predictor is 1024-d, so in_=2048 and out_=1024 — the projection
+    // shrinks the talker hidden down to predictor hidden. The projection
+    // loop must iterate `in_` over the talker hidden and use `in_` as the
+    // row stride; using `hidden_size_` (predictor dim) for both is the
+    // 1.7B bug that produced garbage fine codebooks.
+    int32_t  small_to_mtp_in_  = 0;         // talker n_embd (input dim)
+    int32_t  small_to_mtp_out_ = 0;         // predictor n_embd (output dim)
     // Scratch for predict_one_step; sized on load_extras.
     std::vector<float> scratch_embd_;
     std::vector<float> scratch_logits_;
