@@ -104,6 +104,42 @@ void fail_with(httplib::Response& res, const std::string& err) {
     res.set_content(e.dump(), "application/json");
 }
 
+// Resolve the `voice` field on a TtsRequest. .voice files (QWEN3VOICE
+// binary, dim-N ECAPA-TDNN embedding) live under <clips_dir>/voices/.
+// Anything else is treated as a WAV path for ICL reference cloning.
+//
+// On match: reads the binary, populates tr.speaker_embedding, and clears
+// tr.voice_path so the session doesn't try to interpret it as a WAV.
+// On no match: leaves tr.voice_path untouched (legacy behaviour).
+void resolve_voice_field(TtsRequest& tr, const std::string& clips_dir) {
+    if (tr.voice_path.empty()) return;
+    if (tr.voice_path.size() < 6) return;
+    if (tr.voice_path.compare(tr.voice_path.size() - 6, 6, ".voice") != 0)
+        return;
+    std::string vname = tr.voice_path;
+    size_t slash = vname.find_last_of('/');
+    if (slash != std::string::npos) vname = vname.substr(slash + 1);
+    if (vname.find("..") != std::string::npos) return;
+    if (clips_dir.empty()) return;
+    std::string vpath = clips_dir + "/voices/" + vname;
+    std::ifstream vf(vpath, std::ios::binary);
+    if (!vf) return;
+    char hdr[32];
+    if (!vf.read(hdr, 32)) return;
+    if (std::memcmp(hdr, "QWEN3VOICE", 10) != 0) return;
+    uint32_t dim = 0;
+    std::memcpy(&dim, hdr + 20, 4);
+    if (dim == 0 || dim > 65536) return;  // sanity
+    std::vector<uint8_t> raw(static_cast<size_t>(dim) * 4);
+    if (!vf.read(reinterpret_cast<char*>(raw.data()),
+                  static_cast<std::streamsize>(raw.size())))
+        return;
+    tr.speaker_embedding.resize(dim);
+    std::memcpy(tr.speaker_embedding.data(), raw.data(), dim * 4);
+    tr.voice_path.clear();
+    if (tr.mode.empty() || tr.mode == "tts") tr.mode = "voice_clone";
+}
+
 // ── Clip helpers ──────────────────────────────────────────────────────────
 
 static const std::unordered_set<std::string> kAudioExts = {
@@ -228,7 +264,7 @@ std::shared_ptr<httplib::Server> build_server(
     });
 
     svr->Post("/v1/audio/speech",
-              [slots_ref](const httplib::Request& req, httplib::Response& res) {
+              [slots_ref, clips_dir](const httplib::Request& req, httplib::Response& res) {
         auto sg = resolve_slot(req, *slots_ref, res);
         if (!sg) return;
         const auto& body = sg->body;
@@ -245,6 +281,7 @@ std::shared_ptr<httplib::Server> build_server(
         tr.speaker_name    = body.value("speaker", "");
         tr.reference_audio = body.value("reference_audio", "");
         tr.reference_text  = body.value("reference_text", "");
+        resolve_voice_field(tr, clips_dir);
         if (body.contains("seed"))             tr.seed             = body["seed"].get<int32_t>();
         if (body.contains("temperature"))      tr.temperature      = body["temperature"].get<float>();
         if (body.contains("top_p"))            tr.top_p            = body["top_p"].get<float>();
@@ -468,7 +505,7 @@ std::shared_ptr<httplib::Server> build_server(
 
     // ── POST /v1/audio/speech/stream ──────────────────────────────────────
     svr->Post("/v1/audio/speech/stream",
-              [slots_ref](const httplib::Request& req, httplib::Response& res) {
+              [slots_ref, clips_dir](const httplib::Request& req, httplib::Response& res) {
         auto sg = resolve_slot(req, *slots_ref, res);
         if (!sg) return;
         const auto& body = sg->body;
@@ -485,6 +522,7 @@ std::shared_ptr<httplib::Server> build_server(
         tr.speaker_name    = body.value("speaker", "");
         tr.reference_audio = body.value("reference_audio", "");
         tr.reference_text  = body.value("reference_text", "");
+        resolve_voice_field(tr, clips_dir);
         tr.response_format = body.value("response_format", "wav");
         if (body.contains("seed"))             tr.seed             = body["seed"].get<int32_t>();
         if (body.contains("temperature"))      tr.temperature      = body["temperature"].get<float>();
@@ -863,6 +901,299 @@ std::shared_ptr<httplib::Server> build_server(
                     resp["ok"] = false;
                     resp["error"] = "not found";
                 }
+                res.set_content(resp.dump(), "application/json");
+            });
+
+            // ── Voice arithmetic endpoints ───────────────────────────────
+            // These match the qwen_voice CLI subcommands and exist so the
+            // Voice Maker tab in the webapp can do all three voice-editing
+            // knobs (linear mix, SLERP, steering-vector shift) without a
+            // shell round-trip.
+
+            // Helper: load .voice file by name (or path) from voices_dir.
+            auto load_voice_by_name = [voices_dir](const std::string& name,
+                                                     std::vector<float>& out,
+                                                     std::string& err) -> bool {
+                if (name.empty() || name.find("..") != std::string::npos ||
+                    name.find('/') != std::string::npos) {
+                    err = "invalid name"; return false;
+                }
+                fs::path p = fs::path(voices_dir) / name;
+                std::ifstream f(p, std::ios::binary);
+                if (!f) { err = "voice not found: " + name; return false; }
+                char hdr[32];
+                if (!f.read(hdr, 32)) { err = "short read"; return false; }
+                if (std::memcmp(hdr, "QWEN3VOICE", 10) != 0) {
+                    err = "bad magic"; return false;
+                }
+                uint32_t dim = 0;
+                std::memcpy(&dim, hdr + 20, 4);
+                out.resize(dim);
+                f.read(reinterpret_cast<char*>(out.data()),
+                       static_cast<std::streamsize>(dim * 4));
+                if (!f) { err = "short data"; return false; }
+                return true;
+            };
+            auto write_voice_to_disk = [voices_dir](const std::string& name,
+                                                     const std::vector<float>& v) -> bool {
+                if (name.empty() || name.find("..") != std::string::npos ||
+                    name.find('/') != std::string::npos) return false;
+                fs::path p = fs::path(voices_dir) / name;
+                std::ofstream f(p, std::ios::binary);
+                if (!f) return false;
+                f.write("QWEN3VOICE\0\0\0\0\0\0", 16);
+                uint32_t ver = 1, dim = static_cast<uint32_t>(v.size()),
+                         flags = 0, res = 0;
+                f.write(reinterpret_cast<const char*>(&ver), 4);
+                f.write(reinterpret_cast<const char*>(&dim), 4);
+                f.write(reinterpret_cast<const char*>(&flags), 4);
+                f.write(reinterpret_cast<const char*>(&res), 4);
+                f.write(reinterpret_cast<const char*>(v.data()),
+                       static_cast<std::streamsize>(v.size() * 4));
+                return f.good();
+            };
+
+            // POST /v1/voices/blend — linear mix or SLERP between two voices.
+            //   { a, b, t: [0,1], mode: "linear"|"slerp", out: "name.voice" }
+            svr->Post("/v1/voices/blend",
+                      [load_voice_by_name, write_voice_to_disk](
+                          const httplib::Request& req, httplib::Response& res) {
+                json resp;
+                json body;
+                try { body = json::parse(req.body); }
+                catch (...) {
+                    res.status = 400;
+                    resp["error"] = "invalid json";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                std::string a_name = body.value("a", "");
+                std::string b_name = body.value("b", "");
+                std::string out_name = body.value("out", "");
+                std::string mode = body.value("mode", "linear");
+                float t = body.value("t", 0.5f);
+                if (t < 0.0f) t = 0.0f;
+                if (t > 1.0f) t = 1.0f;
+                if (a_name.empty() || b_name.empty() || out_name.empty()) {
+                    res.status = 400;
+                    resp["error"] = "requires a, b, out";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                std::vector<float> a, b;
+                std::string err;
+                if (!load_voice_by_name(a_name, a, err) ||
+                    !load_voice_by_name(b_name, b, err)) {
+                    res.status = 404;
+                    resp["error"] = err;
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                if (a.size() != b.size()) {
+                    res.status = 400;
+                    resp["error"] = "dim mismatch";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                std::vector<float> out(a.size());
+                if (mode == "slerp") {
+                    // Normalize both to unit length, SLERP, re-scale to mean L2.
+                    double na = 0.0, nb = 0.0;
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        na += static_cast<double>(a[i]) * a[i];
+                        nb += static_cast<double>(b[i]) * b[i];
+                    }
+                    na = std::sqrt(na); nb = std::sqrt(nb);
+                    if (na < 1e-9 || nb < 1e-9) {
+                        res.status = 400;
+                        resp["error"] = "zero-norm voice";
+                        res.set_content(resp.dump(), "application/json");
+                        return;
+                    }
+                    const double avg_n = 0.5 * (na + nb);
+                    double dot = 0.0;
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        dot += (static_cast<double>(a[i]) / na) *
+                               (static_cast<double>(b[i]) / nb);
+                    }
+                    if (dot >  1.0) dot =  1.0;
+                    if (dot < -1.0) dot = -1.0;
+                    const double omega = std::acos(dot);
+                    if (omega < 1e-4) {
+                        for (size_t i = 0; i < a.size(); ++i) {
+                            double ua = static_cast<double>(a[i]) / na;
+                            double ub = static_cast<double>(b[i]) / nb;
+                            out[i] = static_cast<float>(((1.0 - t) * ua + t * ub) * avg_n);
+                        }
+                    } else {
+                        const double sin_o = std::sin(omega);
+                        const double wa = std::sin((1.0 - t) * omega) / sin_o;
+                        const double wb = std::sin(t * omega) / sin_o;
+                        for (size_t i = 0; i < a.size(); ++i) {
+                            double ua = static_cast<double>(a[i]) / na;
+                            double ub = static_cast<double>(b[i]) / nb;
+                            out[i] = static_cast<float>((wa * ua + wb * ub) * avg_n);
+                        }
+                    }
+                    resp["omega_rad"]  = omega;
+                    resp["omega_deg"]  = omega * 180.0 / M_PI;
+                } else {
+                    // Linear interpolation.
+                    for (size_t i = 0; i < a.size(); ++i)
+                        out[i] = (1.0f - t) * a[i] + t * b[i];
+                }
+                if (!write_voice_to_disk(out_name, out)) {
+                    res.status = 500;
+                    resp["error"] = "write failed";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                resp["ok"] = true;
+                resp["name"] = out_name;
+                resp["mode"] = mode;
+                resp["t"] = t;
+                resp["dim"] = out.size();
+                res.set_content(resp.dump(), "application/json");
+            });
+
+            // POST /v1/voices/shift — apply a steering direction to a voice.
+            //   { base, direction, scale, out }
+            svr->Post("/v1/voices/shift",
+                      [load_voice_by_name, write_voice_to_disk](
+                          const httplib::Request& req, httplib::Response& res) {
+                json resp;
+                json body;
+                try { body = json::parse(req.body); }
+                catch (...) {
+                    res.status = 400;
+                    resp["error"] = "invalid json";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                std::string base_name = body.value("base", "");
+                std::string dir_name  = body.value("direction", "");
+                std::string out_name  = body.value("out", "");
+                float scale = body.value("scale", 1.0f);
+                if (base_name.empty() || dir_name.empty() || out_name.empty()) {
+                    res.status = 400;
+                    resp["error"] = "requires base, direction, out";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                std::vector<float> base_v, dir_v;
+                std::string err;
+                if (!load_voice_by_name(base_name, base_v, err) ||
+                    !load_voice_by_name(dir_name,  dir_v,  err)) {
+                    res.status = 404;
+                    resp["error"] = err;
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                if (base_v.size() != dir_v.size()) {
+                    res.status = 400;
+                    resp["error"] = "dim mismatch";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                std::vector<float> out(base_v.size());
+                for (size_t i = 0; i < base_v.size(); ++i)
+                    out[i] = base_v[i] + scale * dir_v[i];
+                if (!write_voice_to_disk(out_name, out)) {
+                    res.status = 500;
+                    resp["error"] = "write failed";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                resp["ok"] = true;
+                resp["name"] = out_name;
+                resp["scale"] = scale;
+                res.set_content(resp.dump(), "application/json");
+            });
+
+            // POST /v1/voices/discover_direction — build a steering vector
+            //   from two labelled lists of voices.
+            //   { positive: ["v1.voice", ...], negative: [...], out: "name.dir" }
+            svr->Post("/v1/voices/discover_direction",
+                      [load_voice_by_name, write_voice_to_disk](
+                          const httplib::Request& req, httplib::Response& res) {
+                json resp;
+                json body;
+                try { body = json::parse(req.body); }
+                catch (...) {
+                    res.status = 400;
+                    resp["error"] = "invalid json";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                std::string out_name = body.value("out", "");
+                if (out_name.empty() || !body.contains("positive") ||
+                    !body.contains("negative")) {
+                    res.status = 400;
+                    resp["error"] = "requires positive[], negative[], out";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                auto mean_of_list = [&](const json& arr, std::vector<float>& mean,
+                                         size_t& dim, size_t& count) -> bool {
+                    count = 0; dim = 0; mean.clear();
+                    std::vector<float> acc;
+                    for (const auto& name_j : arr) {
+                        if (!name_j.is_string()) continue;
+                        std::vector<float> v;
+                        std::string err;
+                        if (!load_voice_by_name(name_j.get<std::string>(), v, err))
+                            continue;
+                        if (acc.empty()) {
+                            acc.assign(v.size(), 0.0f);
+                            dim = v.size();
+                        } else if (v.size() != dim) continue;
+                        for (size_t i = 0; i < dim; ++i) acc[i] += v[i];
+                        ++count;
+                    }
+                    if (count == 0) return false;
+                    mean.assign(dim, 0.0f);
+                    for (size_t i = 0; i < dim; ++i)
+                        mean[i] = acc[i] / static_cast<float>(count);
+                    return true;
+                };
+                std::vector<float> mean_p, mean_n;
+                size_t dim_p, dim_n, cnt_p, cnt_n;
+                if (!mean_of_list(body["positive"], mean_p, dim_p, cnt_p)) {
+                    res.status = 400;
+                    resp["error"] = "no positive voices loaded";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                if (!mean_of_list(body["negative"], mean_n, dim_n, cnt_n)) {
+                    res.status = 400;
+                    resp["error"] = "no negative voices loaded";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                if (dim_p != dim_n) {
+                    res.status = 400;
+                    resp["error"] = "dim mismatch between groups";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                std::vector<float> dir_v(dim_p);
+                for (size_t i = 0; i < dim_p; ++i)
+                    dir_v[i] = mean_p[i] - mean_n[i];
+                if (!write_voice_to_disk(out_name, dir_v)) {
+                    res.status = 500;
+                    resp["error"] = "write failed";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                double norm = 0.0;
+                for (float x : dir_v) norm += static_cast<double>(x) * x;
+                norm = std::sqrt(norm);
+                resp["ok"] = true;
+                resp["name"] = out_name;
+                resp["positive_count"] = cnt_p;
+                resp["negative_count"] = cnt_n;
+                resp["dim"] = dim_p;
+                resp["norm"] = norm;
                 res.set_content(resp.dump(), "application/json");
             });
         }

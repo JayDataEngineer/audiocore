@@ -44,6 +44,7 @@
 <!-- ════════════════════════════════════════════════════════════════════ -->
 <nav class="tabs" role="tablist">
   <button class="tab active" data-tab="design"     role="tab">✨ Voice Design</button>
+  <button class="tab"        data-tab="maker"      role="tab">🎛️ Voice Maker</button>
   <button class="tab"        data-tab="synthesize" role="tab">🗣️ Synthesize</button>
   <button class="tab"        data-tab="music"      role="tab">🎵 Music</button>
   <button class="tab"        data-tab="voices"     role="tab">🎭 Voices</button>
@@ -103,6 +104,128 @@
         <div class="player-area" id="vd-player">
           <div class="player-empty">Generated audio appears here</div>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════ VOICE MAKER ════════════════ -->
+  <section class="panel" id="tab-maker">
+    <div class="card">
+      <div class="card-head">
+        <h2>Voice Maker</h2>
+        <p class="card-sub">
+          Three mathematical knobs for shaping voices without re-encoding audio.
+          Blend two voices with <b>SLERP</b>, push a voice along a
+          <b>steering vector</b>, or discover new directions from labelled
+          groups. Results are saved to your Voices library.
+        </p>
+      </div>
+
+      <!-- Knob 1: SLERP / linear blend -->
+      <div class="knob-block">
+        <div class="knob-head">
+          <span class="knob-num">1</span>
+          <h3>Blend two voices</h3>
+          <span class="knob-tag">linear · SLERP</span>
+        </div>
+        <p class="knob-doc">
+          Smoothly interpolate between voice A and voice B. At <code>t=0</code>
+          you hear pure A, at <code>t=1</code> pure B, at <code>t=0.5</code> an
+          even blend. SLERP follows the great-circle arc on the unit
+          hypersphere — smoother for cross-gender / cross-age blends.
+        </p>
+        <div class="form-row">
+          <label>Voice A</label>
+          <select id="mk-blend-a" class="grow"></select>
+        </div>
+        <div class="form-row">
+          <label>Voice B</label>
+          <select id="mk-blend-b" class="grow"></select>
+        </div>
+        <div class="form-row">
+          <label>Blend t <span class="slider-val" id="mk-blend-t-val">0.50</span></label>
+          <input type="range" id="mk-blend-t" min="0" max="1" step="0.01" value="0.5" class="slider grow">
+        </div>
+        <div class="form-row">
+          <label>Mode</label>
+          <select id="mk-blend-mode">
+            <option value="slerp" selected>SLERP (spherical)</option>
+            <option value="linear">Linear</option>
+          </select>
+          <label>Output name</label>
+          <input type="text" id="mk-blend-out" class="grow" value="blend.voice" placeholder="blend.voice">
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" id="mk-blend-btn" type="button">🔀 Blend</button>
+        </div>
+        <div class="status" id="mk-blend-status"></div>
+      </div>
+
+      <!-- Knob 2: Steering vector shift -->
+      <div class="knob-block">
+        <div class="knob-head">
+          <span class="knob-num">2</span>
+          <h3>Apply steering vector</h3>
+          <span class="knob-tag">linear algebra</span>
+        </div>
+        <p class="knob-doc">
+          Push a base voice along a labelled concept direction
+          (e.g. <em>gender_v2_f_minus_m.dir</em>). Positive scale → more
+          "positive" end of the concept; negative scale → opposite.
+          Try <code>scale = ±0.5</code> for subtle shifts, <code>±1.0</code>
+          for stronger.
+        </p>
+        <div class="form-row">
+          <label>Base voice</label>
+          <select id="mk-shift-base" class="grow"></select>
+        </div>
+        <div class="form-row">
+          <label>Direction</label>
+          <select id="mk-shift-dir" class="grow"></select>
+        </div>
+        <div class="form-row">
+          <label>Scale <span class="slider-val" id="mk-shift-scale-val">+0.50</span></label>
+          <input type="range" id="mk-shift-scale" min="-1.5" max="1.5" step="0.05" value="0.5" class="slider grow">
+        </div>
+        <div class="form-row">
+          <label>Output name</label>
+          <input type="text" id="mk-shift-out" class="grow" value="shifted.voice" placeholder="shifted.voice">
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" id="mk-shift-btn" type="button">⇆ Shift</button>
+        </div>
+        <div class="status" id="mk-shift-status"></div>
+      </div>
+
+      <!-- Knob 3: Discover direction -->
+      <div class="knob-block">
+        <div class="knob-head">
+          <span class="knob-num">3</span>
+          <h3>Discover new steering vector</h3>
+          <span class="knob-tag">mean(diff)</span>
+        </div>
+        <p class="knob-doc">
+          Build a brand-new concept direction from labelled examples. Pick
+          which voices embody the "more X" end and which embody "less X."
+          The vector emitted is <code>mean(positive) − mean(negative)</code>.
+          Reuse it in Knob 2 above.
+        </p>
+        <div class="form-row">
+          <label>Positive group <span class="hint">(more X)</span></label>
+          <select id="mk-disc-pos" class="grow" multiple size="4"></select>
+        </div>
+        <div class="form-row">
+          <label>Negative group <span class="hint">(less X)</span></label>
+          <select id="mk-disc-neg" class="grow" multiple size="4"></select>
+        </div>
+        <div class="form-row">
+          <label>Direction name</label>
+          <input type="text" id="mk-disc-out" class="grow" value="custom.dir" placeholder="custom.dir">
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" id="mk-disc-btn" type="button">🧭 Discover</button>
+        </div>
+        <div class="status" id="mk-disc-status"></div>
       </div>
     </div>
   </section>

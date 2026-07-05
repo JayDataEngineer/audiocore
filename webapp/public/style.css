@@ -495,3 +495,52 @@ select {
   border: 2px solid var(--bg);
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+
+/* ══════════════ VOICE MAKER ══════════════ */
+.knob-block {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 18px 20px;
+  margin-top: 14px;
+  background: var(--bg-input);
+}
+.knob-block + .knob-block { margin-top: 16px; }
+.knob-head {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 6px;
+}
+.knob-head h3 {
+  margin: 0; font-size: 14px; font-weight: 600;
+  letter-spacing: -.01em;
+  flex: 1;
+}
+.knob-num {
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  background: var(--accent-grad);
+  color: #fff;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700;
+  flex-shrink: 0;
+}
+.knob-tag {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-muted);
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+}
+.knob-doc {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.55;
+  margin: 4px 0 14px;
+}
+.knob-doc code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  background: var(--bg-card);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--accent-2);
+}

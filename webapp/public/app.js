@@ -207,6 +207,155 @@
     }
   });
 
+  // ── Voice Maker tab ────────────────────────────────────────────────
+  // Populate all the dropdowns when the user opens the tab.
+  async function refresh_maker_dropdowns() {
+    let voices = [];
+    try {
+      const r = await fetch("/v1/voices");
+      const j = await r.json();
+      voices = j.voices || [];
+    } catch (_) {}
+    // Sort: .voice files first, then .dir files (so directions cluster at the bottom).
+    voices.sort((a, b) => {
+      const aDir = a.name.endsWith(".dir"), bDir = b.name.endsWith(".dir");
+      if (aDir !== bDir) return aDir ? 1 : -1;
+      return a.name.localeCompare(b.name);
+    });
+    const voice_only = voices.filter(v => !v.name.endsWith(".dir"));
+    const dir_only   = voices.filter(v =>  v.name.endsWith(".dir"));
+
+    const fill = (sel, list, include_dim) => {
+      if (!sel) return;
+      const cur = sel.value;
+      sel.innerHTML = "";
+      if (!list.length) {
+        const o = document.createElement("option");
+        o.value = "";
+        o.textContent = "(none available)";
+        sel.appendChild(o);
+        return;
+      }
+      for (const v of list) {
+        const o = document.createElement("option");
+        o.value = v.name;
+        o.textContent = v.name + (include_dim && v.dim ? "  [" + v.dim + "-d, L2=" + (v.l2_norm||0).toFixed(2) + "]" : "");
+        sel.appendChild(o);
+      }
+      // preserve current selection if still present
+      if (cur) {
+        for (const o of sel.options) if (o.value === cur) { sel.value = cur; break; }
+      }
+    };
+    fill($("#mk-blend-a"),    voice_only, true);
+    fill($("#mk-blend-b"),    voice_only, true);
+    fill($("#mk-shift-base"), voice_only, true);
+    fill($("#mk-shift-dir"),  dir_only,   true);
+    fill($("#mk-disc-pos"),   voice_only, false);
+    fill($("#mk-disc-neg"),   voice_only, false);
+  }
+
+  // Open the tab → refresh dropdowns.
+  // (the global tab click handler already wires this; we hook in addition)
+  document.addEventListener("click", (e) => {
+    const t = e.target.closest(".tab");
+    if (t && t.dataset.tab === "maker") refresh_maker_dropdowns();
+  });
+
+  // Live slider value displays
+  $("#mk-blend-t").addEventListener("input", (e) => {
+    $("#mk-blend-t-val").textContent = parseFloat(e.target.value).toFixed(2);
+  });
+  $("#mk-shift-scale").addEventListener("input", (e) => {
+    const v = parseFloat(e.target.value);
+    $("#mk-shift-scale-val").textContent = (v >= 0 ? "+" : "") + v.toFixed(2);
+  });
+
+  // Knob 1: blend
+  $("#mk-blend-btn").addEventListener("click", async () => {
+    const st = $("#mk-blend-status");
+    const a = $("#mk-blend-a").value, b = $("#mk-blend-b").value;
+    if (!a || !b) { status(st, "Pick both voices.", "err"); return; }
+    const body = {
+      a, b,
+      t: parseFloat($("#mk-blend-t").value),
+      mode: $("#mk-blend-mode").value,
+      out: $("#mk-blend-out").value.trim() || "blend.voice",
+    };
+    if (a === b) { status(st, "Pick two different voices.", "err"); return; }
+    status(st, "Blending…", "loading");
+    try {
+      const r = await fetch("/v1/voices/blend", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        const extra = j.mode === "slerp"
+          ? " · Ω=" + (j.omega_deg || 0).toFixed(2) + "°"
+          : "";
+        status(st, "Saved " + j.name + extra + " (dim=" + j.dim + ")", "ok");
+        toast("Voice blended", "ok");
+        refresh_maker_dropdowns();
+      } else status(st, j.error || "Blend failed", "err");
+    } catch (err) { status(st, "Error: " + err.message, "err"); }
+  });
+
+  // Knob 2: shift
+  $("#mk-shift-btn").addEventListener("click", async () => {
+    const st = $("#mk-shift-status");
+    const base = $("#mk-shift-base").value, dir = $("#mk-shift-dir").value;
+    if (!base || !dir) { status(st, "Pick a base voice and a direction.", "err"); return; }
+    const body = {
+      base, direction: dir,
+      scale: parseFloat($("#mk-shift-scale").value),
+      out: $("#mk-shift-out").value.trim() || "shifted.voice",
+    };
+    status(st, "Shifting…", "loading");
+    try {
+      const r = await fetch("/v1/voices/shift", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        status(st, "Saved " + j.name + " (scale=" + j.scale + ")", "ok");
+        toast("Voice shifted", "ok");
+        refresh_maker_dropdowns();
+      } else status(st, j.error || "Shift failed", "err");
+    } catch (err) { status(st, "Error: " + err.message, "err"); }
+  });
+
+  // Knob 3: discover_direction
+  $("#mk-disc-btn").addEventListener("click", async () => {
+    const st = $("#mk-disc-status");
+    const pos_sel = $("#mk-disc-pos"), neg_sel = $("#mk-disc-neg");
+    const pos = [...pos_sel.selectedOptions].map(o => o.value);
+    const neg = [...neg_sel.selectedOptions].map(o => o.value);
+    if (pos.length < 2 || neg.length < 2) {
+      status(st, "Pick at least 2 voices in each group.", "err"); return;
+    }
+    const body = {
+      positive: pos, negative: neg,
+      out: $("#mk-disc-out").value.trim() || "custom.dir",
+    };
+    status(st, "Computing steering vector…", "loading");
+    try {
+      const r = await fetch("/v1/voices/discover_direction", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        status(st, "Saved " + j.name + " (‖dir‖=" + (j.norm||0).toFixed(3) +
+                    ", from " + j.positive_count + "+" + j.negative_count +
+                    " voices)", "ok");
+        toast("Direction discovered", "ok");
+        refresh_maker_dropdowns();
+      } else status(st, j.error || "Discovery failed", "err");
+    } catch (err) { status(st, "Error: " + err.message, "err"); }
+  });
+
   // ── Synthesize tab ─────────────────────────────────────────────────
   const PRESET_SPEAKERS = [
     "Vivian", "Serena", "Ryan", "Aiden", "Eric",
