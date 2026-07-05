@@ -260,6 +260,7 @@
   document.addEventListener("click", (e) => {
     const t = e.target.closest(".tab");
     if (t && t.dataset.tab === "maker") refresh_maker_dropdowns();
+    if (t && t.dataset.tab === "music") refresh_music_sources();
   });
 
   // Live slider value displays
@@ -484,25 +485,105 @@
 
   // ── Music tab ──────────────────────────────────────────────────────
   let mus_last_blob = null;
+
+  // Refresh the source-clip dropdown from the clips library.
+  async function refresh_music_sources() {
+    const sel = $("#mus-src");
+    if (!sel) return;
+    try {
+      const r = await fetch("/v1/clips");
+      if (!r.ok) return;
+      const j = await r.json();
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">— pick a clip —</option>';
+      (j.clips || []).forEach((c) => {
+        const o = document.createElement("option");
+        o.value = c.name;
+        o.textContent = c.name + (c.duration ? ` (${c.duration.toFixed(1)}s)` : "");
+        sel.appendChild(o);
+      });
+      if (cur) sel.value = cur;
+    } catch (e) { /* ignore */ }
+  }
+
+  // Mode selector: reveal/hide source + mask rows.
+  function sync_music_mode_rows() {
+    const mode = $("#mus-mode").value;
+    const needs_src = (mode === "cover" || mode === "repaint" || mode === "completion");
+    const needs_mask = (mode === "repaint" || mode === "completion");
+    $("#mus-src-row").hidden     = !needs_src;
+    $("#mus-mask-row").hidden    = !needs_mask;
+    $("#mus-mask-row2").hidden   = !needs_mask;
+    const hint = $("#mus-mask-hint");
+    if (hint) {
+      hint.textContent = (mode === "repaint")
+        ? "Inside [start,end] is regenerated; outside is preserved."
+        : (mode === "completion")
+          ? "Inside [start,end] is preserved; outside is regenerated (extension)."
+          : "";
+    }
+    if (needs_src) refresh_music_sources();
+  }
+  $("#mus-mode").addEventListener("change", sync_music_mode_rows);
+  $("#mus-m0").addEventListener("input", (e) => {
+    $("#mus-m0-val").textContent = parseFloat(e.target.value).toFixed(2);
+  });
+  $("#mus-m1").addEventListener("input", (e) => {
+    $("#mus-m1-val").textContent = parseFloat(e.target.value).toFixed(2);
+  });
+
   $("#mus-btn").addEventListener("click", async () => {
     const st = $("#mus-status");
     const btn = $("#mus-btn");
     if (!ACTIVE_MUSIC) {
       status(st, "No music model loaded.", "err"); return;
     }
+    const mode = $("#mus-mode").value;
+    const needs_src = (mode === "cover" || mode === "repaint" || mode === "completion");
+    let src_b64 = null;
+    if (needs_src) {
+      const src_name = $("#mus-src").value.trim();
+      if (!src_name) {
+        status(st, "Pick a source clip for " + mode + " mode.", "err");
+        return;
+      }
+      status(st, "Loading source clip '" + src_name + "'…", "loading");
+      try {
+        const r = await fetch("/v1/clips/raw/" + encodeURIComponent(src_name));
+        if (!r.ok) throw new Error("clip fetch failed (" + r.status + ")");
+        const blob = await r.blob();
+        src_b64 = await new Promise((resolve, reject) => {
+          const fr = new FileReader();
+          fr.onload = () => resolve(fr.result.split(",")[1]);
+          fr.onerror = reject;
+          fr.readAsDataURL(blob);
+        });
+      } catch (err) {
+        status(st, "Could not load source clip: " + err.message, "err");
+        return;
+      }
+    }
     btn.disabled = true; btn.textContent = "Generating…";
-    status(st, "Composing music (this can take a minute or more)…", "loading");
+    status(st, "Composing " + mode + " (this can take a minute or more)…", "loading");
     clear_player($("#mus-player"));
 
     try {
+      const seed = parseInt($("#mus-seed").value, 10);
       const body = {
         model: ACTIVE_MUSIC,
+        mode,
         caption:  $("#mus-caption").value.trim(),
         lyrics:   $("#mus-lyrics").value.trim(),
         duration: parseFloat($("#mus-dur").value) || 30,
         steps:    parseInt($("#mus-steps").value, 10) || 50,
         guidance_scale: parseFloat($("#mus-guid").value) || 7.5,
       };
+      if (seed && seed > 0) body.seed = seed;
+      if (src_b64) {
+        body.input_audio = src_b64;
+        body.mask_start = parseFloat($("#mus-m0").value) || 0;
+        body.mask_end   = parseFloat($("#mus-m1").value) || 1;
+      }
       const r = await fetch("/v1/audio/music", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -517,7 +598,7 @@
       mus_last_blob = blob;
       const url = URL.createObjectURL(blob);
       set_player($("#mus-player"), url,
-        "stereo · " + (blob.size / 1024 / 1024).toFixed(2) + " MB");
+        mode + " · stereo · " + (blob.size / 1024 / 1024).toFixed(2) + " MB");
       $("#mus-download").disabled = false;
       status(st, "Done.", "ok");
     } catch (err) {

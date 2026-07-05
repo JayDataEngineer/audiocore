@@ -978,6 +978,53 @@ bool AceStepSession::run_music(const void* request, void* response,
     // For cover mode, music_codes stays empty — run_dit_and_vae will use
     // cover_latent_cond_ for n_frames and skip the FSQ decode step.
     if (!run_dit_and_vae(*req, music_codes, &res->pcm_stereo, error)) return false;
+
+    // ── Post-processing: DC offset removal + gentle peak normalization ──
+    // The ACE-Step VAE decoder tends to emit a small constant DC offset
+    // (typically -0.02 to -0.04) with the actual audio content oscillating
+    // around it at very low amplitude. Left untreated this produces
+    // near-silent, click-prone WAV files. We:
+    //   1. Subtract the per-channel mean (DC block).
+    //   2. Peak-normalize the AC component to 0.9 (only if the peak is
+    //      below 0.5 — we never attenuate a loud signal, only boost quiet
+    //      ones to use the available headroom).
+    // This mirrors what every production mastering chain does anyway, and
+    // is essential here because the VAE was trained on data normalized to
+    // ~[-1, 1] but our decode produces a tiny, biased output range.
+    {
+        auto& pcm = res->pcm_stereo;
+        const size_t n_total = pcm.size();
+        if (n_total >= 4) {
+            // Per-channel mean (interleaved L,R,L,R).
+            const size_t n_per_ch = n_total / 2;
+            double sum_l = 0.0, sum_r = 0.0;
+            for (size_t i = 0; i < n_per_ch; i++) {
+                sum_l += pcm[i * 2];
+                sum_r += pcm[i * 2 + 1];
+            }
+            const float dc_l = static_cast<float>(sum_l / static_cast<double>(n_per_ch));
+            const float dc_r = static_cast<float>(sum_r / static_cast<double>(n_per_ch));
+            // Subtract DC offset; track peak.
+            float peak = 0.0f;
+            for (size_t i = 0; i < n_per_ch; i++) {
+                float l = pcm[i * 2]     - dc_l;
+                float r = pcm[i * 2 + 1] - dc_r;
+                pcm[i * 2]     = l;
+                pcm[i * 2 + 1] = r;
+                if (std::fabs(l) > peak) peak = std::fabs(l);
+                if (std::fabs(r) > peak) peak = std::fabs(r);
+            }
+            // Boost only if very quiet — leaves louder signals untouched.
+            if (peak > 1e-6f && peak < 0.5f) {
+                const float gain = 0.9f / peak;
+                for (size_t i = 0; i < n_total; i++) pcm[i] *= gain;
+            }
+            fprintf(stderr,
+                "[ace_step] post: DC_offset=[%.5f,%.5f]  peak_after=%.5f  %s\n",
+                dc_l, dc_r, peak,
+                (peak > 1e-6f && peak < 0.5f) ? "(normalized)" : "(untouched)");
+        }
+    }
     return true;
 }
 
