@@ -548,16 +548,41 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     const int32_t  overlay_len     = codec_input_len - 1; // all except codec_bos
 
     // ── Project special text tokens (bos, eos, pad) ─────────────────────
-    // REVERTED to chat-template IDs (talker_->bos_token_id / eos_token_id).
-    // The TTS-specific IDs (151672/151673/151671) collapsed the talker
-    // hidden state on 0.6B (RMS 0.002, near-silent). The chat-template
-    // IDs work for 0.6B. 1.7B needs a different fix (see compact-text
-    // mode and small_to_mtp projection diagnostics).
+    //
+    // Canonical faster-qwen3-tts uses TTS-specific tokens from the model
+    // config: tts_bos=151672, tts_eos=151673, tts_pad=151671 (verified in
+    // every Qwen3-TTS config.json: 0.6B-Base, 1.7B-Base, CustomVoice,
+    // VoiceDesign all carry these exact IDs).
+    //
+    // EMPIRICAL STATUS on our GGUFs:
+    //   - 1.7B-Base: TTS-specific IDs FIXED the Chinese-gibberish bug
+    //     (chat-template IDs put the model out-of-distribution; the model
+    //     would emit coherent but wrong-language content).
+    //   - 0.6B-Base: TTS-specific IDs COLLAPSE the model to RMS=0.002
+    //     (near-silence). Chat-template IDs (151644/151645) work for 0.6B.
+    //
+    // The 0.6B-specific collapse with canonical tokens is likely a GGUF
+    // conversion quirk (token-type metadata or embedding-row initialization
+    // for IDs in the 1516xx range). Investigating that is tracked as gap
+    // A1.b. For now, pick the IDs variant-aware based on talker hidden.
+    //
+    // Override via env vars QWEN3TTS_TTS_BOS / _EOS / _PAD for debugging.
     std::vector<float> special_proj(static_cast<size_t>(3) * n_embd);
     {
-        int32_t special_ids[3] = {talker_->bos_token_id(),
-                                  talker_->eos_token_id(),
-                                  static_cast<int32_t>(pad_idx)};
+        // Variant-aware defaults: 1.7B (hidden>=2048) uses canonical
+        // TTS-specific IDs; 0.6B (hidden<2048) uses chat-template IDs that
+        // have been empirically verified to work.
+        const bool is_1_7b = (n_embd >= 2048);
+        int32_t tts_bos_id = is_1_7b ? 151672 : talker_->bos_token_id();
+        int32_t tts_eos_id = is_1_7b ? 151673 : talker_->eos_token_id();
+        int32_t tts_pad_id = is_1_7b ? 151671 : static_cast<int32_t>(pad_idx);
+        if (const char* v = std::getenv("QWEN3TTS_TTS_BOS")) tts_bos_id = std::atoi(v);
+        if (const char* v = std::getenv("QWEN3TTS_TTS_EOS")) tts_eos_id = std::atoi(v);
+        if (const char* v = std::getenv("QWEN3TTS_TTS_PAD")) tts_pad_id = std::atoi(v);
+        int32_t special_ids[3] = {tts_bos_id, tts_eos_id, tts_pad_id};
+        std::fprintf(stderr, "qwen3_tts: tts_bos/eos/pad ids = %d/%d/%d (variant=%s, hidden=%d)\n",
+                     tts_bos_id, tts_eos_id, tts_pad_id,
+                     is_1_7b ? "1.7B" : "0.6B", n_embd);
         talker_->project_text_tokens(special_ids, 3, special_proj.data(), error);
     }
     const float* tts_bos_embed = &special_proj[0];
