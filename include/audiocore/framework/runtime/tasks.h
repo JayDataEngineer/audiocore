@@ -90,6 +90,15 @@ struct TtsRequest {
     // ── Qwen3-TTS knobs ──
     float       speed = 1.0f;                 // speed multiplier
     float       repetition_penalty = 1.05f;   // repetition penalty (CB0, HuggingFace style)
+
+    // ── Voice sidecar DSP defaults ──
+    // Populated by resolve_voice_field() when a `<name>.voice.json` sidecar
+    // exists next to the loaded `<name>.voice` file. These are DEFAULTS —
+    // explicit `pitch_shift` / `speed` in the request body still override.
+    // The frontend Voice Maker writes the sidecar via PUT /v1/voices/<n>/meta.
+    float       voice_pitch_shift = 0.0f;     // semitones, -12..+12
+    float       voice_speed       = 1.0f;     // 0.5..2.0
+    bool        has_voice_meta    = false;    // true once sidecar loaded
 };
 
 struct TtsResponse {

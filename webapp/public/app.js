@@ -357,6 +357,152 @@
     } catch (err) { status(st, "Error: " + err.message, "err"); }
   });
 
+  // ── Knob 4: Shape voice (DSP sidecar) ──────────────────────────────
+  // Loads the saved pitch/speed for the selected voice into the sliders,
+  // then Preview runs a one-shot TTS using the slider values, and Save
+  // writes them to <voice>.voice.json so all future Synthesize calls
+  // using that voice automatically inherit the shaping.
+  async function load_shape_for_voice() {
+    const name = $("#mk-shape-voice").value;
+    if (!name) return;
+    try {
+      const r = await fetch(`/v1/voices/${encodeURIComponent(name)}/meta`);
+      const j = await r.json();
+      $("#mk-shape-pitch").value = j.pitch_shift || 0;
+      $("#mk-shape-speed").value = j.speed || 1.0;
+      $("#mk-shape-pitch-val").textContent = (j.pitch_shift || 0).toFixed(1) + " st";
+      $("#mk-shape-speed-val").textContent = (j.speed || 1.0).toFixed(2) + "×";
+      const st = $("#mk-shape-status");
+      if (j.has_meta) {
+        status(st, `Loaded saved shaping: ${(j.pitch_shift||0).toFixed(1)} st / ${(j.speed||1.0).toFixed(2)}×`, "info");
+      } else {
+        status(st, "No saved shaping yet — defaults loaded.", "info");
+      }
+    } catch (_) { /* silent */ }
+  }
+
+  // Refresh dropdowns also fills the knob-4 select and re-fetches meta.
+  const _orig_refresh = refresh_maker_dropdowns;
+  refresh_maker_dropdowns = async function () {
+    await _orig_refresh();
+    const sel = $("#mk-shape-voice");
+    if (!sel) return;
+    // _orig_refresh doesn't fill mk-shape-voice, so derive from voices list
+    try {
+      const r = await fetch("/v1/voices");
+      const j = await r.json();
+      const voices = (j.voices || []).filter(v => !v.name.endsWith(".dir"));
+      const cur = sel.value;
+      sel.innerHTML = "";
+      if (!voices.length) {
+        const o = document.createElement("option");
+        o.value = ""; o.textContent = "(none available)";
+        sel.appendChild(o);
+        return;
+      }
+      for (const v of voices) {
+        const o = document.createElement("option");
+        o.value = v.name;
+        const tag = v.dsp ? `  [pitch ${(v.dsp.pitch_shift||0).toFixed(1)}, sp ${(v.dsp.speed||1).toFixed(2)}]` : "";
+        o.textContent = v.name + tag;
+        sel.appendChild(o);
+      }
+      if (cur) for (const o of sel.options) if (o.value === cur) { sel.value = cur; break; }
+      if (!sel.value) load_shape_for_voice();
+    } catch (_) {}
+  };
+
+  $("#mk-shape-voice").addEventListener("change", load_shape_for_voice);
+  $("#mk-shape-pitch").addEventListener("input", (e) => {
+    const v = parseFloat(e.target.value);
+    $("#mk-shape-pitch-val").textContent = (v >= 0 ? "+" : "") + v.toFixed(1) + " st";
+  });
+  $("#mk-shape-speed").addEventListener("input", (e) => {
+    const v = parseFloat(e.target.value);
+    $("#mk-shape-speed-val").textContent = v.toFixed(2) + "×";
+  });
+
+  // Preview: synthesize with the current slider values (one-shot, doesn't save)
+  $("#mk-shape-preview").addEventListener("click", async () => {
+    const st = $("#mk-shape-status");
+    const player = $("#mk-shape-player");
+    const name = $("#mk-shape-voice").value;
+    const text = $("#mk-shape-text").value.trim();
+    if (!name) { status(st, "Pick a voice first.", "err"); return; }
+    if (!text) { status(st, "Type some preview text.", "err"); return; }
+    const pitch = parseFloat($("#mk-shape-pitch").value);
+    const speed = parseFloat($("#mk-shape-speed").value);
+    status(st, `Previewing at ${pitch.toFixed(1)} st / ${speed.toFixed(2)}×…`, "loading");
+    player.hidden = false;
+    player.innerHTML = '<div class="player-empty">Generating preview…</div>';
+    try {
+      const r = await fetch("/v1/audio/speech", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: window.AUDIOCORE_MODEL_ID || "default",
+          input: text,
+          voice: name,
+          mode: "voice_clone",
+          pitch_shift: pitch,
+          speed: speed,
+        }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        status(st, j.error || `Preview failed (${r.status})`, "err");
+        return;
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      player.innerHTML = `<audio controls autoplay src="${url}"></audio>
+        <div class="hint">Preview • ${pitch.toFixed(1)} st • ${speed.toFixed(2)}× (not saved)</div>`;
+      status(st, "Preview ready. Adjust sliders and Preview again, or Save shaping.", "ok");
+    } catch (err) { status(st, "Error: " + err.message, "err"); }
+  });
+
+  // Save shaping: PUT the sidecar JSON
+  $("#mk-shape-save").addEventListener("click", async () => {
+    const st = $("#mk-shape-status");
+    const name = $("#mk-shape-voice").value;
+    if (!name) { status(st, "Pick a voice first.", "err"); return; }
+    const pitch = parseFloat($("#mk-shape-pitch").value);
+    const speed = parseFloat($("#mk-shape-speed").value);
+    status(st, "Saving shaping…", "loading");
+    try {
+      const r = await fetch(`/v1/voices/${encodeURIComponent(name)}/meta`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pitch_shift: pitch, speed: speed }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        status(st, `Saved ${j.name} → pitch ${j.dsp.pitch_shift} st, speed ${j.dsp.speed}×. ` +
+                   "Every Synthesize using this voice now applies these defaults.", "ok");
+        toast("Voice shaping saved", "ok");
+        refresh_maker_dropdowns();
+      } else status(st, j.error || "Save failed", "err");
+    } catch (err) { status(st, "Error: " + err.message, "err"); }
+  });
+
+  // Reset shaping: DELETE the sidecar
+  $("#mk-shape-clear").addEventListener("click", async () => {
+    const st = $("#mk-shape-status");
+    const name = $("#mk-shape-voice").value;
+    if (!name) return;
+    status(st, "Resetting shaping…", "loading");
+    try {
+      const r = await fetch(`/v1/voices/${encodeURIComponent(name)}/meta`, { method: "DELETE" });
+      const j = await r.json();
+      $("#mk-shape-pitch").value = 0;
+      $("#mk-shape-speed").value = 1.0;
+      $("#mk-shape-pitch-val").textContent = "0.0 st";
+      $("#mk-shape-speed-val").textContent = "1.00×";
+      status(st, j.ok ? "Shaping reset to defaults." : (j.error || "Nothing to reset."), "ok");
+      refresh_maker_dropdowns();
+    } catch (err) { status(st, "Error: " + err.message, "err"); }
+  });
+
   // ── Synthesize tab ─────────────────────────────────────────────────
   const PRESET_SPEAKERS = [
     "Vivian", "Serena", "Ryan", "Aiden", "Eric",
@@ -381,7 +527,30 @@
     $("#syn-preset").hidden   = v !== "preset";
     $("#syn-uploaded").hidden = v !== "uploaded";
     $("#syn-ref-row").hidden  = v !== "reference";
+    if (v === "uploaded") load_syn_voice_meta();
   });
+
+  // When a saved .voice is picked in Synthesize, load its saved shaping
+  // into the pitch/speed sliders so the user sees the actual values that
+  // will be applied (and can fine-tune from there).
+  async function load_syn_voice_meta() {
+    const sel = $("#syn-uploaded");
+    const name = sel && sel.value;
+    if (!name) return;
+    try {
+      const r = await fetch(`/v1/voices/${encodeURIComponent(name)}/meta`);
+      const j = await r.json();
+      const pitch = j.pitch_shift || 0;
+      const speed = j.speed || 1.0;
+      $("#syn-pitch").value = pitch;
+      $("#syn-speed").value = speed;
+      $("#syn-pitch-val").textContent = pitch.toFixed(1);
+      $("#syn-speed-val").textContent = speed.toFixed(2);
+    } catch (_) {}
+  }
+  if ($("#syn-uploaded")) {
+    $("#syn-uploaded").addEventListener("change", load_syn_voice_meta);
+  }
 
   // Slider live values
   $("#syn-pitch").addEventListener("input", (e) => {

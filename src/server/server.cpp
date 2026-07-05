@@ -138,6 +138,31 @@ void resolve_voice_field(TtsRequest& tr, const std::string& clips_dir) {
     std::memcpy(tr.speaker_embedding.data(), raw.data(), dim * 4);
     tr.voice_path.clear();
     if (tr.mode.empty() || tr.mode == "tts") tr.mode = "voice_clone";
+
+    // ── Load DSP sidecar `<name>.voice.json` if present ────────────────
+    // The Voice Maker writes pitch_shift / speed here so any Synthesize
+    // call that picks this voice automatically inherits the saved shaping.
+    std::string mpath = vpath + ".json";
+    std::ifstream mf(mpath);
+    if (mf) {
+        std::string mtext((std::istreambuf_iterator<char>(mf)),
+                           std::istreambuf_iterator<char>());
+        try {
+            auto meta = json::parse(mtext);
+            // Range-clamp semitones to a safe ±12; speed to (0.25, 4.0].
+            float ps = meta.value("pitch_shift", 0.0f);
+            if (ps < -12.0f) ps = -12.0f;
+            if (ps >  12.0f) ps =  12.0f;
+            float sp = meta.value("speed", 1.0f);
+            if (sp < 0.25f) sp = 0.25f;
+            if (sp > 4.0f)  sp = 4.0f;
+            tr.voice_pitch_shift = ps;
+            tr.voice_speed       = sp;
+            tr.has_voice_meta    = true;
+        } catch (...) {
+            // Malformed sidecar — silently ignore.
+        }
+    }
 }
 
 // ── Clip helpers ──────────────────────────────────────────────────────────
@@ -351,8 +376,15 @@ std::shared_ptr<httplib::Server> build_server(
         // These are independent of any TTS family — pure signal processing
         // on the float32 PCM before WAV/MP3 encoding. Useful for "fine-
         // tune the voice after generation" sliders in the UI.
-        const float pitch_shift_semi = body.value("pitch_shift", 0.0f);
-        const float speed_mult       = body.value("speed",       1.0f);
+        //
+        // Resolution order: (1) `<name>.voice.json` sidecar defaults
+        // (set by resolve_voice_field from the Voice Maker), then (2) the
+        // explicit `pitch_shift` / `speed` keys in this request body —
+        // the body wins so users can always override per-call.
+        float pitch_shift_semi = tr.has_voice_meta ? tr.voice_pitch_shift : 0.0f;
+        float speed_mult       = tr.has_voice_meta ? tr.voice_speed       : 1.0f;
+        if (body.contains("pitch_shift")) pitch_shift_semi = body["pitch_shift"].get<float>();
+        if (body.contains("speed"))       speed_mult       = body["speed"].get<float>();
         if (!tresp.pcm_mono.empty()) {
             if (std::fabs(pitch_shift_semi) > 0.001f) {
                 auto shifted = audiocore::pitch_shift(
@@ -828,6 +860,9 @@ std::shared_ptr<httplib::Server> build_server(
             fs::create_directories(voices_dir, ec);
 
             // Read a QWEN3VOICE file's dim + L2 norm (for metadata in lists).
+            // Also reads an optional `<name>.voice.json` sidecar (written by
+            // the Voice Maker via PUT /v1/voices/<n>/meta) that carries
+            // default DSP shaping — `pitch_shift` (semitones) and `speed`.
             auto voice_meta = [](const fs::path& p) -> json {
                 std::ifstream f(p, std::ios::binary);
                 if (!f) return {};
@@ -851,6 +886,21 @@ std::shared_ptr<httplib::Server> build_server(
                 v["size"]    = static_cast<uint64_t>(fs::file_size(p));
                 v["dim"]     = static_cast<uint64_t>(dim);
                 v["l2_norm"] = l2;
+
+                // Voice-shaping sidecar: <name>.voice.json next to the .voice.
+                std::string sidecar = p.string() + ".json";
+                std::ifstream sf(sidecar);
+                if (sf) {
+                    std::string mtext((std::istreambuf_iterator<char>(sf)),
+                                       std::istreambuf_iterator<char>());
+                    try {
+                        auto meta = json::parse(mtext);
+                        json dsp;
+                        dsp["pitch_shift"] = meta.value("pitch_shift", 0.0f);
+                        dsp["speed"]       = meta.value("speed",       1.0f);
+                        v["dsp"] = std::move(dsp);
+                    } catch (...) { /* malformed sidecar — ignore */ }
+                }
                 return v;
             };
 
@@ -889,6 +939,127 @@ std::shared_ptr<httplib::Server> build_server(
                 std::string data((std::istreambuf_iterator<char>(f)),
                                   std::istreambuf_iterator<char>());
                 res.set_content(std::move(data), "application/octet-stream");
+            });
+
+            // ── Voice shaping sidecar endpoints ──────────────────────────
+            // <voices_dir>/<name>.voice.json — written by the Voice Maker
+            // Knob 4 ("Shape voice") and read by resolve_voice_field() so
+            // any Synthesize call using this voice automatically picks up
+            // the saved pitch_shift + speed defaults.
+
+            // PUT /v1/voices/<name>/meta — save DSP sidecar JSON
+            svr->Put(R"(/v1/voices/([^/?]+)/meta)",
+                     [voices_dir](const httplib::Request& req, httplib::Response& res) {
+                json resp;
+                std::string name = req.matches[1];
+                if (name.empty() || name.size() < 6 ||
+                    name.compare(name.size() - 6, 6, ".voice") != 0 ||
+                    name.find("..") != std::string::npos ||
+                    name.find('/') != std::string::npos) {
+                    res.status = 400;
+                    resp["error"] = "name must end in .voice and be a flat filename";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                fs::path target = fs::path(voices_dir) / name;
+                if (!fs::is_regular_file(target)) {
+                    res.status = 404;
+                    resp["error"] = "voice not found — upload the .voice first";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                json body;
+                try { body = json::parse(req.body); }
+                catch (...) {
+                    res.status = 400;
+                    resp["error"] = "invalid json";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                float ps = body.value("pitch_shift", 0.0f);
+                float sp = body.value("speed",       1.0f);
+                if (ps < -12.0f) ps = -12.0f;
+                if (ps >  12.0f) ps =  12.0f;
+                if (sp < 0.25f)  sp = 0.25f;
+                if (sp > 4.0f)   sp = 4.0f;
+                json out;
+                out["pitch_shift"] = ps;
+                out["speed"]       = sp;
+                fs::path sidecar = target;
+                sidecar += ".json";
+                std::ofstream of(sidecar);
+                if (!of) {
+                    res.status = 500;
+                    resp["error"] = "cannot write sidecar";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                of << out.dump(2);
+                of.close();
+                resp["ok"]   = true;
+                resp["name"] = name;
+                resp["dsp"]  = std::move(out);
+                res.set_content(resp.dump(), "application/json");
+            });
+
+            // GET /v1/voices/<name>/meta — read sidecar (or defaults)
+            svr->Get(R"(/v1/voices/([^/?]+)/meta)",
+                     [voices_dir](const httplib::Request& req, httplib::Response& res) {
+                json resp;
+                std::string name = req.matches[1];
+                if (name.empty() || name.find("..") != std::string::npos ||
+                    name.find('/') != std::string::npos) {
+                    res.status = 400;
+                    resp["error"] = "invalid name";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                fs::path sidecar = fs::path(voices_dir) / name;
+                sidecar += ".json";
+                std::ifstream sf(sidecar);
+                if (!sf) {
+                    resp["pitch_shift"] = 0.0f;
+                    resp["speed"]       = 1.0f;
+                    resp["has_meta"]    = false;
+                } else {
+                    std::string mtext((std::istreambuf_iterator<char>(sf)),
+                                       std::istreambuf_iterator<char>());
+                    try {
+                        auto meta = json::parse(mtext);
+                        resp["pitch_shift"] = meta.value("pitch_shift", 0.0f);
+                        resp["speed"]       = meta.value("speed",       1.0f);
+                        resp["has_meta"]    = true;
+                    } catch (...) {
+                        resp["pitch_shift"] = 0.0f;
+                        resp["speed"]       = 1.0f;
+                        resp["has_meta"]    = false;
+                    }
+                }
+                res.set_content(resp.dump(), "application/json");
+            });
+
+            // DELETE /v1/voices/<name>/meta — remove sidecar
+            svr->Delete(R"(/v1/voices/([^/?]+)/meta)",
+                        [voices_dir](const httplib::Request& req, httplib::Response& res) {
+                json resp;
+                std::string name = req.matches[1];
+                if (name.empty() || name.find("..") != std::string::npos ||
+                    name.find('/') != std::string::npos) {
+                    res.status = 400;
+                    resp["error"] = "invalid name";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                fs::path sidecar = fs::path(voices_dir) / name;
+                sidecar += ".json";
+                if (fs::is_regular_file(sidecar)) {
+                    fs::remove(sidecar);
+                    resp["ok"] = true;
+                } else {
+                    resp["ok"] = false;
+                    resp["error"] = "no sidecar";
+                }
+                res.set_content(resp.dump(), "application/json");
             });
 
             // POST /v1/voices/upload — multipart file upload (.voice files)
