@@ -223,7 +223,22 @@ bool AceStepSession::load(const std::string& model_path,
     const std::string dit_path = find_gguf(dir, "acestep-v15", dit_variant);
     const std::string lm_path  = find_gguf(dir, "5Hz-lm", lm_variant);
     const std::string te_path  = find_gguf(dir, "Qwen3-Embedding");
-    const std::string vae_path = find_gguf(dir, "vae");
+    // VAE path: allow override via extras["vae_path"] (ScragVAE swap-in).
+    // The ScragVAE community decoder has tensor-for-tensor compatibility with
+    // the stock VAE but produces dramatically better high-frequency detail
+    // (12-24kHz region) and dynamic range. When the override path doesn't
+    // exist or isn't supplied, fall back to the dir's default *vae*.gguf.
+    std::string vae_path;
+    if (opts.extras.count("vae_path") && !opts.extras.at("vae_path").empty()) {
+        vae_path = opts.extras.at("vae_path");
+        if (!file_exists(vae_path)) {
+            if (error) *error = "ACE-Step: vae_path override '" + vae_path +
+                                "' does not exist";
+            return false;
+        }
+    } else {
+        vae_path = find_gguf(dir, "vae");
+    }
     if (!file_exists(dit_path) || !file_exists(lm_path) ||
         !file_exists(te_path)  || !file_exists(vae_path)) {
         if (error) *error = std::string("ACE-Step model dir must contain four "
