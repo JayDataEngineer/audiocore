@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include "audiocore/framework/runtime/tasks.h"
+#include "audiocore/framework/audio/dsp.h"   // pitch_shift, change_speed
 #include "audiocore/models/ace_step/family.h"    // MusicRequest / MusicResponse
 #ifdef AUDIOCORE_ENABLE_MP3
 #include "audiocore/framework/io/mp3_encoder.h"
@@ -307,6 +308,31 @@ std::shared_ptr<httplib::Server> build_server(
             fail_with(res, err);
             return;
         }
+
+        // ── Optional post-processing: pitch shift + speed change. ──────
+        // WSOLA-based, model-agnostic. See framework/audio/dsp.h.
+        // These are independent of any TTS family — pure signal processing
+        // on the float32 PCM before WAV/MP3 encoding. Useful for "fine-
+        // tune the voice after generation" sliders in the UI.
+        const float pitch_shift_semi = body.value("pitch_shift", 0.0f);
+        const float speed_mult       = body.value("speed",       1.0f);
+        if (!tresp.pcm_mono.empty()) {
+            if (std::fabs(pitch_shift_semi) > 0.001f) {
+                auto shifted = audiocore::pitch_shift(
+                    tresp.pcm_mono.data(), tresp.pcm_mono.size(),
+                    static_cast<double>(pitch_shift_semi),
+                    tresp.sampling_rate);
+                tresp.pcm_mono = std::move(shifted);
+            }
+            if (std::fabs(speed_mult - 1.0f) > 0.001f && speed_mult > 0.0f) {
+                auto sped = audiocore::change_speed(
+                    tresp.pcm_mono.data(), tresp.pcm_mono.size(),
+                    static_cast<double>(speed_mult),
+                    tresp.sampling_rate);
+                tresp.pcm_mono = std::move(sped);
+            }
+        }
+
         if (tr.response_format == "mp3") {
 #ifdef AUDIOCORE_ENABLE_MP3
             auto mp3 = pcm_mono_to_mp3(tresp.pcm_mono.data(),
@@ -708,6 +734,138 @@ std::shared_ptr<httplib::Server> build_server(
             }
             res.set_content(resp.dump(), "application/json");
         });
+    }
+
+    // ── Voice library routes (.voice files = QWEN3VOICE embeddings) ────────
+    // Voices live under <clips_dir>/voices/. The frontend uses these routes
+    // to populate the "Voices" tab and let users save / upload / delete
+    // 2048-d ECAPA-TDNN embeddings for reuse in the Synthesize tab.
+    {
+        std::string voices_dir;
+        if (!clips_dir.empty()) voices_dir = clips_dir + "/voices";
+        if (!voices_dir.empty()) {
+            std::error_code ec;
+            fs::create_directories(voices_dir, ec);
+
+            // Read a QWEN3VOICE file's dim + L2 norm (for metadata in lists).
+            auto voice_meta = [](const fs::path& p) -> json {
+                std::ifstream f(p, std::ios::binary);
+                if (!f) return {};
+                char hdr[32];
+                if (!f.read(hdr, 32)) return {};
+                if (std::memcmp(hdr, "QWEN3VOICE", 10) != 0) return {};
+                uint32_t dim = 0;
+                std::memcpy(&dim, hdr + 20, 4);
+                // Read a chunk to estimate L2 (only first 1024 floats —
+                // accurate enough for display, faster than full scan).
+                std::vector<float> sample(std::min<uint32_t>(dim, 2048));
+                f.read(reinterpret_cast<char*>(sample.data()),
+                       static_cast<std::streamsize>(sample.size() * 4));
+                double l2 = 0.0;
+                for (float v : sample) l2 += static_cast<double>(v) * v;
+                l2 = std::sqrt(l2 * (static_cast<double>(dim) /
+                                      static_cast<double>(sample.size())));
+                json v;
+                v["name"]    = p.filename().string();
+                v["path"]    = p.filename().string();
+                v["size"]    = static_cast<uint64_t>(fs::file_size(p));
+                v["dim"]     = static_cast<uint64_t>(dim);
+                v["l2_norm"] = l2;
+                return v;
+            };
+
+            // GET /v1/voices — list .voice files
+            svr->Get("/v1/voices", [voices_dir, voice_meta](const httplib::Request&, httplib::Response& res) {
+                json arr = json::array();
+                std::error_code ec;
+                for (auto& entry : fs::directory_iterator(voices_dir, ec)) {
+                    if (!entry.is_regular_file()) continue;
+                    if (entry.path().extension() != ".voice") continue;
+                    auto meta = voice_meta(entry.path());
+                    if (!meta.is_null()) arr.push_back(meta);
+                }
+                std::sort(arr.begin(), arr.end(), [](const json& a, const json& b) {
+                    return a["name"].get<std::string>() < b["name"].get<std::string>();
+                });
+                res.set_content(json{{"voices", arr}}.dump(), "application/json");
+            });
+
+            // GET /v1/voices/raw/<name> — serve the .voice binary
+            svr->Get(R"(/v1/voices/raw/([^/?]+))",
+                     [voices_dir](const httplib::Request& req, httplib::Response& res) {
+                std::string name = req.matches[1];
+                if (name.find("..") != std::string::npos || name.find('/') != std::string::npos) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid name"})", "application/json");
+                    return;
+                }
+                fs::path target = fs::path(voices_dir) / name;
+                if (!fs::is_regular_file(target)) {
+                    res.status = 404;
+                    res.set_content(R"({"error":"not found"})", "application/json");
+                    return;
+                }
+                std::ifstream f(target, std::ios::binary);
+                std::string data((std::istreambuf_iterator<char>(f)),
+                                  std::istreambuf_iterator<char>());
+                res.set_content(std::move(data), "application/octet-stream");
+            });
+
+            // POST /v1/voices/upload — multipart file upload (.voice files)
+            svr->Post("/v1/voices/upload",
+                      [voices_dir](const httplib::Request& req, httplib::Response& res) {
+                json resp;
+                if (!req.is_multipart_form_data()) {
+                    res.status = 400;
+                    resp["error"] = "expected multipart/form-data";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                auto files = req.get_file_values("file");
+                json saved = json::array();
+                for (auto& f : files) {
+                    if (f.filename.empty()) continue;
+                    auto ext = fs::path(f.filename).extension().string();
+                    for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+                    if (ext != ".voice") continue;
+                    std::string safe = sanitize_filename(f.filename);
+                    fs::path dest = fs::path(voices_dir) / safe;
+                    std::ofstream out(dest, std::ios::binary);
+                    out.write(f.content.data(), f.content.size());
+                    saved.push_back(safe);
+                }
+                resp["ok"] = true;
+                resp["saved"] = std::move(saved);
+                res.set_content(resp.dump(), "application/json");
+            });
+
+            // POST /v1/voices/delete — delete a voice by name
+            svr->Post("/v1/voices/delete",
+                      [voices_dir](const httplib::Request& req, httplib::Response& res) {
+                json resp;
+                std::string name;
+                try {
+                    auto j = json::parse(req.body);
+                    name = j.value("name", "");
+                } catch (...) {}
+                if (name.empty() || name.find("..") != std::string::npos ||
+                    name.find('/') != std::string::npos) {
+                    res.status = 400;
+                    resp["error"] = "invalid name";
+                    res.set_content(resp.dump(), "application/json");
+                    return;
+                }
+                fs::path target = fs::path(voices_dir) / name;
+                if (fs::is_regular_file(target)) {
+                    fs::remove(target);
+                    resp["ok"] = true;
+                } else {
+                    resp["ok"] = false;
+                    resp["error"] = "not found";
+                }
+                res.set_content(resp.dump(), "application/json");
+            });
+        }
     }
 
     // ── Embedded webapp assets ────────────────────────────────────────────

@@ -465,6 +465,164 @@ static int cmd_shift(int argc, char** argv) {
     return 0;
 }
 
+// ── SLERP: Spherical Linear Interpolation ───────────────────────────────
+//
+// The ECAPA-TDNN embeddings are NOT unit-norm (typical L2 ≈ 17.7), but
+// they all live near a thin shell of similar radius. SLERP generalizes
+// linear interpolation to great-circle arcs on the unit hypersphere:
+//
+//   SLERP(p, q, t) = (sin((1-t)·Ω) / sin Ω) · p + (sin(t·Ω) / sin Ω) · q
+//
+// where Ω = arccos( cos_sim(p, q) ) and t ∈ [0, 1].
+//
+// Because the magnitudes are nearly identical across voices, we normalize
+// both inputs first, SLERP, then re-scale the result to the average L2 to
+// match what the talker expects. This gives a perceptually smoother blend
+// than linear `mix` when |t - 0.5| is far from 0 or 1.
+static int cmd_slerp(int argc, char** argv) {
+    if (argc != 4) {
+        std::fprintf(stderr,
+            "usage: qwen_voice slerp <a.voice> <b.voice> <t> <out.voice>\n"
+            "  t ∈ [0, 1]: 0 = pure a, 1 = pure b, 0.5 = equal mix.\n");
+        return 2;
+    }
+    auto a = read_voice(argv[0]);
+    auto b = read_voice(argv[1]);
+    if (a.empty() || b.empty() || a.size() != b.size()) {
+        std::fprintf(stderr, "[err] read/dim mismatch\n"); return 1;
+    }
+    float t = std::strtof(argv[2], nullptr);
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    // Magnitudes (we'll restore to the average of the two).
+    double na = 0.0, nb = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        na += static_cast<double>(a[i]) * a[i];
+        nb += static_cast<double>(b[i]) * b[i];
+    }
+    na = std::sqrt(na);
+    nb = std::sqrt(nb);
+    if (na < 1e-9 || nb < 1e-9) {
+        std::fprintf(stderr, "[err] zero-norm voice\n"); return 1;
+    }
+    const double avg_norm = 0.5 * (na + nb);
+
+    // Unit-normalized copies.
+    std::vector<double> ua(a.size()), ub(b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        ua[i] = static_cast<double>(a[i]) / na;
+        ub[i] = static_cast<double>(b[i]) / nb;
+    }
+
+    // Cosine similarity clamped to valid arccos domain.
+    double dot = 0.0;
+    for (size_t i = 0; i < ua.size(); ++i) dot += ua[i] * ub[i];
+    if (dot >  1.0) dot =  1.0;
+    if (dot < -1.0) dot = -1.0;
+    const double omega = std::acos(dot);
+
+    std::vector<float> out(a.size());
+    // If Ω is tiny, the two voices are nearly identical — fall back to LERP
+    // to avoid division by zero in sin(Ω).
+    if (omega < 1e-4) {
+        for (size_t i = 0; i < a.size(); ++i)
+            out[i] = static_cast<float>(((1.0 - t) * ua[i] + t * ub[i]) * avg_norm);
+    } else {
+        const double sin_omega = std::sin(omega);
+        const double w_a = std::sin((1.0 - t) * omega) / sin_omega;
+        const double w_b = std::sin(t * omega) / sin_omega;
+        for (size_t i = 0; i < a.size(); ++i)
+            out[i] = static_cast<float>((w_a * ua[i] + w_b * ub[i]) * avg_norm);
+    }
+    if (!write_voice(argv[3], out)) return 1;
+    print_stats(std::string("wrote ") + argv[3], out);
+    std::fprintf(stderr, "[info] SLERP: omega=%.4f rad (%.1f deg), t=%.3f\n",
+                 omega, omega * 180.0 / M_PI, t);
+    return 0;
+}
+
+// ── discover_direction: build a steering vector from labeled groups ─────
+//
+// Knob 2 in the user's voice-modification taxonomy. Reads every .voice
+// in <positive_dir> and <negative_dir>, computes the group means, and
+// emits `mean_pos - mean_neg` as a direction file. Apply with `shift`.
+//
+//   qwen_voice discover_direction voices/high/ voices/low/ pitch.dir
+//   qwen_voice shift base.voice pitch.dir 0.5 out.voice
+//
+// Convention: positive group = the "more X" end (e.g., higher pitch),
+// negative group = "less X". Positive `scale` in `shift` then = more X.
+static int cmd_discover_direction(int argc, char** argv) {
+    if (argc != 3) {
+        std::fprintf(stderr,
+            "usage: qwen_voice discover_direction <positive_dir> <negative_dir> <out.dir>\n"
+            "  Reads every *.voice in each dir, computes group means, emits\n"
+            "  mean_pos - mean_neg as a steering vector. Apply with `shift`.\n"
+            "  Example: discover_direction voices/high_pitch/ voices/low_pitch/ pitch.dir\n");
+        return 2;
+    }
+    const std::string pos_dir  = argv[0];
+    const std::string neg_dir  = argv[1];
+    const std::string out_path = argv[2];
+
+    auto load_dir_means = [](const std::string& dir, std::vector<float>& mean,
+                              size_t& dim, size_t& count) -> bool {
+        namespace fs = std::filesystem;
+        if (!fs::is_directory(dir)) {
+            std::fprintf(stderr, "[err] not a directory: %s\n", dir.c_str());
+            return false;
+        }
+        std::vector<float> acc;
+        dim = 0; count = 0;
+        for (auto& e : fs::directory_iterator(dir)) {
+            if (!e.is_regular_file()) continue;
+            if (e.path().extension() != ".voice") continue;
+            auto v = read_voice(e.path().string());
+            if (v.empty()) continue;
+            if (acc.empty()) {
+                acc.assign(v.size(), 0.0f);
+                dim = v.size();
+            } else if (v.size() != dim) {
+                std::fprintf(stderr, "[warn] dim mismatch in %s (%zu vs %zu), skipping\n",
+                             e.path().string().c_str(), v.size(), dim);
+                continue;
+            }
+            for (size_t i = 0; i < dim; ++i) acc[i] += v[i];
+            ++count;
+        }
+        if (count == 0) {
+            std::fprintf(stderr, "[err] no .voice files in %s\n", dir.c_str());
+            return false;
+        }
+        mean.assign(dim, 0.0f);
+        for (size_t i = 0; i < dim; ++i) mean[i] = acc[i] / static_cast<float>(count);
+        return true;
+    };
+
+    std::vector<float> mean_pos, mean_neg;
+    size_t dim_pos = 0, dim_neg = 0, cnt_pos = 0, cnt_neg = 0;
+    if (!load_dir_means(pos_dir, mean_pos, dim_pos, cnt_pos)) return 1;
+    if (!load_dir_means(neg_dir, mean_neg, dim_neg, cnt_neg)) return 1;
+    if (dim_pos != dim_neg) {
+        std::fprintf(stderr, "[err] positive dim %zu vs negative dim %zu\n", dim_pos, dim_neg);
+        return 1;
+    }
+    std::vector<float> direction(dim_pos);
+    for (size_t i = 0; i < dim_pos; ++i)
+        direction[i] = mean_pos[i] - mean_neg[i];
+    if (!write_voice(out_path, direction)) return 1;
+    double norm = 0.0;
+    for (float x : direction) norm += static_cast<double>(x) * x;
+    norm = std::sqrt(norm);
+    std::fprintf(stderr,
+        "[info] direction from %zu positive + %zu negative voices (dim=%zu)\n"
+        "       ||direction||_2 = %.4f\n",
+        cnt_pos, cnt_neg, dim_pos, norm);
+    print_stats(std::string("wrote direction ") + out_path, direction);
+    return 0;
+}
+
 static int cmd_encode(int argc, char** argv) {
     std::string model_dir = grab_arg(argc, argv, "--model-dir");
     std::string encoder   = grab_arg(argc, argv, "--encoder");
@@ -530,7 +688,20 @@ static int cmd_apply(int argc, char** argv) {
     // Python `voice_clone_prompt=(ref_code, ref_text, spk_emb)` API.
     std::string ref_audio = grab_arg(argc, argv, "--reference-audio");
     std::string ref_text  = grab_arg(argc, argv, "--reference-text");
-    if (model_dir.empty() || text.empty() ||
+    // --mode voice_design: dedicated VoiceDesign variant only. The instruct
+    // slot carries the natural-language voice description ("Deep male voice
+    // with British accent"). No reference / voice / speaker-name needed.
+    std::string mode      = grab_arg(argc, argv, "--mode");
+    if (mode == "voice_design") {
+        if (model_dir.empty() || text.empty() || instruct.empty()) {
+            std::fprintf(stderr,
+                "usage: qwen_voice apply --model-dir <voicedesign-dir> \\\n"
+                "       --text \"...\" --instruct \"<voice description>\" \\\n"
+                "       --mode voice_design [--out out.wav] [--temperature 0.8]\n"
+                "  VoiceDesign: instruct is the natural-language voice description.\n");
+            return 2;
+        }
+    } else if (model_dir.empty() || text.empty() ||
         (voice.empty() && ref_audio.empty() && spk_name.empty())) {
         std::fprintf(stderr,
             "usage: qwen_voice apply --model-dir <dir> --text \"...\" \\\n"
@@ -539,10 +710,12 @@ static int cmd_apply(int argc, char** argv) {
             "       [--language en] [--speaker-name \"\"] [--temperature 0.7]\n"
             "       [--encoder <spk.gguf>]\n"
             "       [--reference-audio <wav>] [--reference-text \"transcript\"]\n"
+            "       [--mode voice_design]  (requires VoiceDesign variant + --instruct)\n"
             "  x-vector mode:    --voice <file.voice>           (Base/Instruct variants)\n"
             "  named speaker:    --speaker-name Vivian          (CustomVoice variants)\n"
             "  ICL clone mode:   --reference-audio <wav> [--reference-text \"...\"]\n"
-            "  both:             --voice + --reference-audio    (spk_emb + codec tokens)\n");
+            "  both:             --voice + --reference-audio    (spk_emb + codec tokens)\n"
+            "  voice_design:     --mode voice_design + --instruct \"description\"\n");
         return 2;
     }
     if (out.empty()) out = "qwen_voice_apply.wav";
@@ -593,7 +766,13 @@ static int cmd_apply(int argc, char** argv) {
     // matching the Python voice_clone_prompt=(ref_code, ref_spk_embedding,
     // ref_text) API.
     bool ok = false;
-    if (!ref_audio.empty()) {
+    if (mode == "voice_design") {
+        req.mode = "voice_design";
+        std::fprintf(stderr, "[info] voice_design: \"%s\"\n", instruct.c_str());
+        ok = q->run_tts(&req, &resp, &err);
+        if (!ok)
+            std::fprintf(stderr, "[err] run_tts (voice_design) failed: %s\n", err.c_str());
+    } else if (!ref_audio.empty()) {
         req.mode = "voice_clone";
         if (!emb.empty()) req.speaker_embedding = emb;
         std::fprintf(stderr, "[info] ICL voice clone: ref_audio=%s ref_text=%s\n",
@@ -645,7 +824,11 @@ static void usage() {
         "  add <a.voice> <b.voice> <out.voice>\n"
         "  scale <voice> <scalar> <out.voice>\n"
         "  direction <from.voice> <to.voice> <out.direction>\n"
-        "  shift <base.voice> <direction.dir> <scale> <out.voice>\n\n"
+        "  shift <base.voice> <direction.dir> <scale> <out.voice>\n"
+        "  slerp <a.voice> <b.voice> <t> <out.voice>\n"
+        "        (Spherical Linear Interpolation; t∈[0,1]; smoother than mix)\n"
+        "  discover_direction <positive_dir> <negative_dir> <out.direction>\n"
+        "        (steering-vector from labeled groups; e.g. high/ vs low/)\n\n"
         "Model-backed subcommands (load qwen3_tts session):\n"
         "  encode --model-dir <dir> --wav <ref.wav> --out <voice>\n"
         "         [--encoder <spk.gguf>] [--extra-wav a.wav ...]\n"
@@ -668,6 +851,8 @@ int main(int argc, char** argv) {
     else if (sub == "scale")     return cmd_scale(sub_argc, sub_argv);
     else if (sub == "direction") return cmd_direction(sub_argc, sub_argv);
     else if (sub == "shift")     return cmd_shift(sub_argc, sub_argv);
+    else if (sub == "slerp")     return cmd_slerp(sub_argc, sub_argv);
+    else if (sub == "discover_direction") return cmd_discover_direction(sub_argc, sub_argv);
     else if (sub == "encode")    return cmd_encode(argc, argv);
     else if (sub == "apply")     return cmd_apply(argc, argv);
     else if (sub == "-h" || sub == "--help" || sub == "help") { usage(); return 0; }

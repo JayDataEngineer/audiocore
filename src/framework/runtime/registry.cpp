@@ -6,6 +6,9 @@
 #include "audiocore/framework/core/session.h"
 #include "audiocore/framework/runtime/discovery.h"
 
+#include "ggml.h"
+#include "ggml-backend.h"
+
 namespace audiocore {
 
 // ── Old FamilyRegistry implementation (backward compat) ───────────────────
@@ -167,6 +170,30 @@ public:
         bc.device_id = 0;
         if (auto it = request.options.find("device"); it != request.options.end())
             bc.device_id = std::stoi(it->second);
+
+        // GPU availability probe — mirror qwen_voice's load_session() logic.
+        // The make_backend() call later does ggml_backend_dev_by_type(GPU)
+        // → dev_init(); on some builds that silently returns null if the
+        // ggml backend registry hasn't been touched yet (the talker load
+        // via llama.cpp uses a separate path). Iterating dev_count/dev_get
+        // here forces registration, and we fall back to CPU if no GPU is
+        // actually present so the codec + speaker encoder still bind.
+        if (bc.kind == BackendKind::ggml_cuda ||
+            bc.kind == BackendKind::ggml_vulkan) {
+            bool gpu_ok = false;
+            int n_devs = ggml_backend_dev_count();
+            for (int i = 0; i < n_devs; i++) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    gpu_ok = true;
+                    break;
+                }
+            }
+            if (!gpu_ok) {
+                bc.kind = BackendKind::ggml_cpu;
+                opts.extras["n_gpu_layers"] = "0";
+            }
+        }
 
         std::string err;
         if (!session->load(resolved.string(), opts, bc, &err))

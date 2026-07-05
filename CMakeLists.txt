@@ -66,6 +66,8 @@ add_library(audiocore_framework STATIC
     src/framework/io/gguf_reader_ext.cpp
     src/framework/io/weight_loader.cpp
     src/framework/io/wav.cpp
+    # Time-domain WSOLA pitch-shift + speed-change post-processing.
+    src/framework/audio/dsp.cpp
     # Unified sampler shared by every family + the qwen3::Runner MTP step.
     src/framework/sampling/sampler.cpp
     src/framework/core/backend.cpp

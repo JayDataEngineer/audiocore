@@ -3,62 +3,259 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>audiocore</title>
+<title>audiocore · voice studio</title>
 <link rel="stylesheet" href="/style.css">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 </head>
 <body>
-<div class="shell">
 
-  <header>
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- TOPBAR                                                               -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">
+      <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
+        <defs>
+          <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#818cf8"/>
+            <stop offset="100%" stop-color="#6366f1"/>
+          </linearGradient>
+        </defs>
+        <rect x="3" y="13" width="3" height="6" rx="1.5" fill="url(#g)"/>
+        <rect x="9" y="9"  width="3" height="14" rx="1.5" fill="url(#g)"/>
+        <rect x="15" y="5" width="3" height="22" rx="1.5" fill="url(#g)"/>
+        <rect x="21" y="9" width="3" height="14" rx="1.5" fill="url(#g)"/>
+        <rect x="27" y="13" width="3" height="6" rx="1.5" fill="url(#g)"/>
+      </svg>
+    </div>
     <h1>audiocore</h1>
-    <span class="badge" id="model-badge"></span>
-  </header>
+    <span class="brand-sub">voice studio</span>
+  </div>
+  <div class="topbar-right">
+    <span class="badge" id="model-badge">connecting…</span>
+  </div>
+</header>
 
-  <section>
-    <div class="section-head">
-      <h2>Synthesize</h2>
-    </div>
-    <div class="card">
-      <form id="tts-form">
-        <div class="tts-row">
-          <select id="tts-model"></select>
-          <input type="text" id="tts-text" placeholder="Type something to speak..." required>
-          <button class="btn btn-primary" type="submit" id="tts-btn">Synthesize</button>
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- TABS                                                                 -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<nav class="tabs" role="tablist">
+  <button class="tab active" data-tab="design"     role="tab">✨ Voice Design</button>
+  <button class="tab"        data-tab="synthesize" role="tab">🗣️ Synthesize</button>
+  <button class="tab"        data-tab="music"      role="tab">🎵 Music</button>
+  <button class="tab"        data-tab="voices"     role="tab">🎭 Voices</button>
+  <button class="tab"        data-tab="clips"      role="tab">🎬 Clips</button>
+</nav>
+
+<main class="shell">
+
+  <!-- ════════════════ VOICE DESIGN ════════════════ -->
+  <section class="panel active" id="tab-design">
+    <div class="panel-grid">
+      <div class="card">
+        <div class="card-head">
+          <h2>Describe the voice</h2>
+          <p class="card-sub">Natural-language description → unique speaker. Powered by Qwen3-TTS VoiceDesign.</p>
         </div>
-        <div class="tts-opts">
+
+        <div class="preset-chips" id="vd-presets">
+          <button class="chip" data-desc="A deep, gravelly male voice with a British accent, middle-aged, slow and deliberate.">🇬🇧 Deep Male</button>
+          <button class="chip" data-desc="A bright, high-pitched young female voice with an American accent, energetic and cheerful.">🇺🇸 Bright Female</button>
+          <button class="chip" data-desc="A soft, warm, elderly woman's voice, gentle and kindly, slightly whispered.">👵 Elderly</button>
+          <button class="chip" data-desc="A young child's voice, innocent and curious, high-pitched and small.">🧒 Child</button>
+          <button class="chip" data-desc="A calm, neutral, middle-aged voice, professional broadcast quality, neither too deep nor too high.">🎙️ Broadcaster</button>
+          <button class="chip" data-desc="A whispery, breathy, mysterious voice, like a conspiracy theorist sharing a secret.">🤫 Whispery</button>
+          <button class="chip" data-desc="An energetic sports commentator, loud and excited, with a deep booming voice.">⚽ Announcer</button>
+          <button class="chip" data-desc="A robotic, monotone, metallic voice, like an AI assistant from a sci-fi movie.">🤖 Robotic</button>
+        </div>
+
+        <textarea id="vd-instruct" rows="4"
+          placeholder="Describe the voice you want…  e.g. 'A warm Scottish male voice with a slight rasp, middle-aged, telling a bedtime story.'"></textarea>
+
+        <div class="form-row">
+          <label>Sample text</label>
+          <input type="text" id="vd-text" class="grow"
+                 value="The treasure is buried under the old oak tree."
+                 placeholder="Text to speak with the designed voice">
+        </div>
+
+        <div class="form-row">
+          <label>Temperature</label>
+          <input type="number" id="vd-temp" value="0.8" min="0.1" max="1.5" step="0.05" class="num">
+          <label>Top-p</label>
+          <input type="number" id="vd-topp" value="0.9" min="0.1" max="1.0" step="0.05" class="num">
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="vd-btn" type="button">✨ Design voice</button>
+          <button class="btn btn-ghost"   id="vd-save" type="button" disabled>💾 Save as .voice</button>
+        </div>
+        <div class="status" id="vd-status"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Preview</h2>
+        </div>
+        <div class="player-area" id="vd-player">
+          <div class="player-empty">Generated audio appears here</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════ SYNTHESIZE ════════════════ -->
+  <section class="panel" id="tab-synthesize">
+    <div class="panel-grid">
+      <div class="card">
+        <div class="card-head">
+          <h2>Compose</h2>
+        </div>
+
+        <textarea id="syn-text" rows="3"
+          placeholder="Type something to speak…">I just can't believe you're really gone.</textarea>
+
+        <div class="form-row">
+          <label>Instruct <span class="hint">(emotion/style)</span></label>
+          <input type="text" id="syn-instruct" class="grow"
+                 value="With deep sadness, whispering, on the verge of tears."
+                 placeholder="e.g. 'Whispered, full of wonder.'">
+        </div>
+
+        <div class="form-row">
           <label>Voice</label>
-          <input type="text" id="tts-voice" placeholder="Vivian">
-          <label>Mode</label>
-          <select id="tts-mode">
-            <option value="tts">TTS</option>
-            <option value="sfx">SFX</option>
-            <option value="voice_clone">Voice Clone</option>
+          <select id="syn-voice-source">
+            <option value="preset">Preset speaker</option>
+            <option value="uploaded">Uploaded / Saved .voice</option>
+            <option value="reference">Reference audio (clone)</option>
+            <option value="none">None (plain TTS)</option>
           </select>
+          <select id="syn-preset" class="grow"></select>
+          <select id="syn-uploaded" class="grow" hidden></select>
         </div>
-        <div class="status" id="tts-status"></div>
-      </form>
+
+        <div class="form-row" id="syn-ref-row" hidden>
+          <label>Reference</label>
+          <input type="file" id="syn-ref-file" accept="audio/*">
+          <input type="text" id="syn-ref-text" class="grow"
+                 placeholder="Reference transcript (optional, improves clone)">
+        </div>
+
+        <details class="advanced">
+          <summary>Sampling parameters</summary>
+          <div class="form-grid">
+            <div><label>Temperature</label><input type="number" id="syn-temp" value="0.7" min="0.1" max="1.5" step="0.05"></div>
+            <div><label>Top-p</label>      <input type="number" id="syn-topp" value="0.9" min="0.1" max="1.0" step="0.05"></div>
+            <div><label>Top-k</label>      <input type="number" id="syn-topk" value="50"  min="0"   max="200" step="1"></div>
+            <div><label>Max tokens</label> <input type="number" id="syn-max" value="100" min="1"   max="2000" step="10"></div>
+          </div>
+        </details>
+
+        <details class="advanced">
+          <summary>Post-processing</summary>
+          <div class="form-grid">
+            <div><label>Pitch shift <span class="hint">(semitones)</span></label>
+              <input type="range" id="syn-pitch" min="-12" max="12" step="0.5" value="0" class="slider">
+              <span class="slider-val" id="syn-pitch-val">0</span></div>
+            <div><label>Speed</label>
+              <input type="range" id="syn-speed" min="0.5" max="2.0" step="0.05" value="1.0" class="slider">
+              <span class="slider-val" id="syn-speed-val">1.0</span></div>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="syn-btn" type="button">🎙️ Synthesize</button>
+          <button class="btn btn-ghost" id="syn-download" type="button" disabled>⬇️ Download</button>
+        </div>
+        <div class="status" id="syn-status"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Preview</h2></div>
+        <div class="player-area" id="syn-player">
+          <div class="player-empty">Generated audio appears here</div>
+        </div>
+      </div>
     </div>
   </section>
 
-  <section>
-    <div class="section-head">
-      <h2>Clips <span class="count" id="clips-count"></span></h2>
-    </div>
-    <div class="card" style="padding:14px 16px;margin-bottom:10px">
-      <form id="upload-form" class="form-row">
-        <input type="file" name="file" accept="audio/*" multiple required>
-        <button class="btn btn-primary" type="submit">Upload</button>
-        <span class="status" id="upload-status"></span>
-      </form>
-    </div>
-    <div class="clips-grid" id="clips-list">
-      <div class="empty"><div class="empty-icon">&#9835;</div>Loading clips...</div>
+  <!-- ════════════════ MUSIC ════════════════ -->
+  <section class="panel" id="tab-music">
+    <div class="panel-grid">
+      <div class="card">
+        <div class="card-head"><h2>Compose</h2></div>
+        <div class="form-row">
+          <label>Caption <span class="hint">(genre / mood)</span></label>
+          <input type="text" id="mus-caption" class="grow"
+                 value="lo-fi hip hop, mellow piano, vinyl crackle, jazz drums"
+                 placeholder="e.g. 'epic orchestral trailer, big drums'">
+        </div>
+        <div class="form-row">
+          <label>Lyrics <span class="hint">(optional)</span></label>
+          <textarea id="mus-lyrics" rows="3" placeholder="[verse]&#10;Words sung by the lead vocal…"></textarea>
+        </div>
+        <div class="form-grid">
+          <div><label>Duration (s)</label><input type="number" id="mus-dur" value="30" min="5" max="300" step="5"></div>
+          <div><label>Steps</label>       <input type="number" id="mus-steps" value="50" min="10" max="200" step="5"></div>
+          <div><label>Guidance</label>    <input type="number" id="mus-guid" value="7.5" min="1" max="20" step="0.5"></div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" id="mus-btn" type="button">🎵 Generate</button>
+          <button class="btn btn-ghost" id="mus-download" type="button" disabled>⬇️ Download</button>
+        </div>
+        <div class="status" id="mus-status"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Preview</h2></div>
+        <div class="player-area" id="mus-player">
+          <div class="player-empty">Generated audio appears here</div>
+        </div>
+      </div>
     </div>
   </section>
 
-</div>
+  <!-- ════════════════ VOICES LIBRARY ════════════════ -->
+  <section class="panel" id="tab-voices">
+    <div class="card">
+      <div class="card-head">
+        <h2>Voices</h2>
+        <p class="card-sub">QWEN3VOICE files (2048-d ECAPA-TDNN embeddings). Reusable across synthesis calls.</p>
+      </div>
+      <div class="actions">
+        <input type="file" id="voice-upload-file" accept=".voice,audio/*" multiple>
+        <button class="btn btn-primary" id="voice-upload-btn" type="button">⬆️ Upload</button>
+        <button class="btn btn-ghost" id="voice-refresh" type="button">↻ Refresh</button>
+      </div>
+      <div class="status" id="voice-status"></div>
+      <div class="voices-grid" id="voices-list">
+        <div class="empty"><div class="empty-icon">🎭</div>Loading voices…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════ CLIPS ════════════════ -->
+  <section class="panel" id="tab-clips">
+    <div class="card">
+      <div class="card-head">
+        <h2>Clips</h2>
+        <p class="card-sub">All generated audio lives here.</p>
+      </div>
+      <div class="actions">
+        <input type="file" id="clip-upload-file" accept="audio/*" multiple>
+        <button class="btn btn-primary" id="clip-upload-btn" type="button">⬆️ Upload</button>
+        <button class="btn btn-ghost" id="clip-refresh" type="button">↻ Refresh</button>
+      </div>
+      <div class="status" id="clip-status"></div>
+      <div class="clips-grid" id="clips-list">
+        <div class="empty"><div class="empty-icon">🎬</div>Loading clips…</div>
+      </div>
+    </div>
+  </section>
+
+</main>
 
 <div class="toast" id="toast"></div>
 
