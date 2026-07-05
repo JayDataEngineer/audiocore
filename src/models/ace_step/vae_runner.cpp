@@ -820,6 +820,82 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
     }
     fprintf(stderr, "[vae] decode: n_frames=%d\n", n_frames);
 
+    // ── Tiled decode for long-form generation ────────────────────────────
+    // The single-pass decoder tops out around T=375 (15s @ 25Hz) due to the
+    // 4 GB im2col scratch budget. For longer requests we split the latent
+    // sequence into overlapping tiles, decode each separately, and crossfade
+    // the overlapping PCM regions with a Hann window. This unlocks full
+    // songs (2-3 minute output) with no model changes.
+    //
+    // Tile geometry (tuned for ~10s tiles + 1s overlap):
+    //   TILE_FRAMES = 250 latent frames  = 10.0s audio
+    //   OVERLAP_FRAMES = 25 latent frames = 1.0s audio crossfade
+    // 1920 = total VAE upsampling factor (latent_frames → pcm_samples)
+    constexpr int32_t TILE_FRAMES    = 250;
+    constexpr int32_t OVERLAP_FRAMES = 25;
+    constexpr int32_t UPSAMPLE       = 1920;
+
+    if (n_frames > TILE_FRAMES) {
+        fprintf(stderr, "[vae] tiled decode: %d frames → tiles of %d (overlap %d)\n",
+                n_frames, TILE_FRAMES, OVERLAP_FRAMES);
+        const size_t pcm_total = static_cast<size_t>(n_frames) * UPSAMPLE * 2;
+        pcm->assign(pcm_total, 0.0f);
+        const size_t ov_pcm = static_cast<size_t>(OVERLAP_FRAMES) * UPSAMPLE;
+        std::vector<float> hann_w(ov_pcm);
+        for (size_t i = 0; i < ov_pcm; i++) {
+            hann_w[i] = 0.5f * (1.0f - std::cos(2.0f * 3.14159265358979f * i /
+                                static_cast<float>(ov_pcm - 1)));
+        }
+        std::vector<float> wsum(pcm_total, 0.0f);
+
+        int32_t tile_idx = 0;
+        for (int32_t t0 = 0; t0 < n_frames; t0 += (TILE_FRAMES - OVERLAP_FRAMES)) {
+            int32_t t1 = std::min(t0 + TILE_FRAMES, n_frames);
+            int32_t t_len = t1 - t0;
+            fprintf(stderr, "[vae] tile %d: [%d..%d] (%d frames)\n",
+                    tile_idx, t0, t1, t_len);
+
+            std::vector<float> tile_pcm;
+            if (!decode(latents + static_cast<size_t>(t0) * 64, t_len, &tile_pcm, error))
+                return false;
+
+            const size_t dst_off = static_cast<size_t>(t0) * UPSAMPLE * 2;
+            const size_t copy_n   = std::min(tile_pcm.size(),
+                                             pcm->size() - dst_off);
+            for (size_t i = 0; i < copy_n; i++) {
+                float w = 1.0f;
+                size_t tile_sample    = i / 2;  // mono index
+                size_t tile_pcm_frame = tile_sample / UPSAMPLE;
+                // Fade-in region (first OVERLAP_FRAMES of tile, skip first tile)
+                if (tile_pcm_frame < static_cast<size_t>(OVERLAP_FRAMES) && tile_idx > 0) {
+                    size_t hann_idx = tile_pcm_frame * UPSAMPLE +
+                                      (tile_sample % UPSAMPLE);
+                    if (hann_idx < hann_w.size()) w = hann_w[hann_idx];
+                }
+                // Fade-out region (last OVERLAP_FRAMES of tile, skip last tile)
+                size_t tile_total_frames = tile_pcm.size() / 2 / UPSAMPLE;
+                size_t frames_from_end = (tile_total_frames >= 1)
+                    ? (tile_total_frames - 1 - tile_pcm_frame) : 0;
+                if (frames_from_end < static_cast<size_t>(OVERLAP_FRAMES) &&
+                    t1 < n_frames) {
+                    size_t hann_idx = (OVERLAP_FRAMES - 1 - frames_from_end) *
+                                      UPSAMPLE + (tile_sample % UPSAMPLE);
+                    if (hann_idx < hann_w.size()) w *= hann_w[hann_idx];
+                }
+                (*pcm)[dst_off + i] += w * tile_pcm[i];
+                wsum[dst_off + i]   += w;
+            }
+            tile_idx++;
+            if (t1 >= n_frames) break;
+        }
+        for (size_t i = 0; i < pcm->size(); i++) {
+            if (wsum[i] > 1e-6f) (*pcm)[i] /= wsum[i];
+        }
+        fprintf(stderr, "[vae] tiled decode done: %zu PCM samples from %d tiles\n",
+                pcm->size(), tile_idx);
+        return true;
+    }
+
     // ── Shared scratch buffer ────────────────────────────────────────────
     // Sized for the worst-case op (block 4 ResUnit conv1 @ 15s):
     //   im2col F16: T*7*128*2 ≈ 1.4 GB, plus activations ≈ 0.8 GB

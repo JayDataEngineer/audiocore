@@ -291,9 +291,14 @@ static bool run_one_forward(
     const float   theta   = cfg.rope_theta  > 0 ? cfg.rope_theta  : 1000000.0f;
     const int     nthr    = 4;
 
-    // Context memory: 6 GB for T up to ~375 (15 s at 25 Hz).
-    // For 30s+ durations, switch to the ggml-alloc + backend API pattern.
-    const size_t mem = 6144ULL * 1024 * 1024;
+    // Context memory: scales with T_latent. 6 GB handles T≤375 (15 s @ 25 Hz).
+    // For longer sequences we scale linearly (graph is mostly matmuls with
+    // T-dependent activations). Capped at 24 GB to avoid system OOM.
+    size_t mem;
+    if (T <= 375)       mem = 6144ULL * 1024 * 1024;       // 6 GB  (≤15 s)
+    else if (T <= 750)  mem = 12288ULL * 1024 * 1024;      // 12 GB (≤30 s)
+    else if (T <= 1125) mem = 18432ULL * 1024 * 1024;      // 18 GB (≤45 s)
+    else                mem = 24576ULL * 1024 * 1024;      // 24 GB (>45 s)
     char* ctx_buf = new (std::nothrow) char[mem];
     if (!ctx_buf) { if (error) *error = "DiT OOM"; return false; }
 
