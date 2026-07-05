@@ -103,7 +103,7 @@ std::vector<float> wsola_stretch(const float* x, size_t n, double rate,
     const int overlap = frame - hop;
     if (overlap <= 0) return std::vector<float>(x, x + n);
 
-    // Output length scales with 1/rate (rate>1 = stretch = longer).
+    // Output length scales with 1/rate (rate>1 = compress = shorter/faster).
     const size_t out_n_est = static_cast<size_t>(
         std::llround(static_cast<double>(n) / rate)) + static_cast<size_t>(frame) * 2;
     std::vector<float> y(out_n_est, 0.0f);
@@ -220,9 +220,13 @@ std::vector<float> change_speed(const float* x, size_t n, double rate,
                                  int sample_rate) {
     if (n == 0 || rate == 1.0) return std::vector<float>(x, x + n);
     if (rate <= 0.0) return {};
-    // rate > 1 = faster = shorter output = stretch by 1/rate.
-    double stretch_rate = 1.0 / rate;
-    return wsola_stretch(x, n, stretch_rate, sample_rate);
+    // rate > 1 = faster playback = shorter output.
+    // wsola_stretch's actual behavior is "rate>1 = shorter output"
+    // (out_n = n/rate), so we pass rate directly. The previous
+    // implementation inverted to 1/rate which made speed=1.5 produce
+    // 1.5x LONGER audio (i.e. slower) — the opposite of what callers
+    // and the docstring describe.
+    return wsola_stretch(x, n, rate, sample_rate);
 }
 
 }  // namespace audiocore

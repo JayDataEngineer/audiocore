@@ -487,6 +487,48 @@ std::shared_ptr<httplib::Server> build_server(
             fail_with(res, err);
             return;
         }
+
+        // Optional pitch shift + speed change post-processing (same WSOLA
+        // pipeline as the speech endpoint — useful for transposing a
+        // generated loop to match a key or fitting it to a video length).
+        // The DSP is mono, so we deinterleave → process per-channel →
+        // reinterleave for the stereo output.
+        const float pitch_shift_semi = body.value("pitch_shift", 0.0f);
+        const float speed_ratio      = body.value("speed", 1.0f);
+        if (!mresp.pcm_stereo.empty() && mresp.pcm_stereo.size() % 2 == 0) {
+            const size_t n_per_ch = mresp.pcm_stereo.size() / 2;
+            const int   sr        = mresp.sampling_rate;
+            auto run_per_channel = [&](auto fn) {
+                std::vector<float> l(n_per_ch), r(n_per_ch);
+                for (size_t i = 0; i < n_per_ch; i++) {
+                    l[i] = mresp.pcm_stereo[i * 2];
+                    r[i] = mresp.pcm_stereo[i * 2 + 1];
+                }
+                l = fn(l.data(), l.size());
+                r = fn(r.data(), r.size());
+                std::vector<float> out(l.size() * 2);
+                for (size_t i = 0; i < l.size() && i < r.size(); i++) {
+                    out[i * 2]     = l[i];
+                    out[i * 2 + 1] = r[i];
+                }
+                return out;
+            };
+            if (std::fabs(pitch_shift_semi) > 0.001f) {
+                mresp.pcm_stereo = run_per_channel(
+                    [&](const float* p, size_t n) {
+                        return audiocore::pitch_shift(
+                            p, n, static_cast<double>(pitch_shift_semi), sr);
+                    });
+            }
+            if (std::fabs(speed_ratio - 1.0f) > 0.001f && speed_ratio > 0.0f) {
+                mresp.pcm_stereo = run_per_channel(
+                    [&](const float* p, size_t n) {
+                        return audiocore::change_speed(
+                            p, n, static_cast<double>(speed_ratio), sr);
+                    });
+            }
+        }
+
         if (mr.response_format == "mp3") {
 #ifdef AUDIOCORE_ENABLE_MP3
             auto mp3 = pcm_stereo_to_mp3(mresp.pcm_stereo.data(),

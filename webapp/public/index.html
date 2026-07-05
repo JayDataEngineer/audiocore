@@ -364,6 +364,18 @@
           <div><label>Guidance</label>    <input type="number" id="mus-guid" value="7.5" min="1" max="20" step="0.5"></div>
           <div><label>Seed</label>        <input type="number" id="mus-seed" value="0" min="0" max="2147483647" step="1"></div>
         </div>
+
+        <details class="advanced">
+          <summary>Post-processing</summary>
+          <div class="form-grid">
+            <div><label>Pitch shift <span class="hint">(semitones)</span></label>
+              <input type="range" id="mus-pitch" min="-12" max="12" step="0.5" value="0" class="slider">
+              <span class="slider-val" id="mus-pitch-val">0</span></div>
+            <div><label>Speed</label>
+              <input type="range" id="mus-speed" min="0.5" max="2.0" step="0.05" value="1.0" class="slider">
+              <span class="slider-val" id="mus-speed-val">1.0</span></div>
+          </div>
+        </details>
         <div class="actions">
           <button class="btn btn-primary" id="mus-btn" type="button">🎵 Generate</button>
           <button class="btn btn-ghost" id="mus-download" type="button" disabled>⬇️ Download</button>

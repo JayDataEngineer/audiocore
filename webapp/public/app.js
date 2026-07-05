@@ -531,6 +531,12 @@
   $("#mus-m1").addEventListener("input", (e) => {
     $("#mus-m1-val").textContent = parseFloat(e.target.value).toFixed(2);
   });
+  $("#mus-pitch").addEventListener("input", (e) => {
+    $("#mus-pitch-val").textContent = e.target.value;
+  });
+  $("#mus-speed").addEventListener("input", (e) => {
+    $("#mus-speed-val").textContent = parseFloat(e.target.value).toFixed(2);
+  });
 
   $("#mus-btn").addEventListener("click", async () => {
     const st = $("#mus-status");
@@ -584,6 +590,10 @@
         body.mask_start = parseFloat($("#mus-m0").value) || 0;
         body.mask_end   = parseFloat($("#mus-m1").value) || 1;
       }
+      const pitch = parseFloat($("#mus-pitch").value) || 0;
+      const speed = parseFloat($("#mus-speed").value) || 1.0;
+      if (Math.abs(pitch) > 0.01) body.pitch_shift = pitch;
+      if (Math.abs(speed - 1.0) > 0.01) body.speed = speed;
       const r = await fetch("/v1/audio/music", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
