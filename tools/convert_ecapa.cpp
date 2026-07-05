@@ -12,12 +12,17 @@
 //
 // Usage:
 //   convert_ecapa <model_dir> <output.gguf>
-//   convert_ecapa <model_dir> <output.gguf> --strip-prefix  # if source already has speaker.*
 //   convert_ecapa <model_dir> <output.gguf> --filter-prefix speaker_encoder.
 //       # Only emit tensors whose name starts with the prefix; strip the
 //       # prefix before adding `speaker.` Used when the source safetensors
 //       # bundles the ECAPA weights inside a larger talker checkpoint
-//       # (e.g. Qwen3-TTS-0.6B-Base/model.safetensors, 1.8 GB).
+//       # (e.g. Qwen3-TTS-1.7B-Base/model.safetensors, 3.6 GB — the
+//       # canonical extraction path for the 2048-dim encoder).
+//   convert_ecapa <model_dir> <output.gguf> --strip-prefix
+//       # Source tensors are ALREADY named `speaker.*` — emit them verbatim
+//       # WITHOUT adding another `speaker.` prefix. (Rare; only useful for
+//       # standalone ECAPA checkpoints like marksverdhei's that already use
+//       # the runtime-expected namespacing.)
 //
 // `model_dir` must contain config.json and model.safetensors.
 
@@ -258,11 +263,18 @@ static int usage(const char* argv0) {
     std::fprintf(stderr,
         "usage: %s <model_dir> <output.gguf> [--strip-prefix] [--filter-prefix PREFIX]\n"
         "  Convert ECAPA-TDNN speaker-encoder HuggingFace safetensors to a\n"
-        "  standalone audiocore GGUF. Adds `speaker.` prefix to tensor names\n"
-        "  unless --strip-prefix is given (source already prefixed).\n"
+        "  standalone audiocore GGUF. The runtime expects tensors named\n"
+        "  `speaker.*` (see Qwen3TtsSpeakerEncoder::bind). By default this\n"
+        "  converter PREPENDS `speaker.` to every source tensor name.\n"
         "  --filter-prefix PREFIX: only emit tensors whose name starts with\n"
-        "  PREFIX; strip PREFIX before adding `speaker.`. Use to extract the\n"
-        "  ECAPA weights from a bundled talker checkpoint (1.8 GB).\n",
+        "      PREFIX; strip PREFIX, THEN add `speaker.`. Use to extract\n"
+        "      the ECAPA weights from a bundled talker checkpoint, e.g.\n"
+        "        convert_ecapa Qwen3-TTS-1.7B-Base out.gguf \\\n"
+        "            --filter-prefix speaker_encoder.\n"
+        "      turns `speaker_encoder.asp.conv.bias` → `speaker.asp.conv.bias`.\n"
+        "  --strip-prefix: emit source tensor names VERBATIM (no `speaker.`\n"
+        "      added). Only use when the source already names tensors\n"
+        "      `speaker.*` (rare; standalone ECAPA checkpoints).\n",
         argv0);
     return 2;
 }

@@ -1,21 +1,43 @@
 // tests/test_qwen3_voice_e2e.cpp — Voice-embedding round-trip regression test.
 //
-// Proves the marksverdhei-style "Qwen3 voice embeddings" workflow end-to-end:
+// Proves the Mastrapasqua-style "Qwen3 combo" pipeline end-to-end:
+//   (a) take a speaker embedding (the small .voice files),
+//   (b) take a separate emotional `instruct` prompt,
+//   (c) receive a normal text prompt,
+//   (d) produce high-quality output.
 //
-//   1. Load a qwen3_tts Base session (talker + predictor + codec + encoder).
-//      Voice embeddings require the Base variants — they're the only ones
-//      trained to accept an injected speaker vector at the codec bridge.
-//   2. Take a reference WAV (24 kHz mono 16-bit). Default fixture is
-//      weights/reference_output.wav from a prior Qwen3-TTS run; override
-//      with QWEN3TTS_REF_WAV to encode your own voice.
-//   3. Encode the reference WAV via Qwen3TtsSpeakerEncoder → 2048-d float
-//      vector. Save it as a QWEN3VOICE file on disk.
+// Pipeline (matches https://github.com/gabriele-mastrapasqua/qwen3-tts):
+//
+//   1. EXTRACT VOICE on a **Base** talker:
+//        - 1.7B-Base is the canonical source (its ECAPA-TDNN speaker
+//          encoder is 2048-dim, matching the 1.7B talker hidden size).
+//        - 0.6B-Base also accepts a 1024-dim ECAPA vector but CANNOT do
+//          the combo — the 0.6B talker was not instruct-tuned. Setting
+//          QWEN3TTS_DIR=<0.6b-base> exercises the embedding round-trip
+//          only (the synthesis leg emits audio but the instruct is
+//          ignored; see Mastrapasqua main.c: "instruct is only supported
+//          on 1.7B model").
+//   2. Load a **CustomVoice** talker for inference:
+//        - Set QWEN3TTS_DIR=<1.7b-customvoice>. The loader auto-applies
+//          the WDELTA patch from the sibling <1.7b-base> dir (path
+//          rewrite "customvoice" → "base"). WDELTA overwrites the
+//          codec_embedding (token_embd.weight) and text_proj tensors
+//          with Base's versions so CV can accept a continuous ECAPA
+//          embedding at the speaker slot, while retaining CV's
+//          instruct-tuned transformer norms.
+//   3. Encode the reference WAV via Qwen3TtsSpeakerEncoder → 2048-d
+//      float vector. Save as a QWEN3VOICE file on disk.
 //   4. Reload the voice file and sanity-check the magic / dim / values.
-//   5. Exercise the math ops (mix, direction, shift) on saved files to
-//      verify the on-disk format round-trips.
-//   6. Run TTS via synthesize_with_embedding using the reloaded vector,
+//   5. Run TTS via synthesize_with_embedding using the reloaded vector,
 //      with an emotional `instruct` prompt. Write the result WAV.
-//   7. Verify the output is real audio (RMS > silence threshold).
+//   6. Verify the output is real audio (RMS > silence threshold).
+//
+// Required model layout (sibling directories under QWEN3TTS_DIR/..):
+//   <size>-base/qwen3_tts_talker.gguf           ← Base talker (WDELTA source)
+//   <size>-base/qwen3tts-speaker-encoder.gguf   ← ECAPA-TDNN encoder
+//   <size>-customvoice/qwen3_tts_talker.gguf    ← CV talker (combo-capable)
+//   <size>-customvoice/qwen3tts-tokenizer-*.gguf ← text BPE sidecar (151936 tokens)
+//   <size>-customvoice/tokenizer-f16.gguf       ← audio codec (~358 MB)
 //
 // Skips with return 77 if QWEN3TTS_DIR is unset or load fails, so it is
 // safe to run in CI environments without the model weights.
@@ -221,12 +243,17 @@ int main() {
     std::fprintf(stderr, "[PASS] vector math ops verified\n");
 
     // ── Step 4: apply saved embedding + emotional instruct ───────────────
+    // Sampling defaults match the qwen_voice apply CLI (top_k=50 is the
+    // canonical Qwen3-TTS coarse-codec sampler setting; omitting it lets
+    // the post-top-p distribution admit low-probability hiss tokens that
+    // collapse the output to a long sibilant).
     TtsRequest syn_req;
     syn_req.text         = "I just can't believe you're really gone.";
     syn_req.language     = "en";
     syn_req.instruct     = "With deep sadness, whispering, on the verge of tears.";
-    syn_req.max_new_tokens = 60;
+    syn_req.max_new_tokens = 100;
     syn_req.temperature = 0.7f; syn_req.top_p = 0.9f;
+    syn_req.text_top_k  = 50;
     TtsResponse syn_resp;
     CHECK(q->synthesize_with_embedding(syn_req, reloaded.data(),
                                        reloaded.size(), syn_resp, &err),
