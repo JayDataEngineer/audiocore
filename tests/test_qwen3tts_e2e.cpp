@@ -99,6 +99,13 @@ int main() {
     req.top_p          = 0.9f;
     req.language       = "en";
 
+    // CustomVoice models need a named speaker; Base models need a reference
+    // audio (voice cloning).  Allow the test to pick a speaker via env var.
+    if (const char* spk = std::getenv("QWEN3TTS_SPEAKER")) {
+        req.speaker_name = spk;
+        std::fprintf(stderr, "[INFO] speaker:       %s\n", spk);
+    }
+
     TtsResponse resp;
     std::string run_err;
     std::fprintf(stderr, "[INFO] running TTS ...\n");
