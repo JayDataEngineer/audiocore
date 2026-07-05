@@ -682,7 +682,17 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
             float* dst = &codec_overlay[pos * n_embd];
             if (has_vc_spk) {
                 std::memcpy(dst, vc_spk_emb.data(), static_cast<size_t>(n_embd) * sizeof(float));
-                // Raw ECAPA vector: NO tts_pad overlay (gap A1.b).
+                // Raw ECAPA vector: by default NO tts_pad overlay (gap A1.b).
+                // Canonical HF Qwen3-TTS does not add tts_pad to a raw
+                // speaker_embedding either, so this matches upstream.
+                // QWEN3TTS_VC_ADD_PAD=1 enables the overlay for experiments.
+                // (Pre-fix BF16-corrupt GGUFs collapsed to near-silence with
+                // the overlay; on fresh GGUFs the combo works either way —
+                // verified 0.6B-Base 2025-07-05.)
+                if (std::getenv("QWEN3TTS_VC_ADD_PAD") != nullptr) {
+                    for (int j = 0; j < n_embd; j++)
+                        dst[j] += tts_pad_embed[j];
+                }
             } else if (speaker_token < codec_vocab) {
                 const float* spk_row = codec_row(speaker_token);
                 if (spk_row) std::memcpy(dst, spk_row, static_cast<size_t>(ce_dim) * sizeof(float));

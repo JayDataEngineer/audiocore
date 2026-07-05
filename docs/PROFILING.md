@@ -1,8 +1,113 @@
 # Model Profiling & Benchmarks
 
 **Hardware:** NVIDIA RTX 4090 (24 GB VRAM)
-**Date:** 2026-07-02
+**Date:** 2026-07-03
 **Engine:** audiocore (ggml/CUDA backend) for GGUF models; standalone PyTorch for MOSS-SoundEffect v2
+
+**See also:** [MODELS-SUPPORTED.md](MODELS-SUPPORTED.md) for which models run in
+C++ vs Python, and [MODEL-GAPS.md](MODEL-GAPS.md) for what's missing.
+
+---
+
+## Voice cloning modes — Qwen3-TTS (Stage 17b, 2026-07-03)
+
+Two distinct clone paradigms, both wired in C++ via a single ~23 MB
+standalone ECAPA-TDNN GGUF
+(`qwen3tts-speaker-encoder.gguf`, converted from
+`marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B` via `tools/convert_ecapa.cpp`).
+
+| Path | What runs | RTF | Notes |
+|------|-----------|-----|-------|
+| `tts_batch` with reference_audio | Talker + codec decode | 0.127 (1.7B Base) | Default reference-voice path (no embedding involved) |
+| `voice_clone` + reference_audio | ECAPA (~50 ms CPU) + codec encoder (~80 ms GPU) + Talker + codec decode | 0.127 (1.7B Base) | **Full ICL path (Gap K closed 2026-07-03).** ECAPA → 2048-dim speaker vector AND codec encoder → 50 ICL codec tokens, both spliced into the talker prefill. Pass empty `reference_text` (Gap L — text-embedding module not yet converted). |
+| `voice_clone` + pre-computed `speaker_embedding` | Talker + codec decode | 0.126 | **Voice-caching pattern.** Compute ECAPA once, reuse the 2048-float vector forever. No per-call WAV I/O, no ECAPA, no codec encoder. RTF identical to Base — embedding injection is free. Exposed as `Session.compute_embedding(wav_path)` in Python bindings (P1, 2026-07-03). |
+
+**ECAPA-TDNN encoder details** — 76 tensors, rank-1 → F32 (biases), rank-2/3
+→ F16 (conv_1d weights). Runs on a single CPU backend via direct gallocr
+(no scheduler — model is tiny, CPU supports the full conv1d + reflect-pad
+op set, and the GPU would just add buffer-copy overhead for a ~46 ms call).
+Weight registration mirrors codec.cpp's pattern: loader resolves mmap
+pointers via `GgufReader::find()` + `tensor_data_ptr()` and registers them;
+`upload_weights_()` copies them into the per-call gallocr buffers after
+allocation (without this, all weights are silently zero — latent bug fixed
+2026-07-03).
+
+**Emotion conditioning** is text-level via the `instruct` field
+(`mode='tts_instruct'`), not a vector — already worked, no porting needed.
+The `instruct` field is read mode-agnostically (line 304 of session.cpp)
+and prepended to the synthesis text in every non-VoiceDesign mode, so
+CustomVoice + emotion, voice_clone + emotion, and tts_batch + emotion all
+work. VoiceDesign mode consumes `instruct` for the voice description
+(architecturally one slot — same limitation as upstream Qwen3-TTS).
+
+---
+
+## Combo (speaker embedding + emotional instruct + text) — WORKING 2026-07-05
+
+**Status:** the combo (a) pre-computed speaker embedding (.voice file),
+(b) separate emotional `instruct` prompt, (c) normal text prompt →
+(d) high-quality emotional cloned speech — works end-to-end on **0.6B-Base**
+with the freshly rebuilt GGUFs (post `bf16_to_f32` converter fix,
+commit 757ce16).
+
+The earlier "Base can't do the combo" claim from the Mastrapasqua blog
+("Style control and voice cloning are separate worlds on Base") appears to
+have been a description of Base's *training distribution*, not a hard
+algorithmic block. Empirically, on the fresh GGUFs:
+
+| Test | Input | Transcript | Tone |
+|------|-------|------------|------|
+| `09_combo_voice_instruct.wav` | text="I just can't believe you're really gone." + instruct="With deep sadness, whispering, on the verge of tears." + vivian.voice | "just can't believe you're really gone" | "profound grief and disbelief... deep emotional distress" |
+| `10_combo_happy.wav` | text="The sun is shining and I feel absolutely wonderful today!" + instruct="Spoken with joyful excitement, bright and cheerful." + vivian.voice | "The sun is shining and I feel absolutely wonderful today!" | "cheerful, enthusiastic, and full of joy" |
+
+### Prerequisites (any one of these was sufficient to break the combo)
+
+1. **GGUF converter fix (commit 757ce16).** The pre-fix converter wrote F32
+   norm tensors that pointed at raw BF16 mmap buffers, producing corrupted
+   norms (cos 0.55–0.75 vs safetensors). All 0.6B/1.7B talker GGUFs were
+   rebuilt; old copies preserved as `*.OLD_buggy.gguf`.
+2. **0.6B-native speaker encoder.** The 1.7B ECAPA-TDNN encoder
+   (marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B) outputs a 2048-dim vector
+   that does NOT match the 0.6B talker's 1024-dim `n_embd`. The previous
+   `vc_spk_emb.resize(d, 0.0f)` was a truncation, not a projection. The
+   0.6B-Base safetensors bundles its own 1024-dim `speaker_encoder.*`
+   tensors; these are extracted via
+   `convert_ecapa <0.6B-Base_dir> <out.gguf> --filter-prefix speaker_encoder.`
+   into a 16 MB standalone GGUF.
+3. **No tts_pad overlay on raw ECAPA (gap A1.b).** Adding the canonical
+   `tts_pad_embed` overlay to a raw ECAPA vector at the speaker slot
+   collapses output (RMS 0.045 → 0.023, transcription → "Yeah... [beep]").
+   Both the canonical HF Qwen3-TTS code and our default omit the overlay
+   for raw speaker embeddings. Set `QWEN3TTS_VC_ADD_PAD=1` to A/B test.
+
+### Repro
+
+```bash
+# Encode a reference voice once → 1024-dim .voice file (~4 KB)
+QWEN3TTS_DIR=/mnt/data/models/audio/qwen3_tts/0.6b-base \
+  ./build-debug/qwen_voice encode \
+    --model-dir /mnt/data/models/audio/qwen3_tts/0.6b-base \
+    --wav weights/reference_output.wav --out vivian.voice
+
+# Apply: voice + emotional instruct + text → high-quality output
+QWEN3TTS_DIR=/mnt/data/models/audio/qwen3_tts/0.6b-base \
+  ./build-debug/qwen_voice apply \
+    --model-dir /mnt/data/models/audio/qwen3_tts/0.6b-base \
+    --voice vivian.voice \
+    --text "I just can't believe you're really gone." \
+    --instruct "With deep sadness, whispering, on the verge of tears." \
+    --out webapp/clips/combo.wav \
+    --max-new-tokens 200
+```
+
+### What still DOESN'T work on Base
+
+- **Voice identity fidelity.** The cloned voice captures prosody and gender
+  vaguely but is not a bit-identical timbre match to the reference. The
+  Mastrapasqua CV+WDELTA path is required for studio-quality cloning (still
+  TODO: TPAD per-frame override + WOVR text_proj/codec_embd override).
+- **1.7B-Base.** Requires a rebuild from source safetensors (not present
+  locally). The 0.6B-Base results above are with the rebuilt 0.6B GGUFs.
 
 ---
 
@@ -41,9 +146,19 @@ Three operating modes across the family:
 |---------|-----|-----------|------|----------|-----------|------|------|
 | 1.5 Turbo | 1.7B | 8 | 1.3 s | 39.1 s | 10.0 s stereo | 48 kHz | 3.90 |
 | 1.5 SFT | 1.7B | 50 | 2.0 s | 108.1 s | 10.0 s stereo | 48 kHz | 10.81 |
+| 1.5 Base (new) | 1.7B | 50 | 1.8 s | 104.9 s | 10.0 s stereo | 48 kHz | 10.49 |
 | XL Turbo | 4B | 8 | 4.2 s | 57.2 s | 10.0 s stereo | 48 kHz | 5.72 |
 | XL SFT | 4B | 50 | 10.0 s | 230.6 s | 10.0 s stereo | 48 kHz | 23.06 |
 | XL Base | 4B | 8 | 1.8 s | 56.8 s | 10.0 s stereo | 48 kHz | 5.68 |
+
+**ScragVAE** (drop-in VAE decoder swap, `scragvae-BF16.gguf` from
+`scragnog/Ace-Step-1.5-ScragVAE`): verified end-to-end with turbo DiT —
+**RTF 3.70** (vs 3.90 stock, same architecture ⇒ identical decode cost,
+difference is run-to-run noise). Output RMS 0.012083 (vs 0.012079 stock —
+essentially identical since the turbo DiT produces the same latent; only
+the decoder differs). To use: symlink `scragvae-BF16.gguf` → `vae-BF16.gguf`
+in the variant's model dir. Verified pure drop-in at the tensor level too:
+365 tensors, identical names/shapes, same `acestep-vae` architecture tag.
 
 Text-to-music: Qwen3 text encoder → 5Hz music-code LM → DiT flow-matching diffusion → audio VAE → 48 kHz stereo PCM. Turbo variants use 8 diffusion steps (fast but lower quality); SFT uses 50 steps.
 
