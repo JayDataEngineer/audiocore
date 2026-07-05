@@ -663,22 +663,32 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         }
 
         // Speaker slot — codec_embedding (spk_token) OR raw ECAPA vector.
-        // The canonical upstream layout (modeling_qwen3_tts.py:2182) adds a
-        // tts_pad overlay at this position too, but empirically our 0.6B-Base
-        // GGUFs produce better quality WITHOUT the overlay (the overlay uses
-        // pad_idx=2148 for 0.6B which has a non-zero text_embd row that
-        // shifts the ECAPA vector out of distribution). For CV variants
-        // (where the speaker is a learned token) the overlay is harmless.
-        // We therefore omit the overlay uniformly — this keeps the
-        // 0.6B-Base path (the user's primary use case) working at full
-        // quality. See GAPS.md §A1.b for the 0.6B tts_pad token-id quirk.
+        //
+        // Canonical layout (modeling_qwen3_tts.py:~2218) adds a tts_pad
+        // text-overlay at this position uniformly for BOTH paths:
+        //   speaker_embed_or_codec_token + tts_pad_overlay
+        //
+        // EMPIRICAL QUIRK (gap A1.b): on our 0.6B-Base GGUFs, adding the
+        // tts_pad overlay to a RAW ECAPA vector at this slot shifts the
+        // vector out of distribution and collapses output to near-silence
+        // (RMS 0.20 → 0.023). So for the raw-ECAPA path we omit the overlay.
+        //
+        // For CV variants (where the "speaker" is a LEARNED codec token
+        // like vivian=3065), the model was TRAINED with the canonical
+        // tts_pad overlay at this position. Omitting it puts the model
+        // out-of-distribution. So for the learned-token path we DO add
+        // the overlay (matching canonical).
         if (has_spk_slot) {
             float* dst = &codec_overlay[pos * n_embd];
             if (has_vc_spk) {
                 std::memcpy(dst, vc_spk_emb.data(), static_cast<size_t>(n_embd) * sizeof(float));
+                // Raw ECAPA vector: NO tts_pad overlay (gap A1.b).
             } else if (speaker_token < codec_vocab) {
                 const float* spk_row = codec_row(speaker_token);
                 if (spk_row) std::memcpy(dst, spk_row, static_cast<size_t>(ce_dim) * sizeof(float));
+                // Learned speaker token (CV variants): ADD canonical tts_pad overlay.
+                for (int j = 0; j < n_embd; j++)
+                    dst[j] += tts_pad_embed[j];
             }
             pos++;
         }
@@ -747,12 +757,30 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     std::vector<float> text_region;
     int32_t text_region_len = 0;
     if (compact_text) {
-        // All raw text tokens, then tts_eos terminator
+        // All raw text tokens, then tts_eos terminator.
+        // A2 fix: use the variant-aware tts_eos ID (151673 canonical, or
+        // chat-template ID for 0.6B) — NOT talker_->eos_token_id() which
+        // always returns the sidecar's chat-template eos (151645). The
+        // canonical Qwen3-TTS compact-text prefill expects tts_eos_embed
+        // at the terminator slot; passing the wrong ID collapses the
+        // model to silence (RMS=0.0024 on 0.6B-Base compact).
         const int32_t n_text = n_syn_content;
         std::vector<int32_t> text_ids(static_cast<size_t>(n_text) + 1);
         for (int32_t i = 0; i < n_text; i++)
             text_ids[static_cast<size_t>(i)] = text_ids_raw[static_cast<size_t>(i)];
-        text_ids[static_cast<size_t>(n_text)] = talker_->eos_token_id();  // tts_eos
+        // tts_eos_id resolved earlier via the variant-aware logic. Fall
+        // back to sidecar eos if the special-projection path was skipped.
+        int32_t tts_eos_id_resolved = talker_->eos_token_id();
+        if (const char* v = std::getenv("QWEN3TTS_TTS_EOS")) {
+            tts_eos_id_resolved = std::atoi(v);
+        } else {
+            const bool is_1_7b_eos = (n_embd >= 2048);
+            tts_eos_id_resolved = is_1_7b_eos ? 151673 : talker_->eos_token_id();
+        }
+        text_ids[static_cast<size_t>(n_text)] = tts_eos_id_resolved;
+        std::fprintf(stderr,
+                     "qwen3_tts: compact text region %d text tokens + tts_eos=%d\n",
+                     n_text, tts_eos_id_resolved);
 
         std::vector<float> text_proj_buf(static_cast<size_t>(n_text + 1) * n_embd);
         talker_->project_text_tokens(text_ids.data(), n_text + 1,
