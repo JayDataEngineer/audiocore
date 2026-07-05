@@ -402,8 +402,12 @@
         <div class="form-grid">
           <div><label>Duration (s)</label><input type="number" id="mus-dur" value="30" min="5" max="300" step="5"></div>
           <div><label>Steps</label>       <input type="number" id="mus-steps" value="50" min="10" max="200" step="5"></div>
-          <div><label>Guidance</label>    <input type="number" id="mus-guid" value="7.5" min="1" max="20" step="0.5"></div>
-          <div><label>Seed</label>        <input type="number" id="mus-seed" value="0" min="0" max="2147483647" step="1"></div>
+          <div><label>Guidance <span class="hint" id="mus-guid-hint">(CFG)</span></label>
+                <input type="number" id="mus-guid" value="7.5" min="1" max="20" step="0.5"></div>
+          <div><label>Seed <span class="hint">(0 = random)</span></label>
+                <input type="number" id="mus-seed" value="0" min="0" max="2147483647" step="1"></div>
+          <div><label>Batch <span class="hint">(variations)</span></label>
+                <input type="number" id="mus-batch" value="1" min="1" max="8" step="1"></div>
         </div>
 
         <details class="advanced">

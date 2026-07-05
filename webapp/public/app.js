@@ -691,9 +691,17 @@
           ? "Inside [start,end] is preserved; outside is regenerated (extension)."
           : "";
     }
+    // Contextual guidance hint: in cover mode lower CFG = more faithful to source.
+    const gh = $("#mus-guid-hint");
+    if (gh) {
+      gh.textContent = (mode === "cover")
+        ? "(lower = faithful to source)"
+        : "(CFG strength)";
+    }
     if (needs_src) refresh_music_sources();
   }
   $("#mus-mode").addEventListener("change", sync_music_mode_rows);
+  sync_music_mode_rows();
   $("#mus-m0").addEventListener("input", (e) => {
     $("#mus-m0-val").textContent = parseFloat(e.target.value).toFixed(2);
   });
@@ -738,50 +746,121 @@
         return;
       }
     }
-    btn.disabled = true; btn.textContent = "Generating…";
-    status(st, "Composing " + mode + " (this can take a minute or more)…", "loading");
+    // Batch count: 1 = single render (default). >1 = N variations with
+    // consecutive seeds. Seed 0 means "random" → for batches we anchor a
+    // random base so all N are different but reproducible next time.
+    const batch_n = Math.max(1, Math.min(8, parseInt($("#mus-batch").value, 10) || 1));
+    let base_seed = parseInt($("#mus-seed").value, 10) || 0;
+    if (base_seed === 0 && batch_n > 1) {
+      base_seed = Math.floor(Math.random() * 2_000_000_000) + 1;
+    }
+    btn.disabled = true; btn.textContent = (batch_n > 1) ? "Generating batch…" : "Generating…";
     clear_player($("#mus-player"));
+    const results = [];  // {seed, blob, error}
 
-    try {
-      const seed = parseInt($("#mus-seed").value, 10);
-      const body = {
-        model: ACTIVE_MUSIC,
-        mode,
-        caption:  $("#mus-caption").value.trim(),
-        lyrics:   $("#mus-lyrics").value.trim(),
-        duration: parseFloat($("#mus-dur").value) || 30,
-        steps:    parseInt($("#mus-steps").value, 10) || 50,
-        guidance_scale: parseFloat($("#mus-guid").value) || 7.5,
-      };
-      if (seed && seed > 0) body.seed = seed;
-      if (src_b64) {
-        body.input_audio = src_b64;
-        body.mask_start = parseFloat($("#mus-m0").value) || 0;
-        body.mask_end   = parseFloat($("#mus-m1").value) || 1;
+    for (let i = 0; i < batch_n; i++) {
+      const seed_i = (base_seed === 0) ? 0 : base_seed + i;
+      status(st, "Composing " + mode + " variation " + (i + 1) + "/" + batch_n +
+        (seed_i ? " (seed " + seed_i + ")" : "") + "…", "loading");
+      try {
+        const body = {
+          model: ACTIVE_MUSIC,
+          mode,
+          caption:  $("#mus-caption").value.trim(),
+          lyrics:   $("#mus-lyrics").value.trim(),
+          duration: parseFloat($("#mus-dur").value) || 30,
+          steps:    parseInt($("#mus-steps").value, 10) || 50,
+          guidance_scale: parseFloat($("#mus-guid").value) || 7.5,
+        };
+        if (seed_i && seed_i > 0) body.seed = seed_i;
+        if (src_b64) {
+          body.input_audio = src_b64;
+          body.mask_start = parseFloat($("#mus-m0").value) || 0;
+          body.mask_end   = parseFloat($("#mus-m1").value) || 1;
+        }
+        const pitch = parseFloat($("#mus-pitch").value) || 0;
+        const speed = parseFloat($("#mus-speed").value) || 1.0;
+        if (Math.abs(pitch) > 0.01) body.pitch_shift = pitch;
+        if (Math.abs(speed - 1.0) > 0.01) body.speed = speed;
+        const r = await fetch("/v1/audio/music", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          results.push({ seed: seed_i, error: j.error || ("HTTP " + r.status) });
+          continue;
+        }
+        const blob = await r.blob();
+        results.push({ seed: seed_i, blob });
+      } catch (err) {
+        results.push({ seed: seed_i, error: err.message });
       }
-      const pitch = parseFloat($("#mus-pitch").value) || 0;
-      const speed = parseFloat($("#mus-speed").value) || 1.0;
-      if (Math.abs(pitch) > 0.01) body.pitch_shift = pitch;
-      if (Math.abs(speed - 1.0) > 0.01) body.speed = speed;
-      const r = await fetch("/v1/audio/music", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!r.ok) {
-        const j = await r.json().catch(() => ({}));
-        status(st, j.error || "Music generation failed (" + r.status + ")", "err");
-        return;
+    }
+
+    // Render results. Single success → existing player + download. Multiple
+    // → numbered grid of players, each downloadable. Download button keeps
+    // the LAST successful blob for the "⬇️ Download" shortcut.
+    const ok = results.filter(r => r.blob);
+    const failed = results.filter(r => r.error);
+    const player = $("#mus-player");
+    if (ok.length === 0) {
+      status(st, failed[0]?.error || "All variations failed.", "err");
+      btn.disabled = false; btn.textContent = "🎵 Generate";
+      return;
+    }
+    if (ok.length === 1 && batch_n === 1) {
+      mus_last_blob = ok[0].blob;
+      const url = URL.createObjectURL(ok[0].blob);
+      set_player(player, url,
+        mode + " · stereo · " + (ok[0].blob.size / 1024 / 1024).toFixed(2) + " MB");
+    } else {
+      // Batch: rebuild player area as a grid.
+      player.innerHTML = "";
+      const grid = document.createElement("div");
+      grid.style.cssText = "display:grid;grid-template-columns:1fr;gap:12px;";
+      for (const r of ok) {
+        const url = URL.createObjectURL(r.blob);
+        const card = document.createElement("div");
+        card.style.cssText = "padding:8px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);";
+        const label = document.createElement("div");
+        label.style.cssText = "font-size:12px;color:var(--fg);margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;";
+        const seedTxt = r.seed ? ("seed " + r.seed) : "random";
+        label.innerHTML = '<span><b>#' + (results.indexOf(r) + 1) + '</b> · ' + esc(seedTxt) +
+          ' · ' + (r.blob.size / 1024 / 1024).toFixed(2) + ' MB</span>';
+        const dlBtn = document.createElement("button");
+        dlBtn.className = "btn-icon";
+        dlBtn.textContent = "⬇";
+        dlBtn.title = "Download this variation";
+        dlBtn.onclick = () => {
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(r.blob);
+          a.download = "music_" + mode + "_seed" + r.seed + "_" + Date.now() + ".wav";
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        };
+        label.appendChild(dlBtn);
+        card.appendChild(label);
+        const au = document.createElement("audio");
+        au.controls = true;
+        au.src = url;
+        au.style.cssText = "width:100%;";
+        card.appendChild(au);
+        grid.appendChild(card);
       }
-      const blob = await r.blob();
-      mus_last_blob = blob;
-      const url = URL.createObjectURL(blob);
-      set_player($("#mus-player"), url,
-        mode + " · stereo · " + (blob.size / 1024 / 1024).toFixed(2) + " MB");
-      $("#mus-download").disabled = false;
+      player.appendChild(grid);
+      mus_last_blob = ok[ok.length - 1].blob;
+    }
+    $("#mus-download").disabled = !mus_last_blob;
+    if (failed.length) {
+      status(st, ok.length + "/" + batch_n + " OK · " + failed.length + " failed: " +
+        failed[0].error, "err");
+    } else if (batch_n > 1) {
+      status(st, ok.length + " variations ready (seeds " +
+        ok.map(r => r.seed || "?").join(", ") + ").", "ok");
+    } else {
       status(st, "Done.", "ok");
-    } catch (err) {
-      status(st, "Error: " + err.message, "err");
     }
     btn.disabled = false; btn.textContent = "🎵 Generate";
   });
