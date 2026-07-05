@@ -89,8 +89,11 @@ static FlowSchedule build_schedule(const std::string& variant, int override_step
         return s;
     }
 
-    // ── SFT: linear schedule, 50 steps, shift=1.0 ──────────────────────────
-    if (variant == "sft" && (override_steps <= 0 || override_steps == 50)) {
+    // ── SFT / Base: linear schedule, 50 steps, shift=1.0 ────────────────────
+    // Base (the pretrained root, not instruction-tuned for the 8-step turbo
+    // shortcut) uses the same linear 50-step schedule as SFT.
+    if ((variant == "sft" || variant == "base") &&
+        (override_steps <= 0 || override_steps == 50)) {
         s.timesteps.reserve(50);
         for (int i = 0; i < 50; i++) {
             s.timesteps.push_back(0.98f - i * (0.96f / 49.0f));
@@ -282,6 +285,13 @@ static void bf16_to_f32_buf_local(const void* src, float* dst, int32_t n) {
 bool AceStepSession::run_lm(const MusicRequest& req,
                             std::vector<int32_t>* music_codes,
                             std::string* error) {
+    // (0) Reset LM + TE KV caches so this run is independent of prior calls.
+    //     Without this, the second call's prefill at position 0 collides
+    //     with the cached positions from the first call and llama_decode
+    //     fails with "inconsistent sequence positions".
+    if (lm_) lm_->clear_kv_cache();
+    if (te_) te_->clear_kv_cache();
+
     // (1) Assemble the text prompt
     std::string prompt = req.caption;
     if (!req.lyrics.empty()) {

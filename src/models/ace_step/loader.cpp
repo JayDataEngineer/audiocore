@@ -204,7 +204,18 @@ bool AceStepSession::load(const std::string& model_path,
     //     directory can be either the unpacked release or a flat folder.
     //     LoadOptions::extras["dit_variant"] / ["lm_variant"] override the
     //     default turbo / 1.7B preference when multiple variants coexist.
-    const std::string dir = model_path;
+    //
+    //     Accept either a directory or a single .gguf inside it — the
+    //     registry's FamilyRegistryLoader auto-discovers the first .gguf
+    //     when given a directory, so we may receive a file path even
+    //     though we want the parent folder.
+    std::string dir = model_path;
+    {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(dir, ec)) {
+            dir = std::filesystem::path(dir).parent_path().string();
+        }
+    }
     const std::string dit_variant =
         opts.extras.count("dit_variant") ? opts.extras.at("dit_variant") : "turbo";
     const std::string lm_variant =
@@ -267,6 +278,14 @@ bool AceStepSession::load(const std::string& model_path,
         cfg_.variant = "turbo";
     } else if (cfg_.variant.empty() && dit_path.find("sft") != std::string::npos) {
         cfg_.variant = "sft";
+    } else if (cfg_.variant.empty() &&
+               dit_path.find("xl-base") == std::string::npos &&
+               dit_path.find("-base") != std::string::npos) {
+        // Standard 1.5 Base — pretrained root, not instruction-tuned for the
+        // 8-step turbo shortcut. Uses the linear 50-step schedule (same as
+        // SFT) in build_schedule(). XL Base is excluded so its existing
+        // 8-step behaviour stays untouched.
+        cfg_.variant = "base";
     }
 
     // Standard GGUF architecture keys (written by converter if present):
