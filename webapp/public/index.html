@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>audiocore</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="topbar">
+  <h1>audiocore</h1>
+  <span class="status" id="server-status"></span>
+</div>
+
+<div class="card">
+  <form id="upload-form">
+    <input type="file" name="file" accept="audio/*" multiple required>
+    <input type="submit" value="Upload">
+  </form>
+  <div class="status" id="upload-status"></div>
+</div>
+
+<h2 id="clips-header">Clips</h2>
+<div id="clips-list"></div>
+
+<h2>Synthesize</h2>
+<div class="card">
+  <form id="tts-form" style="flex-direction:column;align-items:stretch;gap:8px">
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <select id="tts-model"></select>
+      <input type="text" id="tts-text" placeholder="Text to speak..." style="flex:1;min-width:200px" required>
+      <input type="submit" value="Synthesize">
+    </div>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <label>Voice:</label>
+      <input type="text" id="tts-voice" placeholder="e.g. Vivian" style="width:120px">
+      <label>Mode:</label>
+      <select id="tts-mode">
+        <option value="tts">TTS</option>
+        <option value="sfx">SFX</option>
+        <option value="voice_clone">Voice Clone</option>
+      </select>
+    </div>
+    <div class="status" id="tts-status"></div>
+  </form>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

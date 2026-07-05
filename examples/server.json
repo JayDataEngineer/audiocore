@@ -5,6 +5,7 @@
   "port":   8081,
   "device": 0,
   "threads": 4,
+  "clips_dir": "",
 
   "models": [
     {
@@ -22,8 +23,10 @@
   ],
 
   "_endpoints": [
+    "GET  /",
     "GET  /health",
     "GET  /v1/models",
+    "GET  /v1/clips",
     "POST /v1/audio/speech   { model: 'qwen3-tts', input: 'hello', voice: 'Vivian' }",
     "POST /v1/audio/music    { model: 'ace-step-turbo', caption: 'lo-fi piano', duration: 30 }"
   ]

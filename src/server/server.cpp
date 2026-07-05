@@ -3,8 +3,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -17,9 +20,16 @@
 #include "audiocore/framework/io/mp3_encoder.h"
 #endif
 
+#ifdef AUDIOCORE_HAS_WEBAPP
+#include "index.html.hpp"
+#include "style.css.hpp"
+#include "app.js.hpp"
+#endif
+
 namespace audiocore {
 
 using nlohmann::json;
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -93,10 +103,107 @@ void fail_with(httplib::Response& res, const std::string& err) {
     res.set_content(e.dump(), "application/json");
 }
 
+// ── Clip helpers ──────────────────────────────────────────────────────────
+
+static const std::unordered_set<std::string> kAudioExts = {
+    ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus", ".weba"
+};
+
+std::string mime_for(const std::string& path) {
+    auto dot = path.rfind('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+    std::string ext = path.substr(dot);
+    for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+    if (ext == ".wav")  return "audio/wav";
+    if (ext == ".mp3")  return "audio/mpeg";
+    if (ext == ".flac") return "audio/flac";
+    if (ext == ".ogg")  return "audio/ogg";
+    if (ext == ".m4a")  return "audio/mp4";
+    if (ext == ".opus") return "audio/opus";
+    if (ext == ".weba") return "audio/webm";
+    if (ext == ".js")   return "application/javascript; charset=utf-8";
+    if (ext == ".css")  return "text/css; charset=utf-8";
+    if (ext == ".html") return "text/html; charset=utf-8";
+    return "application/octet-stream";
+}
+
+std::string sanitize_filename(const std::string& name) {
+    std::string safe;
+    safe.reserve(name.size());
+    for (char c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '_')
+            safe += c;
+        else
+            safe += '_';
+    }
+    if (safe.empty() || !std::isalpha(static_cast<unsigned char>(safe[0])))
+        safe = "clip_" + safe;
+    return safe;
+}
+
+float wav_duration_seconds(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return -1.0f;
+    char hdr[44];
+    if (!f.read(hdr, 44)) return -1.0f;
+    if (std::memcmp(hdr, "RIFF", 4) != 0 || std::memcmp(hdr + 8, "WAVE", 4) != 0)
+        return -1.0f;
+    uint32_t sr = static_cast<uint32_t>(static_cast<uint8_t>(hdr[24])) |
+                  (static_cast<uint32_t>(static_cast<uint8_t>(hdr[25])) << 8) |
+                  (static_cast<uint32_t>(static_cast<uint8_t>(hdr[26])) << 16) |
+                  (static_cast<uint32_t>(static_cast<uint8_t>(hdr[27])) << 24);
+    uint16_t ch = static_cast<uint16_t>(static_cast<uint8_t>(hdr[22])) |
+                  (static_cast<uint16_t>(static_cast<uint8_t>(hdr[23])) << 8);
+    if (sr == 0 || ch == 0) return -1.0f;
+    // Find data chunk
+    f.seekg(12);
+    char chunk[8];
+    while (f.read(chunk, 8)) {
+        uint32_t sz = static_cast<uint32_t>(static_cast<uint8_t>(chunk[4])) |
+                      (static_cast<uint32_t>(static_cast<uint8_t>(chunk[5])) << 8) |
+                      (static_cast<uint32_t>(static_cast<uint8_t>(chunk[6])) << 16) |
+                      (static_cast<uint32_t>(static_cast<uint8_t>(chunk[7])) << 24);
+        if (std::memcmp(chunk, "data", 4) == 0) {
+            return static_cast<float>(sz) / (sr * ch * 2);
+        }
+        f.seekg(static_cast<std::streamoff>(sz), std::ios::cur);
+    }
+    return -1.0f;
+}
+
+json clip_info(const fs::directory_entry& entry) {
+    auto status = entry.status();
+    auto ftime = fs::last_write_time(entry);
+    auto sctp = std::chrono::time_point_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now() +
+        (ftime - fs::file_time_type::clock::now()));
+    int64_t mtime_s = sctp.time_since_epoch().count();
+    json c;
+    c["name"] = entry.path().filename().string();
+    c["size"] = static_cast<uint64_t>(entry.file_size());
+    c["mtime"] = mtime_s;
+    float dur = wav_duration_seconds(entry.path());
+    if (dur > 0) c["duration"] = dur;
+    return c;
+}
+
+#ifdef AUDIOCORE_HAS_WEBAPP
+std::string_view asset_data(const std::string& name) {
+    if (name == "index.html")
+        return std::string_view(reinterpret_cast<const char*>(index_html), index_html_len);
+    if (name == "style.css")
+        return std::string_view(reinterpret_cast<const char*>(style_css), style_css_len);
+    if (name == "app.js")
+        return std::string_view(reinterpret_cast<const char*>(app_js), app_js_len);
+    return {};
+}
+#endif
+
 }  // namespace
 
 std::shared_ptr<httplib::Server> build_server(
-        std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots) {
+        std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots,
+        const std::string& clips_dir) {
     auto svr = std::make_shared<httplib::Server>();
     auto slots_ref = slots;
 
@@ -481,6 +588,144 @@ std::shared_ptr<httplib::Server> build_server(
                 return true;
             });
     });
+
+    // ── Clip management routes ────────────────────────────────────────────
+    if (!clips_dir.empty()) {
+        // Ensure clips directory exists.
+        std::error_code ec;
+        fs::create_directories(clips_dir, ec);
+
+        // GET /v1/clips — list audio clips as JSON
+        svr->Get("/v1/clips", [clips_dir](const httplib::Request&, httplib::Response& res) {
+            json arr = json::array();
+            std::error_code ec;
+            for (auto& entry : fs::directory_iterator(clips_dir, ec)) {
+                if (!entry.is_regular_file()) continue;
+                auto ext = entry.path().extension().string();
+                for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+                if (kAudioExts.count(ext))
+                    arr.push_back(clip_info(entry));
+            }
+            // Sort by mtime descending (newest first).
+            std::sort(arr.begin(), arr.end(), [](const json& a, const json& b) {
+                return a["mtime"].get<int64_t>() > b["mtime"].get<int64_t>();
+            });
+            res.set_content(json{{"clips", arr}}.dump(), "application/json");
+        });
+
+        // GET /v1/clips/raw/<name> — serve audio file
+        svr->Get(R"(/v1/clips/raw/([^/?]+))",
+                 [clips_dir](const httplib::Request& req, httplib::Response& res) {
+            std::string name = req.matches[1];
+            // Prevent path traversal.
+            if (name.find("..") != std::string::npos || name.find('/') != std::string::npos) {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid name"})", "application/json");
+                return;
+            }
+            fs::path target = fs::path(clips_dir) / name;
+            if (!fs::is_regular_file(target)) {
+                res.status = 404;
+                res.set_content(R"({"error":"not found"})", "application/json");
+                return;
+            }
+            auto ext = target.extension().string();
+            for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+            if (!kAudioExts.count(ext)) {
+                res.status = 403;
+                res.set_content(R"({"error":"not an audio file"})", "application/json");
+                return;
+            }
+            std::ifstream f(target, std::ios::binary);
+            std::string data((std::istreambuf_iterator<char>(f)),
+                              std::istreambuf_iterator<char>());
+            res.set_content(std::move(data), mime_for(name));
+        });
+
+        // POST /v1/clips/upload — multipart file upload
+        svr->Post("/v1/clips/upload",
+                  [clips_dir](const httplib::Request& req, httplib::Response& res) {
+            json resp;
+            if (!req.is_multipart_form_data()) {
+                res.status = 400;
+                resp["error"] = "expected multipart/form-data";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            auto files = req.get_file_values("file");
+            json saved = json::array();
+            for (auto& f : files) {
+                if (f.filename.empty()) continue;
+                auto ext = fs::path(f.filename).extension().string();
+                for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+                if (!kAudioExts.count(ext)) continue;
+                std::string safe = sanitize_filename(f.filename);
+                fs::path dest = fs::path(clips_dir) / safe;
+                std::ofstream out(dest, std::ios::binary);
+                out.write(f.content.data(), f.content.size());
+                saved.push_back(safe);
+            }
+            resp["ok"] = true;
+            resp["saved"] = std::move(saved);
+            res.set_content(resp.dump(), "application/json");
+        });
+
+        // POST /v1/clips/delete — delete a clip by name
+        svr->Post("/v1/clips/delete",
+                  [clips_dir](const httplib::Request& req, httplib::Response& res) {
+            json resp;
+            std::string name;
+            if (req.has_param("name")) {
+                name = req.get_param_value("name");
+            } else {
+                // Try form body parsing.
+                std::regex re("name=([^&]+)");
+                std::smatch m;
+                if (std::regex_search(req.body, m, re))
+                    name = m[1];
+            }
+            // Also try JSON body.
+            if (name.empty()) {
+                try {
+                    auto j = json::parse(req.body);
+                    name = j.value("name", "");
+                } catch (...) {}
+            }
+            if (name.empty() || name.find("..") != std::string::npos ||
+                name.find('/') != std::string::npos) {
+                res.status = 400;
+                resp["error"] = "invalid name";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            fs::path target = fs::path(clips_dir) / name;
+            if (fs::is_regular_file(target)) {
+                fs::remove(target);
+                resp["ok"] = true;
+            } else {
+                resp["ok"] = false;
+                resp["error"] = "not found";
+            }
+            res.set_content(resp.dump(), "application/json");
+        });
+    }
+
+    // ── Embedded webapp assets ────────────────────────────────────────────
+#ifdef AUDIOCORE_HAS_WEBAPP
+    svr->Get("/", [](const httplib::Request&, httplib::Response& res) {
+        auto d = asset_data("index.html");
+        res.set_content(std::string(d.data(), d.size()), "text/html; charset=utf-8");
+    });
+    svr->Get("/style.css", [](const httplib::Request&, httplib::Response& res) {
+        auto d = asset_data("style.css");
+        res.set_content(std::string(d.data(), d.size()), "text/css; charset=utf-8");
+    });
+    svr->Get("/app.js", [](const httplib::Request&, httplib::Response& res) {
+        auto d = asset_data("app.js");
+        res.set_content(std::string(d.data(), d.size()),
+                        "application/javascript; charset=utf-8");
+    });
+#endif
 
     return svr;
 }

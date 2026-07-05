@@ -22,8 +22,11 @@ struct ModelSlot {
 };
 
 // Build a configured httplib::Server with all routes wired against `slots`.
+// clips_dir is the directory for audio clip storage (upload/delete/raw).
+// If empty, clip management routes are not registered.
 std::shared_ptr<httplib::Server> build_server(
-        std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots);
+        std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots,
+        const std::string& clips_dir = {});
 
 // WAV encoders (exposed for unit testing).
 std::string pcm_mono_to_wav(const std::vector<float>& pcm, int32_t sr);

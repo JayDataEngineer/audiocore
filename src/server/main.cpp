@@ -4,6 +4,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -51,6 +52,7 @@ struct ServerConfig {
     int device = 0;
     int threads = 1;
     std::string model_dir;
+    std::string clips_dir;
     std::vector<ConfigModel> models;
 };
 
@@ -71,6 +73,7 @@ bool load_config(const std::string& path, ServerConfig& out) {
     out.device = j.value("device", out.device);
     out.threads= j.value("threads", out.threads);
     out.model_dir = j.value("model_dir", "");
+    out.clips_dir = j.value("clips_dir", "");
     if (j.contains("models")) {
         if (!j["models"].is_array()) {
             std::fprintf(stderr, "config 'models' must be an array\n");
@@ -127,6 +130,19 @@ int main(int argc, char** argv) {
     ServerConfig cfg;
     if (!load_config(config_path, cfg)) return 1;
     if (!model_dir_override.empty()) cfg.model_dir = model_dir_override;
+
+    // Default clips_dir to a "clips" subdirectory next to the binary.
+    if (cfg.clips_dir.empty()) {
+        char exe_buf[4096];
+        ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+        if (len > 0) {
+            exe_buf[len] = '\0';
+            cfg.clips_dir = std::string(exe_buf).substr(
+                0, std::string(exe_buf).rfind('/')) + "/clips";
+        } else {
+            cfg.clips_dir = "clips";
+        }
+    }
 
     register_all_families();
 
@@ -235,7 +251,7 @@ int main(int argc, char** argv) {
             "Booting anyway; /v1/audio/* will return 404 until a model is loaded.\n");
     }
 
-    auto svr = audiocore::build_server(slots);
+    auto svr = audiocore::build_server(slots, cfg.clips_dir);
     svr->set_logger([](const httplib::Request& req, const httplib::Response&) {
         std::fprintf(stderr, "%s %s\n", req.method.c_str(), req.path.c_str());
     });

@@ -1,0 +1,26 @@
+*,*::before,*::after{box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0e0e10;color:#e4e4e7;margin:0;padding:24px;line-height:1.5}
+h1{margin:0 0 16px;font-size:20px;font-weight:600}
+h2{margin:24px 0 8px;font-size:14px;font-weight:600;color:#a0a0a8;text-transform:uppercase;letter-spacing:.06em}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.card{background:#1a1a1d;border:1px solid #27272a;border-radius:8px;padding:16px;margin-bottom:16px}
+.card form{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+input[type=file]{color:#a0a0a8}
+input[type=text],textarea{background:#0e0e10;color:#e4e4e7;border:1px solid #3f3f46;border-radius:6px;padding:8px 12px;font-size:13px;font-family:inherit}
+input[type=text]:focus,textarea:focus{outline:none;border-color:#6366f1}
+textarea{resize:vertical;min-height:60px}
+input[type=submit],button{background:#6366f1;color:white;border:0;padding:8px 14px;border-radius:6px;font-size:13px;cursor:pointer;font-weight:500}
+input[type=submit]:hover,button:hover{background:#4f46e5}
+.del{background:#b91c1c;padding:4px 10px;font-size:12px}
+.del:hover{background:#991b1b}
+.clip{background:#1a1a1d;border-radius:8px;padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;gap:14px}
+.clip-info{flex:1;min-width:0}
+.clip-name{font-weight:500;font-size:14px;word-break:break-all}
+.clip-meta{font-size:12px;color:#71717a;margin-top:2px}
+audio{width:320px;max-width:50vw;height:32px}
+.empty{color:#71717a;font-style:italic;padding:24px;text-align:center}
+.status{font-size:12px;color:#71717a;margin-top:4px}
+.ok{color:#22c55e}
+.err{color:#ef4444}
+label{font-size:13px;color:#a0a0a8}
+select{background:#0e0e10;color:#e4e4e7;border:1px solid #3f3f46;border-radius:6px;padding:6px 10px;font-size:13px}

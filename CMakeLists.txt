@@ -33,6 +33,7 @@ option(ENGINE_ENABLE_LLAMAFILE   "Enable llamafile SGEMM"       ON)
 option(ENGINE_BUILD_CLI          "Build audiocore_cli"          ON)
 option(ENGINE_BUILD_SERVER       "Build audiocore_server"       ON)
 option(ENGINE_ENABLE_MP3        "Enable MP3 output via libmp3lame" ON)
+option(ENGINE_BUILD_WEBAPP      "Embed web UI in server binary"    ON)
 option(ENGINE_BUILD_TESTS        "Build unit tests"             OFF)
 option(ENGINE_BUILD_PYTHON       "Build Python bindings"        OFF)
 
@@ -98,6 +99,16 @@ add_library(audiocore_framework STATIC
     src/models/qwen3_tts/session.cpp
     src/models/qwen3_tts/codec.cpp
     src/models/qwen3_tts/speaker_encoder.cpp
+    # Kokoro-82M (mmwillet/TTS.cpp port — self-contained internal/ dir):
+    src/models/kokoro_tts/internal/src/models/kokoro/model.cpp
+    src/models/kokoro_tts/internal/src/models/kokoro/phonemizer.cpp
+    src/models/kokoro_tts/internal/src/models/kokoro/loader.cpp
+    src/models/kokoro_tts/internal/src/tts_model.cpp
+    src/models/kokoro_tts/internal/src/tokenizer.cpp
+    src/models/kokoro_tts/internal/ggml-patches/llama-mmap.cpp
+    src/models/kokoro_tts/internal/src/util.cpp
+    src/models/kokoro_tts/internal/src/models/loaders.cpp
+    src/models/kokoro_tts/session.cpp
     # HTTP server factory (routes + WAV encoders). Linked into the
     # audiocore_server binary AND into the e2e HTTP test, so both share the
     # same routing code path.
@@ -108,6 +119,34 @@ if(ENGINE_ENABLE_MP3)
     target_link_libraries(audiocore_framework PUBLIC mp3lame)
     target_compile_definitions(audiocore_framework PRIVATE AUDIOCORE_ENABLE_MP3=1)
 endif()
+
+# ── Embedded webapp (xxd-style byte arrays from webapp/public/) ────────────
+if(ENGINE_BUILD_WEBAPP AND ENGINE_BUILD_SERVER)
+    set(WEBAPP_DIR "${CMAKE_SOURCE_DIR}/webapp/public")
+    set(WEBAPP_OUT "${CMAKE_CURRENT_BINARY_DIR}/webapp")
+    file(MAKE_DIRECTORY "${WEBAPP_OUT}")
+
+    set(WEBAPP_ASSETS index.html style.css app.js)
+    set(WEBAPP_GENERATED_SRCS "")
+
+    foreach(asset ${WEBAPP_ASSETS})
+        set(input "${WEBAPP_DIR}/${asset}")
+        set(output "${WEBAPP_OUT}/${asset}.hpp")
+        add_custom_command(
+            DEPENDS "${input}"
+            OUTPUT "${output}"
+            COMMAND "${CMAKE_COMMAND}" "-DINPUT=${input}" "-DOUTPUT=${output}"
+                    -P "${CMAKE_SOURCE_DIR}/scripts/xxd.cmake"
+            COMMENT "Embedding ${asset} → ${asset}.hpp"
+        )
+        list(APPEND WEBAPP_GENERATED_SRCS "${output}")
+    endforeach()
+
+    add_custom_target(webapp_embed ALL DEPENDS ${WEBAPP_GENERATED_SRCS})
+    add_dependencies(audiocore_framework webapp_embed)
+    target_include_directories(audiocore_framework PRIVATE "${WEBAPP_OUT}")
+    target_compile_definitions(audiocore_framework PRIVATE AUDIOCORE_HAS_WEBAPP=1)
+endif()
 target_include_directories(audiocore_framework
     PUBLIC
         include
@@ -115,8 +154,16 @@ target_include_directories(audiocore_framework
         third_party/llama.cpp/include
         third_party/llama.cpp/ggml/include
         third_party/httplib
-        third_party/nlohmann)
+        third_party/nlohmann
+    PRIVATE
+        src/models/kokoro_tts/internal/src
+        src/models/kokoro_tts/internal/include
+        src/models/kokoro_tts/internal/ggml-patches
+)
 target_link_libraries(audiocore_framework PUBLIC llama)
+target_compile_definitions(audiocore_framework PRIVATE ESPEAK_INSTALL)
+target_include_directories(audiocore_framework PRIVATE /usr/include/espeak-ng)
+target_link_libraries(audiocore_framework PUBLIC espeak-ng)
 
 # ── Binaries ─────────────────────────────────────────────────────────────
 if(ENGINE_BUILD_CLI)
@@ -142,10 +189,25 @@ target_link_libraries(convert_acestep PRIVATE audiocore_framework)
 add_executable(convert_qwen3tts tools/convert_qwen3tts.cpp)
 target_link_libraries(convert_qwen3tts PRIVATE audiocore_framework)
 
+# ECAPA-TDNN speaker-encoder safetensors → standalone GGUF converter.
+# Source: marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B (or any equivalent
+# EcapaTdnnSpeakerEncoder checkpoint). Produces ~23 MB GGUF with `speaker.*`
+# namespaced tensors that audiocore's Qwen3TtsSpeakerEncoder::bind() resolves
+# unchanged. See docs/MODEL-GAPS.md Gap J.
+add_executable(convert_ecapa tools/convert_ecapa.cpp)
+target_link_libraries(convert_ecapa PRIVATE audiocore_framework)
+
 # GGUF inspector — dump tensor names, shapes, and sizes. Useful for debugging
 # GGUF layout issues (e.g. truncated files, mismatched tensor counts).
 add_executable(inspect_gguf tools/inspect_gguf.cpp)
 target_link_libraries(inspect_gguf PRIVATE audiocore_framework)
+
+# qwen_voice — Qwen3 voice-embedding CLI: encode reference WAVs to saveable
+# vectors, do arithmetic (mix/average/add/scale/direction/shift), and apply
+# a saved voice + emotional `instruct` prompt to TTS. The vector-math
+# subcommands are model-free; only encode/apply load a qwen3_tts session.
+add_executable(qwen_voice tools/qwen_voice.cpp)
+target_link_libraries(qwen_voice PRIVATE audiocore_framework)
 
 if(ENGINE_BUILD_TESTS)
     enable_testing()
@@ -171,3 +233,13 @@ if(ENGINE_BUILD_PYTHON)
     set_target_properties(audiocore PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python")
 endif()
+
+# ── Kokoro TTS test ──────────────────────────────────────────────────────
+add_executable(test_kokoro_e2e tests/test_kokoro_e2e.cpp)
+target_link_libraries(test_kokoro_e2e PRIVATE audiocore_framework)
+
+# Voice-embedding round-trip regression: encode a generated reference WAV
+# into a saved .voice file, reload it, apply it via synthesize_with_embedding
+# with an emotional `instruct` prompt, write the result WAV for listening.
+add_executable(test_qwen3_voice_e2e tests/test_qwen3_voice_e2e.cpp)
+target_link_libraries(test_qwen3_voice_e2e PRIVATE audiocore_framework)
