@@ -94,8 +94,29 @@ int main() {
     auto get_env = [](const char* k, const char* d) {
         const char* v = std::getenv(k); return v ? std::string(v) : std::string(d);
     };
-    std::string talker_fn = get_env("QWEN3TTS_TALKER",    "qwen3tts-talker-1b7-f16.gguf");
-    std::string pred_fn   = get_env("QWEN3TTS_PREDICTOR", "qwen3tts-predictor-1b7-f16.gguf");
+    // Variant-aware default filenames: pick first existing in each list.
+    // The 0.6B dirs typically ship qwen3_tts_talker.gguf (no size suffix);
+    // 1.7B dirs ship qwen3tts-talker-1b7-f16.gguf. Allow either.
+    auto resolve_first_existing = [&](const std::string& dir,
+                                      std::initializer_list<const char*> cands,
+                                      const char* fallback) -> std::string {
+        for (const char* c : cands) {
+            std::string p = dir + "/" + c;
+            std::ifstream t(p, std::ios::binary);
+            if (t.good()) return c;
+        }
+        return fallback;
+    };
+    std::string talker_fn = get_env("QWEN3TTS_TALKER",
+        resolve_first_existing(model_dir,
+            {"qwen3tts-talker-1b7-f16.gguf", "qwen3tts-talker-0b6-f16.gguf",
+             "qwen3_tts_talker.gguf"},
+            "qwen3_tts_talker.gguf").c_str());
+    std::string pred_fn   = get_env("QWEN3TTS_PREDICTOR",
+        resolve_first_existing(model_dir,
+            {"qwen3tts-predictor-1b7-f16.gguf", "qwen3tts-predictor-0b6-f16.gguf",
+             "qwen3_tts_predictor.gguf"},
+            "qwen3_tts_predictor.gguf").c_str());
     // tokenizer-f16.gguf is the actual audio codec (~358 MB, 398 tensors).
     // qwen3tts-tokenizer-*-f16.gguf is the text tokenizer (~5.9 MB) and
     // will soft-fail decode → silence.
