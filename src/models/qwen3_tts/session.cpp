@@ -134,28 +134,56 @@ static constexpr int32_t CODEC_TEOS  = 2157;
 static inline int32_t codec_pad(int32_t /*vocab*/) { return CODEC_PAD; }
 static inline int32_t codec_bos(int32_t /*vocab*/) { return CODEC_BOS; }
 
-// Default speaker name → codec token mapping (from official config)
-// These are approximate; real values come from the model's config.json.
+// Default speaker name → codec token mapping.
+// Canonical IDs from Qwen3-TTS-12Hz-{0.6B,1.7B}-CustomVoice config.json:
+//   talker_config.spk_id = {"serena":3066, "vivian":3065, "uncle_fu":3010,
+//   "ryan":3061, "aiden":2861, "ono_anna":2873, "sohee":2864, "eric":2875,
+//   "dylan":2878}
+// Lookup is case-insensitive (the upstream Python uses speaker.lower()).
+// The previously-hardcoded values 4206..4214 were WRONG and caused the
+// CustomVoice variants to produce "wawa wawa wubba wubba" garbage — see
+// GAPS.md §B1.
 static int32_t speaker_to_token(const std::string& name) {
     static const std::unordered_map<std::string, int32_t> spk_map = {
-        {"vivian", 4206}, {"ryan", 4207}, {"sarah", 4208},
-        {"alex", 4209}, {"emma", 4210}, {"james", 4211},
-        {"olivia", 4212}, {"liam", 4213}, {"sophia", 4214},
+        {"vivian", 3065}, {"serena", 3066}, {"ryan", 3061},
+        {"aiden", 2861}, {"eric", 2875}, {"dylan", 2878},
+        {"sohee", 2864}, {"ono_anna", 2873}, {"uncle_fu", 3010},
+        // Aliases for the previous (incorrect) names so existing scripts
+        // don't break hard — they'll resolve to a real speaker now.
+        {"sarah", 3066}, {"alex", 2861}, {"emma", 3065},
+        {"james", 3061}, {"olivia", 2873}, {"liam", 2878},
+        {"sophia", 2864},
     };
-    auto it = spk_map.find(name);
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    auto it = spk_map.find(lower);
     if (it != spk_map.end()) return it->second;
-    // Unknown speaker: use default
     return -1;
 }
 
-// Language → codec token mapping (from official config)
+// Language → codec token mapping. Canonical IDs from Qwen3-TTS config.json:
+//   talker_config.codec_language_id = {"chinese":2055, "english":2050,
+//   "german":2053, "italian":2070, "portuguese":2071, "spanish":2054,
+//   "japanese":2058, "korean":2064, "french":2061, "russian":2069,
+//   "beijing_dialect":2074, "sichuan_dialect":2062}
+// The previous map (4206..4215) was incorrect — those IDs fall inside the
+// spk_id namespace, not the language namespace.
 static int32_t language_to_token(const std::string& lang) {
     static const std::unordered_map<std::string, int32_t> lang_map = {
-        {"zh", 4206}, {"en", 4207}, {"ja", 4208}, {"ko", 4209},
-        {"de", 4210}, {"fr", 4211}, {"ru", 4212}, {"pt", 4213},
-        {"es", 4214}, {"it", 4215},
+        {"zh", 2055}, {"en", 2050}, {"ja", 2058}, {"ko", 2064},
+        {"de", 2053}, {"fr", 2061}, {"ru", 2069}, {"pt", 2071},
+        {"es", 2054}, {"it", 2070},
+        // Long-form names (matches config.json keys)
+        {"chinese", 2055}, {"english", 2050}, {"japanese", 2058},
+        {"korean", 2064}, {"german", 2053}, {"french", 2061},
+        {"russian", 2069}, {"portuguese", 2071}, {"spanish", 2054},
+        {"italian", 2070},
     };
-    auto it = lang_map.find(lang);
+    std::string lower = lang;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    auto it = lang_map.find(lower);
     if (it != lang_map.end()) return it->second;
     return -1;
 }
@@ -232,6 +260,12 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     // reference WAV (or use a pre-computed embedding) before building the
     // prefill. We store the result in a local so Phase 1 can inject it at
     // the speaker-position slot.
+    //
+    // Third valid path: a named speaker (`req.speaker_name`) resolves to a
+    // codec-token slot inside the talker's `token_embd` table. This is the
+    // canonical CustomVoice path and needs neither an ECAPA encoder nor a
+    // raw embedding. We still allow voice_clone mode here and let the
+    // prefill builder inject the speaker-token row instead of `vc_spk_emb`.
     std::vector<float> vc_spk_emb;
     if (mode == Qwen3TtsMode::VoiceClone) {
         const int d = talker_->n_embd();
@@ -261,18 +295,29 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                 if (error) *error = "voice_clone: speaker encoder failed on reference audio";
                 return false;
             }
+        } else if (!req.speaker_name.empty()) {
+            // CustomVoice named-speaker path: no embedding needed. The
+            // prefill builder resolves `speaker_name` to a codec-token slot
+            // and injects the row from `token_embd` directly. Proceed with
+            // an empty `vc_spk_emb`; `has_vc_spk` will be false but
+            // `has_speaker` (set later from `speaker_to_token`) will be true.
+            std::fprintf(stderr, "qwen3_tts: voice clone: using named speaker '%s' "
+                                 "(no embedding required)\n",
+                         req.speaker_name.c_str());
         } else {
-            if (error) *error = "voice_clone requires reference_audio or speaker_embedding";
+            if (error) *error = "voice_clone requires reference_audio, speaker_embedding, or speaker_name";
             return false;
         }
 
-        if ((int)vc_spk_emb.size() != d) {
+        if (!vc_spk_emb.empty() && (int)vc_spk_emb.size() != d) {
             std::fprintf(stderr, "qwen3_tts: voice clone: spk_emb dim %zu != d_model %d; "
                                  "padding to match\n", vc_spk_emb.size(), d);
             vc_spk_emb.resize((size_t)d, 0.0f);
         }
-        std::fprintf(stderr, "qwen3_tts: voice clone: ECAPA embedding ready (%zu dims)\n",
-                     vc_spk_emb.size());
+        if (!vc_spk_emb.empty()) {
+            std::fprintf(stderr, "qwen3_tts: voice clone: ECAPA embedding ready (%zu dims)\n",
+                         vc_spk_emb.size());
+        }
     }
 
     // ── Full ICL: encode reference audio via codec encoder ────────────────
@@ -617,7 +662,16 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
             pos++;
         }
 
-        // Speaker slot
+        // Speaker slot — codec_embedding (spk_token) OR raw ECAPA vector.
+        // The canonical upstream layout (modeling_qwen3_tts.py:2182) adds a
+        // tts_pad overlay at this position too, but empirically our 0.6B-Base
+        // GGUFs produce better quality WITHOUT the overlay (the overlay uses
+        // pad_idx=2148 for 0.6B which has a non-zero text_embd row that
+        // shifts the ECAPA vector out of distribution). For CV variants
+        // (where the speaker is a learned token) the overlay is harmless.
+        // We therefore omit the overlay uniformly — this keeps the
+        // 0.6B-Base path (the user's primary use case) working at full
+        // quality. See GAPS.md §A1.b for the 0.6B tts_pad token-id quirk.
         if (has_spk_slot) {
             float* dst = &codec_overlay[pos * n_embd];
             if (has_vc_spk) {

@@ -83,6 +83,9 @@
 #include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/server/server.h"
 
+#include "ggml.h"
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -226,22 +229,59 @@ std::vector<std::string> grab_args(int argc, char** argv, const std::string& key
 
 struct SessionCfg {
     std::string model_dir;
-    std::string talker_fn   = "qwen3tts-talker-1b7-f16.gguf";
-    std::string pred_fn     = "qwen3tts-predictor-1b7-f16.gguf";
+    std::string talker_fn;   // auto-resolved below
+    std::string pred_fn;     // auto-resolved below
     // IMPORTANT: the audio codec (Qwen3-TTS-Tokenizer-12Hz, 398 tensors,
     // ~358 MB) is published as tokenizer-f16.gguf. The similarly-named
-    // qwen3tts-tokenizer-1b7-f16.gguf is the much smaller TEXT tokenizer
-    // (~5.9 MB, 0 codec tensors) and will soft-fail decode → silence.
+    // qwen3tts-tokenizer-{0b6,1b7}-f16.gguf is the much smaller TEXT
+    // tokenizer (~5.9 MB, 0 codec tensors) and will soft-fail decode → silence.
     std::string codec_fn    = "tokenizer-f16.gguf";
     std::string encoder_fn;  // optional override
     int         ngpu        = 99;
     std::string backend     = "ggml_cuda";
 };
 
+// D3 fix: pick the first existing candidate filename inside `dir`.
+// Falls back to the legacy hardcoded default if none of the candidates
+// are present (so the original error message stays meaningful).
+static std::string resolve_first_existing(const std::string& dir,
+                                          std::initializer_list<const char*> cands,
+                                          const char* fallback) {
+    for (const char* c : cands) {
+        std::string p = dir.empty() ? std::string(c) : (dir + "/" + c);
+        std::ifstream f(p, std::ios::binary);
+        if (f.good()) return c;
+    }
+    return fallback;
+}
+
 SessionCfg session_cfg_from_env(const std::string& model_dir,
                                 const std::string& encoder_override) {
     SessionCfg c;
     c.model_dir = model_dir;
+
+    // D3: variant-aware defaults. The published 1.7B files use the
+    // `qwen3tts-talker-1b7-f16.gguf` naming scheme, but locally converted
+    // copies use `qwen3_tts_talker.gguf`. Pick whichever exists on disk.
+    // Order matters: prefer the size-suffixed name when present (it pins
+    // the variant unambiguously), then fall back to the generic name.
+    c.talker_fn = resolve_first_existing(
+        model_dir,
+        { "qwen3tts-talker-1b7-f16.gguf",
+          "qwen3tts-talker-0b6-f16.gguf",
+          "qwen3_tts_talker.gguf" },
+        "qwen3tts-talker-1b7-f16.gguf");
+    c.pred_fn = resolve_first_existing(
+        model_dir,
+        { "qwen3tts-predictor-1b7-f16.gguf",
+          "qwen3tts-predictor-0b6-f16.gguf",
+          "qwen3_tts_predictor.gguf" },
+        "qwen3tts-predictor-1b7-f16.gguf");
+    c.codec_fn = resolve_first_existing(
+        model_dir,
+        { "tokenizer-f16.gguf" },   // only valid codec name; text tok sidecar is excluded
+        "tokenizer-f16.gguf");
+
     if (const char* t = std::getenv("QWEN3TTS_TALKER"))    c.talker_fn = t;
     if (const char* p = std::getenv("QWEN3TTS_PREDICTOR"))  c.pred_fn   = p;
     if (const char* k = std::getenv("QWEN3TTS_CODEC"))      c.codec_fn  = k;
@@ -265,9 +305,31 @@ std::unique_ptr<audiocore::Session> load_session(const SessionCfg& c,
     if (!c.encoder_fn.empty())
         opts.extras["speaker_encoder_path"] = c.encoder_fn;
 
+    // Backend resolution: respect the user's choice when the backend is
+    // actually linked in. If they asked for CUDA/Vulkan but no GPU device
+    // is registered (e.g. CPU-only build, no driver), transparently fall
+    // back to CPU instead of letting the speaker/codec backend creation
+    // silently fail and leave the session half-loaded.
     BackendKind kind = BackendKind::ggml_cpu;
     if (c.backend == "ggml_cuda")   kind = BackendKind::ggml_cuda;
     if (c.backend == "ggml_vulkan") kind = BackendKind::ggml_vulkan;
+
+    int n_devs = ggml_backend_dev_count();
+    bool gpu_ok = false;
+    for (int i = 0; i < n_devs; i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_ok = true;
+            break;
+        }
+    }
+    if ((kind == BackendKind::ggml_cuda || kind == BackendKind::ggml_vulkan) && !gpu_ok) {
+        std::fprintf(stderr, "[info] no GPU backend registered; falling back to CPU\n");
+        kind = BackendKind::ggml_cpu;
+        // ngpu_layers > 0 is meaningless on CPU and would just log noise.
+        opts.extras["n_gpu_layers"] = "0";
+    }
+
     BackendConfig bc = { .kind = kind, .device_id = 0, .n_threads = 4 };
 
     if (!sess->load(c.model_dir, opts, bc, err)) return nullptr;
@@ -456,6 +518,7 @@ static int cmd_apply(int argc, char** argv) {
     std::string spk_name  = grab_arg(argc, argv, "--speaker-name");
     std::string temp_s    = grab_arg(argc, argv, "--temperature");
     std::string topp_s    = grab_arg(argc, argv, "--top-p");
+    std::string topk_s    = grab_arg(argc, argv, "--top-k");
     std::string maxnew_s  = grab_arg(argc, argv, "--max-new-tokens");
     std::string seed_s    = grab_arg(argc, argv, "--seed");
     std::string encoder   = grab_arg(argc, argv, "--encoder");
@@ -467,17 +530,19 @@ static int cmd_apply(int argc, char** argv) {
     // Python `voice_clone_prompt=(ref_code, ref_text, spk_emb)` API.
     std::string ref_audio = grab_arg(argc, argv, "--reference-audio");
     std::string ref_text  = grab_arg(argc, argv, "--reference-text");
-    if (model_dir.empty() || text.empty() || (voice.empty() && ref_audio.empty())) {
+    if (model_dir.empty() || text.empty() ||
+        (voice.empty() && ref_audio.empty() && spk_name.empty())) {
         std::fprintf(stderr,
             "usage: qwen_voice apply --model-dir <dir> --text \"...\" \\\n"
-            "       (--voice <voice> | --reference-audio <wav>) \\\n"
+            "       (--voice <voice> | --reference-audio <wav> | --speaker-name <name>) \\\n"
             "       [--instruct \"...\"] [--out out.wav] \\\n"
             "       [--language en] [--speaker-name \"\"] [--temperature 0.7]\n"
             "       [--encoder <spk.gguf>]\n"
             "       [--reference-audio <wav>] [--reference-text \"transcript\"]\n"
-            "  x-vector mode:  --voice <file.voice>   (pre-computed ECAPA embedding)\n"
-            "  ICL clone mode: --reference-audio <wav> [--reference-text \"...\"]\n"
-            "  both:           --voice + --reference-audio (spk_emb + codec tokens)\n");
+            "  x-vector mode:    --voice <file.voice>           (Base/Instruct variants)\n"
+            "  named speaker:    --speaker-name Vivian          (CustomVoice variants)\n"
+            "  ICL clone mode:   --reference-audio <wav> [--reference-text \"...\"]\n"
+            "  both:             --voice + --reference-audio    (spk_emb + codec tokens)\n");
         return 2;
     }
     if (out.empty()) out = "qwen_voice_apply.wav";
@@ -504,6 +569,10 @@ static int cmd_apply(int argc, char** argv) {
     req.speaker_name= spk_name;
     req.temperature = temp_s.empty() ? 0.7f : std::strtof(temp_s.c_str(), nullptr);
     req.top_p       = topp_s.empty() ? 0.9f : std::strtof(topp_s.c_str(), nullptr);
+    // text_top_k controls the cb0 (coarse codec) sampler's top-k filter.
+    // 0 disables top-k (sample from the full distribution after top-p).
+    // The canonical Qwen3-TTS default is top_k=50 with temperature=0.8-1.0.
+    req.text_top_k  = topk_s.empty() ? 50 : std::atoi(topk_s.c_str());
     req.max_new_tokens = maxnew_s.empty() ? 100 : std::atoi(maxnew_s.c_str());
     req.seed        = seed_s.empty() ? 0 : std::atoi(seed_s.c_str());
     req.reference_audio = ref_audio;
@@ -513,12 +582,16 @@ static int cmd_apply(int argc, char** argv) {
         std::fprintf(stderr, "[info] instruct: \"%s\"\n", instruct.c_str());
 
     audiocore::TtsResponse resp;
-    // x-vector fast path: pre-computed embedding only. ICL path: drive
-    // run_tts directly so the session runs the codec encoder on
-    // reference_audio and injects the resulting frames as in-context
-    // reference codes (the strong cloning path). Combining --voice with
-    // --reference-audio gives spk_emb + codec tokens, matching the Python
-    // voice_clone_prompt=(ref_code, ref_spk_embedding, ref_text) API.
+    // Dispatch matrix:
+    //   • --reference-audio         → ICL voice_clone via run_tts (codec encoder
+    //                                 injects ref frames as in-context examples)
+    //   • --voice                   → x-vector fast path via synthesize_with_embedding
+    //   • --speaker-name only       → CustomVoice variant: token-based speaker
+    //                                 resolution, no embedding needed. Drive via
+    //                                 run_tts with empty speaker_embedding.
+    // Combining --voice with --reference-audio gives spk_emb + codec tokens,
+    // matching the Python voice_clone_prompt=(ref_code, ref_spk_embedding,
+    // ref_text) API.
     bool ok = false;
     if (!ref_audio.empty()) {
         req.mode = "voice_clone";
@@ -528,6 +601,14 @@ static int cmd_apply(int argc, char** argv) {
         ok = q->run_tts(&req, &resp, &err);
         if (!ok)
             std::fprintf(stderr, "[err] run_tts (ICL) failed: %s\n", err.c_str());
+    } else if (!spk_name.empty() && emb.empty()) {
+        // CustomVoice named-speaker path: no embedding needed.
+        req.mode = "voice_clone";  // any mode works; speaker_name drives the slot
+        std::fprintf(stderr, "[info] named speaker: %s (token resolved in session)\n",
+                     spk_name.c_str());
+        ok = q->run_tts(&req, &resp, &err);
+        if (!ok)
+            std::fprintf(stderr, "[err] run_tts (named speaker) failed: %s\n", err.c_str());
     } else {
         ok = q->synthesize_with_embedding(req, emb.data(), emb.size(), resp, &err);
         if (!ok)
