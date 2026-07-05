@@ -3,26 +3,44 @@
 This document describes how the speaker embedding enters the talker's input
 sequence and how it conditions the autoregressive generation.
 
-## Pipeline status (2026-07-04)
+## Pipeline status (2026-07-05)
 
 **0.6B-Base: WORKING** — verified end-to-end via cloud_vlm (MiMo-V2.5):
 
 | Demo | Input | cloud_vlm verdict |
 |------|-------|-------------------|
-| Speaker embedding + text | `vivian.voice` + "Hello world, this is a voice cloning demonstration." | "Hello world, this is a voice cloning demonstration." · **Excellent** · 100% |
-| Speaker embedding + HAPPY emotion + text | + `--instruct "Speak with a happy, cheerful, warm emotion."` | "...demonstration. **[laughs]**" · Emotion: "**Cheerful and playful with a theatrical laugh**" · **Excellent** · 100% |
-| Longer text | "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs." | Verbatim match · **Excellent** · 100% |
+| Speaker embedding + text | `vivian.voice` + "Hello world, this is a voice cloning demonstration." | "Hello world, this is a voice cloning demonstration." · **Excellent** · ~95% |
+| Speaker embedding + HAPPY emotion + text | + `--instruct "Speak with a happy, cheerful, warm emotion."` | "Hello world, this is a voice cloning demonstration?" (upward inflection) · Emotion: "**Curious / Upbeat / Neutral-Positive**" · ~92% |
+| Longer text | "The quick brown fox jumps over the lazy dog." | "The quick brown fox jumps over the lazy..." · **Good** · 95% |
+| Multi-language EN | + `--language en` | "Hello world. This is a voice cloning demonstration." · 95% |
+| Multi-language ZH | + `--language zh` (你好世界...) | Mandarin correctly identified & transcribed · ~90% |
+| Multi-language ES | + `--language es` (Hola mundo...) | Spanish correctly identified & transcribed · 95% |
+| Voice blend (50/50) | `mix vivian.voice youth_voice.voice 0.5` | intelligible speech, slightly different tone · 95% |
 
 The user's four-part requirement is met for 0.6B-Base:
 - (a) Speaker embeddings (raw 1024-dim ECAPA vector from `*.voice`) ✓
 - (b) Separate emotional prompt (`--instruct`, injected as system-role overlay) ✓
 - (c) Normal text prompt ✓
-- (d) High-quality output (Excellent quality, 100% intelligibility) ✓
+- (d) High-quality output (~92-95% intelligibility, emotion cue detected) ✓
 
-**1.7B-Base: STILL BROKEN** — talker produces gibberish despite identical
-prefill assembly. Diagnostics (QWEN3TTS_NO_MTP=1) confirm the bug is in
-the talker forward pass, not the predictor. See "1.7B-specific notes"
-below.
+**Working command:**
+```bash
+./build/qwen_voice apply \
+  --model-dir /path/to/qwen3_tts/0.6b-base \
+  --voice vivian.voice \
+  --text "Text to synthesize" \
+  --instruct "Speak with warmth and happiness." \
+  --language en \
+  --temperature 0.7 --top-p 0.9 --top-k 50 \
+  --out output.wav
+```
+
+**1.7B-Base: STILL BROKEN** — talker produces gibberish ("Karma's a
+bitch. You just... problem... problem..." or "tes-tes-tes-tes"). Bug
+is in the talker forward pass, not the predictor (verified via
+`QWEN3TTS_NO_MTP=1`). The cur_hidden norm gap (0.6B ~165-188 vs 1.7B
+~97-108) is roughly proportional to hidden size and doesn't itself
+explain the gibberish. See GAPS.md §A1.
 
 ## How `--instruct` (emotion) is injected
 
