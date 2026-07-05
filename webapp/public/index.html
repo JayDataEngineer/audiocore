@@ -5,45 +5,62 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>audiocore</title>
 <link rel="stylesheet" href="/style.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-<div class="topbar">
-  <h1>audiocore</h1>
-  <span class="status" id="server-status"></span>
-</div>
+<div class="shell">
 
-<div class="card">
-  <form id="upload-form">
-    <input type="file" name="file" accept="audio/*" multiple required>
-    <input type="submit" value="Upload">
-  </form>
-  <div class="status" id="upload-status"></div>
-</div>
+  <header>
+    <h1>audiocore</h1>
+    <span class="badge" id="model-badge"></span>
+  </header>
 
-<h2 id="clips-header">Clips</h2>
-<div id="clips-list"></div>
-
-<h2>Synthesize</h2>
-<div class="card">
-  <form id="tts-form" style="flex-direction:column;align-items:stretch;gap:8px">
-    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-      <select id="tts-model"></select>
-      <input type="text" id="tts-text" placeholder="Text to speak..." style="flex:1;min-width:200px" required>
-      <input type="submit" value="Synthesize">
+  <section>
+    <div class="section-head">
+      <h2>Synthesize</h2>
     </div>
-    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-      <label>Voice:</label>
-      <input type="text" id="tts-voice" placeholder="e.g. Vivian" style="width:120px">
-      <label>Mode:</label>
-      <select id="tts-mode">
-        <option value="tts">TTS</option>
-        <option value="sfx">SFX</option>
-        <option value="voice_clone">Voice Clone</option>
-      </select>
+    <div class="card">
+      <form id="tts-form">
+        <div class="tts-row">
+          <select id="tts-model"></select>
+          <input type="text" id="tts-text" placeholder="Type something to speak..." required>
+          <button class="btn btn-primary" type="submit" id="tts-btn">Synthesize</button>
+        </div>
+        <div class="tts-opts">
+          <label>Voice</label>
+          <input type="text" id="tts-voice" placeholder="Vivian">
+          <label>Mode</label>
+          <select id="tts-mode">
+            <option value="tts">TTS</option>
+            <option value="sfx">SFX</option>
+            <option value="voice_clone">Voice Clone</option>
+          </select>
+        </div>
+        <div class="status" id="tts-status"></div>
+      </form>
     </div>
-    <div class="status" id="tts-status"></div>
-  </form>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Clips <span class="count" id="clips-count"></span></h2>
+    </div>
+    <div class="card" style="padding:14px 16px;margin-bottom:10px">
+      <form id="upload-form" class="form-row">
+        <input type="file" name="file" accept="audio/*" multiple required>
+        <button class="btn btn-primary" type="submit">Upload</button>
+        <span class="status" id="upload-status"></span>
+      </form>
+    </div>
+    <div class="clips-grid" id="clips-list">
+      <div class="empty"><div class="empty-icon">&#9835;</div>Loading clips...</div>
+    </div>
+  </section>
+
 </div>
+
+<div class="toast" id="toast"></div>
 
 <script src="/app.js"></script>
 </body>
