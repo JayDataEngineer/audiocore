@@ -445,13 +445,11 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
     // ── 1. FSQ decode: codes → 6D → upsample 5→25 Hz (skipped for cover) ──
     // For cover mode the FSQ decode is replaced by cover_latent_cond_ which
     // already holds VAE-encoded + temporally-smoothed source latents.
-    // For non-cover: the upstream projects the 6D FSQ vectors through a learned
-    // MLP (6 → 2048 → SiLU → LayerNorm → 64).  If the MLP weights exist in
-    // ext_ctx_ (as vae.fsq_*), use them; otherwise fall back to identity.
-    //
-    // Note: fsq_latent is currently unused in the DiT forward path — the
-    // DiT receives only noise + TE conditioning. It is kept for the code
-    // structure documentation until the FSQ conditioning path is wired.
+    // For non-cover (text_to_music): the upstream projects the 6D FSQ vectors
+    // through a learned MLP (6 → 2048 → SiLU → LayerNorm → 64). The result
+    // is the structural source latent fed into the DiT context's src channels
+    // (0..63). Without this, the DiT has no musical structure conditioning
+    // and produces temporally-incoherent noise output.
     std::vector<float> fsq_latent;
     if (!is_cover_mode) {
         fsq_latent.assign(static_cast<size_t>(n_frames) * out_ch, 0.0f);
@@ -691,7 +689,21 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                 std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
                             static_cast<size_t>(out_ch) * sizeof(float));
         } else {
-            if (silence_ptr && t < silence_T)
+            // text_to_music: FSQ-decoded LM latent is the structural source.
+            // The LM-generated music_codes carry the coarse musical structure
+            // (chord progression, rhythm sketch); fsq_latent is the learned
+            // projection of those codes into the 64-D latent space. This is
+            // the SOURCE the DiT refines — without it the DiT has no musical
+            // context and produces temporally-incoherent output.
+            //
+            // Fallback to silence latent only when fsq_latent isn't populated
+            // (e.g. very short generation, missing fsq_proj weights, or when
+            // t exceeds the fsq_latent's frame count).
+            if (t < n_frames && !fsq_latent.empty()) {
+                std::memcpy(row,
+                            &fsq_latent[static_cast<size_t>(t) * out_ch],
+                            static_cast<size_t>(out_ch) * sizeof(float));
+            } else if (silence_ptr && t < silence_T)
                 std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
                             static_cast<size_t>(out_ch) * sizeof(float));
         }
