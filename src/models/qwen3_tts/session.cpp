@@ -100,15 +100,39 @@ static std::vector<float> resample_to_24k(const float* src, int n_src, int src_r
     return dst;
 }
 
-// ── Codec special tokens (from official Qwen3-TTS config) ────────────────
-// PAD and BOS are the last two rows of the codec embedding table.
-static int32_t codec_pad(int32_t vocab) { return vocab - 2; }
-static int32_t codec_bos(int32_t vocab) { return vocab - 1; }
-static constexpr int32_t CODEC_EOS    = 2150;  // 12Hz tokenizer default
-static constexpr int32_t CODEC_THINK  = 4202;
-static constexpr int32_t CODEC_NOT    = 4203;
-static constexpr int32_t CODEC_TBOS   = 4204;
-static constexpr int32_t CODEC_TEOS   = 4205;
+// ── Codec special tokens (from official Qwen3-TTS config.json) ───────────
+// These IDs are FIXED in the original Qwen3-TTS-1.7B / 0.6B config:
+//   codec_pad_id           = 2148
+//   codec_bos_id           = 2149
+//   codec_eos_token_id     = 2150
+//   codebook_vocab_size    = 2151  (real codec tokens + 3 special)
+// The codec embedding table in our split GGUF is padded to 3072 rows
+// (the original `codec_embedding.weight` shape), but tokens 2151..3071
+// are unused padding and MUST NOT be addressed. Using `vocab - 2` /
+// `vocab - 1` would feed token 3070/3071 which the model never saw in
+// training — the resulting garbage prefill caused severe distortion.
+static constexpr int32_t CODEC_PAD   = 2148;
+static constexpr int32_t CODEC_BOS   = 2149;
+static constexpr int32_t CODEC_EOS   = 2150;
+// Per canonical qwen3-tts.cpp tts_transformer.cpp (defaults match
+// Qwen3-TTS-1.7B / 0.6B config.json exactly):
+//   codec_think_id      = 2154
+//   codec_nothink_id    = 2155
+//   codec_think_bos_id  = 2156
+//   codec_think_eos_id  = 2157
+// The earlier 4202-4205 values were TEXT-vocab IDs that fell outside
+// the codec_embedding table — codec_row() returned nullptr and every
+// bridge position collapsed to tts_pad_embed, stripping the prefill
+// of its think/nothink mode marker. On 0.6B the model is robust
+// enough to recover; on 1.7B it hallucinates foreign-language speech
+// because it never sees the nothink signal.
+static constexpr int32_t CODEC_THINK = 2154;
+static constexpr int32_t CODEC_NOT   = 2155;
+static constexpr int32_t CODEC_TBOS  = 2156;
+static constexpr int32_t CODEC_TEOS  = 2157;
+// Back-compat shims (no longer depend on vocab).
+static inline int32_t codec_pad(int32_t /*vocab*/) { return CODEC_PAD; }
+static inline int32_t codec_bos(int32_t /*vocab*/) { return CODEC_BOS; }
 
 // Default speaker name → codec token mapping (from official config)
 // These are approximate; real values come from the model's config.json.
@@ -210,20 +234,26 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     // the speaker-position slot.
     std::vector<float> vc_spk_emb;
     if (mode == Qwen3TtsMode::VoiceClone) {
-        if (!config_.speaker_present) {
-            if (error) *error =
-                "qwen3_tts voice_clone requires the ECAPA-TDNN speaker encoder "
-                "(GGUF lacks `speaker.*` tensors). See GAPS.md §2.3.";
-            return false;
-        }
         const int d = talker_->n_embd();
 
-        // Pre-computed embedding takes priority (no WAV load needed)
+        // Pre-computed embedding takes priority (no WAV load needed, no
+        // speaker encoder required). This mirrors ht-vllm-omni PR #1227:
+        // passing a raw `speaker_embedding` vector bypasses ref_audio /
+        // ref_text entirely and implies x_vector_only_mode=True.
         if (!req.speaker_embedding.empty()) {
             vc_spk_emb = req.speaker_embedding;
             std::fprintf(stderr, "qwen3_tts: voice clone: using pre-computed "
                                  "embedding (%zu dims)\n", vc_spk_emb.size());
         } else if (!req.reference_audio.empty()) {
+            // ECAPA-TDNN encoder is only required when we must COMPUTE the
+            // embedding from a reference WAV at runtime.
+            if (!config_.speaker_present) {
+                if (error) *error =
+                    "qwen3_tts voice_clone from reference_audio requires the "
+                    "ECAPA-TDNN speaker encoder (GGUF lacks `speaker.*` "
+                    "tensors). See GAPS.md §2.3.";
+                return false;
+            }
             std::fprintf(stderr, "qwen3_tts: voice clone: computing ECAPA embedding from %s\n",
                          req.reference_audio.c_str());
             vc_spk_emb = speaker_encoder_.compute_embedding(req.reference_audio);
@@ -341,27 +371,44 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     const int32_t bos_idx = codec_bos(codec_vocab);
 
     // ── Resolve special token IDs ────────────────────────────────────────
-    int32_t asst_tok = 77091, nl_tok = 198; // Qwen3 defaults
+    int32_t asst_tok = 77091, user_tok = 872, sys_tok = 8948, nl_tok = 198; // Qwen3 defaults
     {
         std::vector<int32_t> tmp;
         if (talker_->tokenize("assistant", false, false, &tmp) && !tmp.empty())
             asst_tok = tmp[0];
+        tmp.clear();
+        if (talker_->tokenize("user", false, false, &tmp) && !tmp.empty())
+            user_tok = tmp[0];
+        tmp.clear();
+        if (talker_->tokenize("system", false, false, &tmp) && !tmp.empty())
+            sys_tok = tmp[0];
         tmp.clear();
         if (talker_->tokenize("\n", false, false, &tmp) && !tmp.empty())
             nl_tok = tmp[0];
     }
 
     // ── encode_for_tts: wrap text in chat template ───────────────────────
+    //
+    // Produces ONLY the assistant turn:
+    //   <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+    //
+    // The instruct text is NOT concatenated here — it's tokenized
+    // separately and injected as a separate prefill segment (see
+    // `instruct_overlay` below) so it doesn't shift the role-token
+    // alignment of `syn_tokens[0..2]` that downstream `role_embed`
+    // depends on.
+    //
+    // CRITICAL: a prior bug concatenated `instruct + req.text` here,
+    // causing the model to literally read the instruct string aloud.
     auto encode_for_tts = [&](const std::string& txt) -> std::vector<int32_t> {
-        std::vector<int32_t> toks;
-        // Tokenize text without special tokens
-        talker_->tokenize(txt, false, false, &toks);
+        std::vector<int32_t> text_toks;
+        talker_->tokenize(txt, false, false, &text_toks);
         // <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
         std::vector<int32_t> result;
         result.push_back(talker_->bos_token_id());   // <|im_start|>
         result.push_back(asst_tok);                  // assistant
         result.push_back(nl_tok);                    // \n
-        result.insert(result.end(), toks.begin(), toks.end());  // text
+        result.insert(result.end(), text_toks.begin(), text_toks.end());
         result.push_back(talker_->eos_token_id());   // <|im_end|>
         result.push_back(nl_tok);                    // \n
         result.push_back(talker_->bos_token_id());   // <|im_start|>
@@ -371,14 +418,64 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     };
 
     // ── Tokenize synthesis text in chat format ──────────────────────────
-    std::string syn_text = effective_instruct + req.text;
-    std::vector<int32_t> syn_tokens = encode_for_tts(syn_text);
+    std::vector<int32_t> syn_tokens = encode_for_tts(req.text);
+
+    // ── Tokenize instruct (emotion / style) — kept SEPARATE from text ──
+    // The instruct tokens are wrapped in a system-role turn and projected
+    // into a separate prefill segment prepended before the role tokens.
+    // This keeps syn_tokens[0..2] aligned as `<|im_start|>assistant\n`
+    // for role_embed, and gives the talker explicit emotion conditioning.
+    //
+    // The canonical Qwen3-TTS pattern uses the `system` role for emotion
+    // cues (e.g., "Speak in a happy, cheerful tone."). The user role is
+    // for content-bearing instructions and tends to confuse the Base
+    // variant into interpreting the cue as content to be read aloud.
+    std::vector<int32_t> instruct_tokens;  // full system-turn token seq
+    if (!effective_instruct.empty()) {
+        std::vector<int32_t> inst_text_toks;
+        talker_->tokenize(effective_instruct, false, false, &inst_text_toks);
+        // <|im_start|>system\n{instruct}<|im_end|>\n
+        instruct_tokens.push_back(talker_->bos_token_id());
+        instruct_tokens.push_back(sys_tok);  // system role (emotion cue)
+        instruct_tokens.push_back(nl_tok);
+        instruct_tokens.insert(instruct_tokens.end(), inst_text_toks.begin(), inst_text_toks.end());
+        instruct_tokens.push_back(talker_->eos_token_id());
+        instruct_tokens.push_back(nl_tok);
+    }
+    const int32_t n_instruct = static_cast<int32_t>(instruct_tokens.size());
+
+    // Also expose the raw text-to-speak tokens (excluding chat scaffolding)
+    // for downstream text_region / trailing_text_hidden assembly.
+    std::vector<int32_t> text_ids_raw;
+    {
+        talker_->tokenize(req.text, false, false, &text_ids_raw);
+    }
+    const int32_t n_text_raw = static_cast<int32_t>(text_ids_raw.size());
     if (syn_tokens.empty()) {
         if (error) *error = "empty input after tokenization";
         return false;
     }
     std::fprintf(stderr, "qwen3_tts: %zu syn tokens (chat format, mode=%d, variant=%s)\n",
                  syn_tokens.size(), static_cast<int>(mode), variant_name(config_.variant));
+    if (std::getenv("QWEN3TTS_DEBUG")) {
+        // Decode the content tokens (indices 3..size-9) back to text for sanity.
+        std::string decoded;
+        std::string ids_str;
+        for (size_t i = 0; i < syn_tokens.size(); ++i) {
+            std::string piece;
+            std::string piece_err;
+            const int32_t tid = syn_tokens[i];
+            const bool ok = talker_->token_to_piece(tid, &piece, &piece_err);
+            ids_str += std::to_string(tid) + (ok ? ":" + piece : ":<?>") + " ";
+            if (i >= 3 && i + 9 <= syn_tokens.size() && ok)
+                decoded += piece;
+        }
+        std::fprintf(stderr, "qwen3_tts: syn_tokens size=%zu, ids=[%s]\n",
+                     syn_tokens.size(), ids_str.c_str());
+        std::fprintf(stderr, "qwen3_tts: syn_text decoded='%s' (n_content=%d)\n",
+                     decoded.c_str(),
+                     static_cast<int>(syn_tokens.size()) - 9);
+    }
 
     // ── Resolve speaker token ────────────────────────────────────────────
     int32_t speaker_token = -1;
@@ -451,12 +548,16 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     const int32_t  overlay_len     = codec_input_len - 1; // all except codec_bos
 
     // ── Project special text tokens (bos, eos, pad) ─────────────────────
+    // REVERTED to chat-template IDs (talker_->bos_token_id / eos_token_id).
+    // The TTS-specific IDs (151672/151673/151671) collapsed the talker
+    // hidden state on 0.6B (RMS 0.002, near-silent). The chat-template
+    // IDs work for 0.6B. 1.7B needs a different fix (see compact-text
+    // mode and small_to_mtp projection diagnostics).
     std::vector<float> special_proj(static_cast<size_t>(3) * n_embd);
     {
         int32_t special_ids[3] = {talker_->bos_token_id(),
                                   talker_->eos_token_id(),
                                   static_cast<int32_t>(pad_idx)};
-        // Project pad through text_proj as well — fallback only
         talker_->project_text_tokens(special_ids, 3, special_proj.data(), error);
     }
     const float* tts_bos_embed = &special_proj[0];
@@ -538,48 +639,129 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         }
     }
 
-    // ── First synthesis text token + codec_bos ──────────────────────────
-    // syn_tokens[3] is the first content token (after role at 0-2)
-    std::vector<float> first_text_plus_codec_bos(static_cast<size_t>(n_embd));
-    {
-        float first_text_proj[8192]; // max hidden_size
-        talker_->project_single_token(syn_tokens[3], first_text_proj, error);
-        const float* codec_bos_row = codec_row(bos_idx);
-        for (int j = 0; j < n_embd; j++) {
-            first_text_plus_codec_bos[static_cast<size_t>(j)] =
-                first_text_proj[j] + (codec_bos_row ? codec_bos_row[j] : 0.0f);
+    // ── Synthesis text region ─────────────────────────────────────────────
+    // Two modes (selected at runtime via QWEN3TTS_COMPACT_TEXT env var):
+    //
+    //   STREAMING (default, canonical vllm-omni streaming mode):
+    //     - first_text + codec_bos goes into prefill
+    //     - remaining text tokens + tts_eos are streamed 1-per-AR-step
+    //     - good for long text (temporal alignment between text & audio)
+    //     - 0.6B handles short text fine in this mode
+    //
+    //   COMPACT (canonical vllm-omni non_streaming_mode):
+    //     - ALL text tokens + tts_eos go into prefill (each overlaid with
+    //       codec_pad), followed by a single (tts_pad + codec_bos)
+    //       transition frame
+    //     - AR loop feeds tts_pad every step (no per-step text)
+    //     - 1.7B requires this for short text — streaming mode leaves the
+    //       larger model with too little text context in the prefill and
+    //       it hallucinates ("bup bup bup", Korean, Chinese, etc).
+    const bool compact_text = std::getenv("QWEN3TTS_COMPACT_TEXT") != nullptr;
+    // n_syn_content is the number of raw text-to-speak tokens (excluding
+    // chat-template scaffolding). This is independent of whether an
+    // instruct user turn is present.
+    const int32_t n_syn_content = std::max(1, n_text_raw);
+
+    // text_region holds either [first_text+codec_bos] (streaming) or
+    // [text_tok + codec_pad]*N + [tts_eos + codec_pad] + [tts_pad + codec_bos]
+    // (compact).
+    std::vector<float> text_region;
+    int32_t text_region_len = 0;
+    if (compact_text) {
+        // All raw text tokens, then tts_eos terminator
+        const int32_t n_text = n_syn_content;
+        std::vector<int32_t> text_ids(static_cast<size_t>(n_text) + 1);
+        for (int32_t i = 0; i < n_text; i++)
+            text_ids[static_cast<size_t>(i)] = text_ids_raw[static_cast<size_t>(i)];
+        text_ids[static_cast<size_t>(n_text)] = talker_->eos_token_id();  // tts_eos
+
+        std::vector<float> text_proj_buf(static_cast<size_t>(n_text + 1) * n_embd);
+        talker_->project_text_tokens(text_ids.data(), n_text + 1,
+                                      text_proj_buf.data(), error);
+
+        // Each text position overlaid with codec_pad
+        const float* pad_row = codec_row(pad_idx);
+        text_region.resize(static_cast<size_t>(n_text + 2) * n_embd);
+        for (int32_t i = 0; i <= n_text; i++) {
+            const float* tp = &text_proj_buf[static_cast<size_t>(i) * n_embd];
+            float* dst = &text_region[static_cast<size_t>(i) * n_embd];
+            for (int j = 0; j < n_embd; j++)
+                dst[j] = tp[j] + (pad_row ? pad_row[j] : 0.0f);
         }
+        // Final transition frame: tts_pad + codec_bos
+        {
+            const float* bos_row = codec_row(bos_idx);
+            float* dst = &text_region[static_cast<size_t>(n_text + 1) * n_embd];
+            for (int j = 0; j < n_embd; j++)
+                dst[j] = tts_pad_embed[j] + (bos_row ? bos_row[j] : 0.0f);
+        }
+        text_region_len = n_text + 2;
+    } else {
+        // Streaming: just first_text + codec_bos
+        text_region.resize(static_cast<size_t>(n_embd));
+        float first_text_proj[8192];
+        talker_->project_single_token(text_ids_raw[0], first_text_proj, error);
+        const float* codec_bos_row = codec_row(bos_idx);
+        for (int j = 0; j < n_embd; j++)
+            text_region[static_cast<size_t>(j)] =
+                first_text_proj[j] + (codec_bos_row ? codec_bos_row[j] : 0.0f);
+        text_region_len = 1;
     }
 
     // ── Assemble prefill input ───────────────────────────────────────────
-    // [role(3)] [codec_overlay(overlay_len)] [first_text_plus_codec_bos(1)]
-    const int32_t prefill_len = 3 + overlay_len + 1;
+    // [instruct_overlay(n_instruct_proj)?] [role(3)] [codec_overlay(overlay_len)] [text_region(text_region_len)]
+    //
+    // The optional instruct overlay is the user-role turn
+    //   <|im_start|>user\n{instruct}<|im_end|>\n
+    // projected through text_proj and prepended so the talker sees the
+    // emotion cue BEFORE the assistant turn. It is only present when
+    // `req.instruct` is non-empty.
+    std::vector<float> instruct_proj_overlay;
+    if (n_instruct > 0) {
+        instruct_proj_overlay.resize(static_cast<size_t>(n_instruct) * n_embd);
+        talker_->project_text_tokens(instruct_tokens.data(), n_instruct,
+                                      instruct_proj_overlay.data(), error);
+        std::fprintf(stderr,
+                     "qwen3_tts: instruct overlay %d tokens (emotion conditioning)\n",
+                     n_instruct);
+    }
+    const int32_t prefill_len = n_instruct + 3 + overlay_len + text_region_len;
     std::vector<float> talker_input(static_cast<size_t>(prefill_len) * n_embd);
-    std::memcpy(talker_input.data(), role_embed.data(),
-                static_cast<size_t>(3) * n_embd * sizeof(float));
-    std::memcpy(&talker_input[static_cast<size_t>(3) * n_embd],
-                codec_overlay.data(),
-                static_cast<size_t>(overlay_len) * n_embd * sizeof(float));
-    std::memcpy(&talker_input[static_cast<size_t>(prefill_len - 1) * n_embd],
-                first_text_plus_codec_bos.data(),
-                static_cast<size_t>(n_embd) * sizeof(float));
+    {
+        size_t off = 0;
+        if (n_instruct > 0) {
+            std::memcpy(talker_input.data() + off * n_embd,
+                        instruct_proj_overlay.data(),
+                        static_cast<size_t>(n_instruct) * n_embd * sizeof(float));
+            off += static_cast<size_t>(n_instruct);
+        }
+        std::memcpy(talker_input.data() + off * n_embd, role_embed.data(),
+                    static_cast<size_t>(3) * n_embd * sizeof(float));
+        off += 3;
+        std::memcpy(talker_input.data() + off * n_embd,
+                    codec_overlay.data(),
+                    static_cast<size_t>(overlay_len) * n_embd * sizeof(float));
+        off += static_cast<size_t>(overlay_len);
+        std::memcpy(talker_input.data() + off * n_embd,
+                    text_region.data(),
+                    static_cast<size_t>(text_region_len) * n_embd * sizeof(float));
+    }
 
     // ── Trailing text hidden states (for AR loop overlay) ───────────────
-    // syn_tokens[4..n_tokens-1] are projected through text_proj,
-    // then tts_eos is appended. The trailing positions from the chat template
-    // after the content tokens are dropped (the reference uses n_tokens-9
-    // to omit the template-closing tokens).
-    const int32_t n_syn_content = static_cast<int32_t>(syn_tokens.size()) - 9; // drop template closing
+    // Compact mode: nothing to stream — AR loop feeds tts_pad every step.
+    // Streaming mode: text_ids_raw[1..] + tts_eos streamed 1-per-step.
     std::vector<float> trailing_text_hidden;
-    {
-        // trailing content tokens start at index 4 (after role + first content)
-        const int32_t n_trail = std::max(0, n_syn_content);
+    if (compact_text) {
+        // Just tts_pad — AR loop will use tts_pad_embed via fallback.
+        trailing_text_hidden.resize(0);
+    } else {
+        // Stream tokens after the first one (first is in prefill).
+        const int32_t n_trail = std::max(0, n_text_raw - 1);
         trailing_text_hidden.resize(static_cast<size_t>(n_trail + 1) * n_embd);
         if (n_trail > 0) {
-            talker_->project_text_tokens(&syn_tokens[4], n_trail,
+            talker_->project_text_tokens(&text_ids_raw[1], n_trail,
                                           trailing_text_hidden.data(), error);
         }
-        // Append tts_eos at the end
         std::memcpy(&trailing_text_hidden[static_cast<size_t>(n_trail) * n_embd],
                     tts_eos_embed, static_cast<size_t>(n_embd) * sizeof(float));
     }
@@ -600,6 +782,32 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                                      talker_hidden.data(), error)) {
         return false;
     }
+
+    // Diagnostic: verify prefill components and output for NaN
+    if (std::getenv("QWEN3TTS_DEBUG")) {
+        auto vec_stats = [](const float* p, size_t n, const char* label) {
+            double mn = 1e30, mx = -1e30, sum = 0, sum_sq = 0;
+            int nan_cnt = 0;
+            for (size_t i = 0; i < n; i++) {
+                float v = p[i];
+                if (std::isnan(v)) { nan_cnt++; continue; }
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += v; sum_sq += double(v) * v;
+            }
+            double mean = nan_cnt ? 0.0 : sum / n;
+            double var  = nan_cnt ? 0.0 : sum_sq / n - mean * mean;
+            std::fprintf(stderr, "  [%s] n=%zu nan=%d min=%.4f max=%.4f mean=%.4f std=%.4f\n",
+                         label, n, nan_cnt, mn, mx, mean, std::sqrt(std::max(0.0, var)));
+        };
+        vec_stats(role_embed.data(), 3 * n_embd, "role_embed");
+        vec_stats(codec_overlay.data(), overlay_len * n_embd, "codec_overlay");
+        vec_stats(text_region.data(), text_region_len * n_embd, "text_region");
+        vec_stats(talker_input.data(), prefill_len * n_embd, "talker_input");
+        vec_stats(talker_hidden.data(), prefill_len * n_embd, "talker_hidden");
+        if (has_vc_spk) vec_stats(vc_spk_emb.data(), vc_spk_emb.size(), "vc_spk_emb");
+    }
+
 
     // The last token's hidden state (first_text + codec_bos position) is
     // the conditioning vector for the code predictor.
@@ -622,8 +830,16 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
 
     const int32_t max_steps = req.max_new_tokens > 0
         ? req.max_new_tokens : config_.max_new_tokens;
-    const int32_t n_total_books = 32;
-    const int32_t n_fine_books = 31;
+    // Qwen3-TTS 12Hz codec: 16 codebooks total = 1 coarse (cb0, sampled by
+    // the talker's codec_head) + 15 fine (cb1..cb15, predicted by the
+    // predictor's MTP loop). Matches the codec GGUF `rvq=16` metadata and
+    // the predictor's codec_embd.{0..14}.weight tensor count. The previous
+    // 32/31 values caused predict_one_step's n_fine_books sanity check to
+    // fail (31 != 15), forcing a fallback through forward_tokens whose
+    // cb_vocab = vocab_size/32 math was wrong, producing random fine codes
+    // and ultimately unintelligible audio.
+    const int32_t n_total_books = 16;
+    const int32_t n_fine_books  = 15;
 
     // Code matrix: [n_total_books × max_steps]
     std::vector<int32_t> code_matrix((size_t)n_total_books * max_steps, 0);
@@ -664,6 +880,18 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
                 if (i != CODEC_EOS) c0_logits[(size_t)i] = -INFINITY;
             }
 
+            // Min-length guard: don't allow CODEC_EOS until the model has
+            // generated at least min_eos_step frames. Without this, the
+            // moment the trailing-text overlay feeds tts_eos_embed (at
+            // step == trailing_len), the model emits codec_eos and the
+            // audio collapses to a single word ("Hello"). Forcing a
+            // minimum of ~1 second of audio (12 frames) past the trailing
+            // text gives the talker time to actually synthesise the words.
+            const int32_t min_eos_step = trailing_len + 12;
+            if (step < min_eos_step) {
+                c0_logits[(size_t)CODEC_EOS] = -INFINITY;
+            }
+
             // Repetition penalty on previously generated CB0 tokens
             const float rp = req.repetition_penalty;
             if (rp != 1.0f) {
@@ -691,6 +919,11 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         }
         code_matrix[(size_t)0 * max_steps + step] = code_0;
         generated_cb0.insert(code_0);
+        // Debug: first 5 steps log cb0 + top logits
+        if (step < 5 && std::getenv("QWEN3TTS_DEBUG")) {
+            std::fprintf(stderr, "  ar[%d]: cb0=%d (unique=%zu)\n",
+                         step, code_0, generated_cb0.size());
+        }
 
         // ── 3b. MTP loop: predict 31 fine codebooks ───
         std::vector<int32_t> fine_codes((size_t)n_fine_books, 0);
@@ -703,10 +936,32 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
             pred_input[(size_t)(i + 1)] = prev_fine[(size_t)i];
         }
 
+        // layer0_embed = talker's codec_embedding[code_0] at talker hidden.
+        // The predictor's predict_one_step internally projects this through
+        // small_to_mtp (1.7B) or uses it directly (0.6B). This must NOT be
+        // the token-id array — that path was a regression that produced
+        // unintelligible, high-pitched screeching on 1.7B.
+        std::vector<float> layer0_embed_vec;
+        const float* layer0_embed_ptr = nullptr;
+        if (talker_->codec_embedding() && code_0 >= 0 && code_0 < codec_vocab) {
+            layer0_embed_vec.assign(
+                talker_->codec_embedding() + static_cast<size_t>(code_0) * ce_dim,
+                talker_->codec_embedding() + static_cast<size_t>(code_0) * ce_dim + ce_dim);
+            layer0_embed_ptr = layer0_embed_vec.data();
+        }
+
         bool mtp_ok = false;
-        if (predictor_->has_mtp()) {
+        // Diagnostic bypass: when QWEN3TTS_NO_MTP=1, skip the predictor
+        // entirely and emit zero fine codes. Helps isolate whether the
+        // 1.7B distortion comes from the predictor or the talker.
+        const bool no_mtp = std::getenv("QWEN3TTS_NO_MTP") != nullptr;
+        if (no_mtp) {
+            for (int i = 0; i < n_fine_books; i++) fine_codes[i] = 0;
+            mtp_ok = true;
+        } else if (predictor_->has_mtp() && layer0_embed_ptr) {
             if (predictor_->predict_one_step(cur_hidden.data(),
-                                             pred_input.data(),
+                                             layer0_embed_ptr,
+                                             code_0,
                                              n_fine_books,
                                              fine_codes.data(), error)) {
                 mtp_ok = true;
@@ -793,18 +1048,49 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         }
 
         // ── 3e. Build next input embedding ───
-        // Sum all 32 code embeddings + trailing text overlay
+        // Canonical vllm-omni Qwen3TTSTalkerForConditionalGeneration.talker_mtp
+        // (GPU fast-path in vllm_omni/.../qwen3_tts_talker.py):
+        //   last_id_hidden = input_embeds.reshape(bsz, 1, -1)
+        //                   # = embed_input_ids(prev_code_0) — talker codec_embedding
+        //   audio_codes    = self.code_predictor(
+        //                       layer0_code=prev_code_0,
+        //                       layer0_embed=last_id_hidden,
+        //                       last_talker_hidden=past_hidden, ...)  # past_hidden
+        //                                                       # only conditions
+        //                                                       # the predictor
+        //   residual_ids_t = audio_codes[:, 1:]               # the 15 fine codes
+        //   embeds = [last_id_hidden]
+        //   for i in range(max_steps):
+        //       embeds.append(code_predictor.get_input_embeddings()[i](
+        //                         residual_ids_t[:, i:i+1]))
+        //   summed = torch.cat(embeds, dim=1).sum(1, keepdim=True)
+        //   inputs_embeds_out = (summed + text_step).reshape(bsz, -1)
+        //
+        // NOTE: past_hidden (the previous talker output) is NOT added to the
+        // next input embedding. It only conditions the predictor. The talker
+        // transformer itself carries state across steps via its KV cache.
+        // Adding cur_hidden here (a previous regression) double-counts the
+        // residual stream and was responsible for the heavy clipping and
+        // wrong-word outputs ("Hello world" → "Because you're not ill").
         std::vector<float> next_embd(static_cast<size_t>(n_embd), 0.0f);
 
+        // Diagnostic: track component magnitudes for collapse debugging
+        double mag_cur_hidden = 0.0, mag_codec = 0.0, mag_fine = 0.0, mag_text = 0.0;
+        for (int j = 0; j < n_embd; j++) {
+            double ch = cur_hidden[static_cast<size_t>(j)];
+            mag_cur_hidden += ch * ch;
+        }
+        mag_cur_hidden = std::sqrt(mag_cur_hidden);
+
         if (talker_->codec_embedding()) {
-            // Coarse code (codebook 0) uses talker's codec_embedding
+            // (b1) Coarse code (codebook 0) uses talker's codec_embedding
             int32_t c0 = std::max(0, code_0);
             if (c0 < talker_->codec_vocab()) {
                 const float* c0_row = talker_->codec_embedding() + static_cast<size_t>(c0) * ce_dim;
                 for (int d = 0; d < ce_dim; d++) next_embd[static_cast<size_t>(d)] += c0_row[d];
             }
 
-            // Fine codes use predictor's fine_embd tables
+            // (b2) Fine codes use predictor's fine_embd tables at talker hidden
             const int32_t fe_dim = predictor_->fine_embd_dim();
             for (int i = 0; i < n_fine_books; i++) {
                 int32_t cid = fine_codes[static_cast<size_t>(i)];
@@ -819,12 +1105,27 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
             }
         }
 
-        // Add trailing text overlay (temporal alignment: one text token per frame)
+        // (c) trailing text overlay (temporal alignment: one text token per
+        // frame). Once trailing_len is exhausted, fall back to tts_pad_embed
+        // so the model knows text conditioning has ended.
         const float* trail_row = (step < trailing_len)
             ? &trailing_text_hidden[static_cast<size_t>(step) * n_embd]
             : tts_pad_embed;
         for (int j = 0; j < n_embd; j++)
             next_embd[static_cast<size_t>(j)] += trail_row[j];
+
+        // Diagnostic: log magnitudes for first 5 steps and at multiples of 25
+        if (step < 5 || (step % 25) == 0) {
+            double mag_next = 0.0;
+            for (int j = 0; j < n_embd; j++) {
+                double v = next_embd[static_cast<size_t>(j)];
+                mag_next += v * v;
+            }
+            mag_next = std::sqrt(mag_next);
+            std::fprintf(stderr, "  ar[%d]: |cur_hidden|=%.4f |next_embd|=%.4f cb0=%d fine0=%d fine14=%d\n",
+                         step, mag_cur_hidden, mag_next, code_0,
+                         fine_codes[0], fine_codes[n_fine_books - 1]);
+        }
 
         // Run talker on this single token to get next hidden
         if (!talker_->forward_embeddings(next_embd.data(), 1,
