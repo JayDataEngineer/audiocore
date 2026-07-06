@@ -1,118 +1,111 @@
 # ACE-Step Detokenizer Gap
 
-**Status:** Open (text_to_music produces temporally-incoherent noise)
+**Status:** Detokenizer transformer implemented (cover-mode ready); text_to_music quality issue is separate (under investigation)
 **Found:** 2026-07-05
-**Severity:** High — text_to_music mode unusable until resolved
+**Updated:** 2026-07-06
 
 ## Summary
 
-The LM (5 Hz FSQ codes) → DiT (25 Hz latents) bridge in our C++ ACE-Step
-port is incomplete. The upstream model uses a **2-layer transformer
-detokenizer** to project FSQ codes into the 64-D latent space that the DiT
-consumes as `src` conditioning; we currently feed raw 6-D FSQ values padded
-to 64-D, which the DiT cannot meaningfully refine.
+The C++ ACE-Step port now has a working `DetokenizerRunner`
+(`src/models/ace_step/detokenizer_runner.cpp`) that mirrors the upstream
+`AudioTokenDetokenizer` + `ResidualFSQ.project_out` path. It is wired into
+`AceStepSession::run_dit_and_vae` but only **invoked for future cover-mode
+support** — for text_to_music, upstream uses `silence_latent` as the DiT src,
+NOT the detokenized LM codes (verified in
+`diffusers/pipelines/ace_step/pipeline_ace_step.py:626` `prepare_src_latents`).
 
-The musical structure (chord progression, rhythm sketch, phrasing) lives in
-the LM code sequence — but only after the detokenizer transformer has
-*interpreted* those codes. The DiT then refines the detokenized latents;
-it cannot infer musical structure from raw FSQ indices on its own.
+The remaining text_to_music audio-quality issue (weak bass, spectral peaks
+at 6/12 kHz) is **NOT** caused by the detokenizer path — output is identical
+with seed=42 whether src=silence_latent or src=detokenized codes, suggesting
+the DiT is not meaningfully using the src channel for text_to_music.
 
-## Evidence
-
-### Tensor names actually present in our 1.5 Turbo checkpoint
-
-```
-detokenizer.embed_tokens.weight      [2048, 2048]   # vocab=2048, dim=2048
-detokenizer.special_tokens           [2048, 5]      # per-code special flags
-detokenizer.proj_out.weight          [64, 2048]     # 2048 → 64
-detokenizer.layers.0.{...}           Qwen3-style block
-detokenizer.layers.1.{...}           Qwen3-style block
-```
-
-(plus `decoder.fsq_proj.*` keys do **not** exist in this checkpoint)
-
-### Architecture (reconstructed from tensor shapes)
+## Architecture (verified against the 1.5 Turbo checkpoint)
 
 ```
-Input:    music_codes[N, 5Hz]              # int indices in [0, 2048)
-        ↓ embed_tokens (vocab=2048, dim=2048)
-        ↓ + special_tokens[code, 0..4] broadcast
-Embed:    h[N, 2048]
-        ↓ 2× Qwen3-style transformer layers
-Hidden:   h[N, 2048]
-        ↓ proj_out (2048 → 64)
-Latent:   z[N, 64] at 5 Hz
-        ↓ repeat each frame 5×
-Latent:   z[N*5, 64] at 25 Hz  ← feeds DiT src channels (0..63)
+detokenizer.embed_tokens.weight      [2048, 2048]   Linear (Q8_0) + bias [2048]
+detokenizer.special_tokens           [2048, 5]      P=5 learnable patch offsets (Q8_0)
+detokenizer.layers.{0,1}                            2× Qwen3-style encoder layers
+  .input_layernorm.weight            [2048]         RMSNorm γ (F32)
+  .post_attention_layernorm.weight   [2048]         RMSNorm γ (F32)
+  .self_attn.{q,k,v,o}_proj.weight   Q8_0           GQA: 16 Q-heads, 8 KV-heads, hd=128
+  .self_attn.{q,k}_norm.weight       [128]          per-head RMSNorm γ (F32)
+  .mlp.{gate,up,down}_proj.weight    Q8_0           SwiGLU, intermediate=6144
+detokenizer.norm.weight              [2048]         final RMSNorm γ (F32)
+detokenizer.proj_out.weight          [2048, 64]     Linear (Q8_0) + bias [64]
+
+tokenizer.quantizer.project_in.weight  [2048, 6]    BF16 — FSQ front projection
+tokenizer.quantizer.project_out.weight [6, 2048]    BF16 — FSQ back projection
 ```
 
-### What the codebase does today (`src/models/ace_step/session.cpp`)
+Config constants from `configuration_acestep_v15.py`:
+`hidden_size=2048`, `num_attention_heads=16`, `num_key_value_heads=8`,
+`head_dim=128`, `intermediate_size=6144`, `pool_window_size=5`,
+`audio_acoustic_hidden_dim=64`, `rms_norm_eps=1e-6`, `rope_theta=1e6`,
+`fsq_input_levels=[8,8,8,5,5,5]` (64 000 codes).
 
-The fallback path pads the 6-D FSQ-decoded vector to 64-D and feeds *that*
-into the DiT src channels:
+## Forward pass
 
-```cpp
-// No learned weights: simple pad (6 → 64) with the FSQ values
-for (int d = 0; d < 6 && d < out_ch; d++)
-    projected[d] = f6[d];
+```
+LM codes [N, 5Hz] (int32 in [0, 64000))
+  → fsq_decode_one (mixed-radix → 6-D via FSQ implicit codebook)
+  → tokenizer.quantizer.project_out (Linear 6 → 2048, BF16)
+  → detokenizer transformer:
+      · embed_tokens Linear (2048 → 2048, Q8_0) + bias
+      · expand each token to P=5 patches, add learnable special_tokens
+      · 2× Qwen3-style encoder layers:
+          - pre-norm RMSNorm
+          - GQA self-attention (bidirectional within each P=5 group,
+            QK-norm, RoPE θ=1e6)
+          - residual
+          - pre-norm RMSNorm + SwiGLU MLP
+          - residual
+      · final RMSNorm
+      · proj_out Linear (2048 → 64, Q8_0) + bias
+  → 25 Hz × 64-D latents
 ```
 
-This is structurally meaningless: the DiT cannot recover chord/rhythm
-information from raw FSQ index values, regardless of how many diffusion
-steps are run on top.
+The per-group (P=5) bidirectional attention is implemented via
+`ggml_flash_attn_ext` with `ne3=N` (batched) so each group of 5 patches
+attends only within itself.
 
-### Effect
+## Where the detokenizer IS used (upstream)
 
-- DiT output per-channel mean ≈ 0, std ≈ random — no temporal structure
-- VAE-decoded PCM is white-noise-like
-- cloud_vlm reports "loud mechanical or motor-like sound" / "continuous
-  unstructured hissing"
+`pipeline_ace_step.py:prepare_src_latents`:
+1. **audio_codes provided** (cover from codes): parse codes → indices
+   `[batch, T, num_quantizers=6]` → `quantizer.get_output_from_indices`
+   → `detokenizer(quantized)` → src_latents
+2. **src_audio provided + task=cover**: VAE-encode audio → tokenize →
+   detokenize → src_latents
 
-Cover mode and repaint mode do **not** hit this gap — they use
-`cover_latent_cond_` / `repaint_latent_cond_` which bypass the FSQ path
-entirely. Only text_to_music is affected.
+## Where the detokenizer is NOT used (upstream)
 
-## Why the docs said "MLP"
+3. **text_to_music (no source)**: `src_latents = silence_latent` (cropped
+   or tiled to target length). The DiT learns "given silence as src +
+   text conditioning, generate music."
 
-The earlier note (`notes/ace-step-pipeline.md`) describes the FSQ projection
-as a "Learned MLP (6→2048→SiLU→LayerNorm→64)". This was likely an inference
-from a stale or different checkpoint. The 1.5 Turbo model on disk has the
-2-layer transformer described above, not an MLP — verified by inspecting
-`detokenizer.*` tensor shapes directly.
+The LM codes produced in step 1 (run_lm) drive text_to_music generation
+only **indirectly** — they were the output of an autoregressive LM that
+already happened; the DiT is conditioned on the **text encoder output**,
+not on the LM codes or their detokenized reconstruction.
 
-## Required work
+## Why text_to_music output is still poor
 
-1. **Bind detokenizer tensors** in `AceStepSession` (or a dedicated
-   `detokenizer_runner.cpp` mirroring `vae_runner.cpp`):
-   - `detokenizer.embed_tokens.weight`
-   - `detokenizer.special_tokens`
-   - `detokenizer.proj_out.weight` (+ bias if present)
-   - `detokenizer.layers.{0,1}.*` (attention + MLP, Qwen3-style with RoPE)
+Same audio output (seed=42) with src=silence_latent vs src=detokenized
+codes → the DiT is not meaningfully using the src channel for
+text_to_music. The issue is in the DiT itself or in how we're feeding
+the text conditioning. Hypotheses to investigate:
 
-2. **Build a ggml graph** that:
-   - Embeds the FSQ codes via `embed_tokens`
-   - Adds the broadcast `special_tokens` row
-   - Runs 2 transformer layers (use llama.cpp's existing Qwen3 building
-     blocks — same family as our Qwen3 LM)
-   - Projects to 64-D via `proj_out`
-   - Repeats each 5 Hz frame 5× to reach 25 Hz
+- Text encoder output (TE hidden states) shape/scale mismatch
+- proj_in patchify stride correctness
+- Time embedding modulation scale
+- CFG scale interactions with the turbo variant
+- RoPE θ mismatch between our DiT and the checkpoint
 
-3. **Replace the fallback path** in `run_dit_and_vae` so the resulting
-   64-D latent at 25 Hz populates `fsq_latent` instead of the padded
-   fallback. The downstream src-channel copy (already wired) then does
-   the right thing.
+These are tracked separately from the detokenizer work.
 
-4. **Verify** via cloud_vlm on a generated clip: "describe the music"
-   should yield musical descriptors (key, tempo, instrumentation) rather
-   than noise descriptors.
+## Related files
 
-## Related
-
-- `notes/ace-step-pipeline.md` — older architecture note (now outdated
-  on the FSQ path)
-- `notes/GAPS.md` — lists text_to_music as ✅; this entry supersedes
-  that claim for our 1.5 Turbo port
-- `src/models/ace_step/session.cpp` — `run_dit_and_vae` step 1 (FSQ
-  decode) is where the fallback path lives
-- `src/models/ace_step/vae_runner.cpp` — pattern to mirror for a
-  `detokenizer_runner.cpp`
+- `src/models/ace_step/detokenizer_runner.cpp` — the implemented detokenizer
+- `src/models/ace_step/session.cpp` — `run_dit_and_vae` text_to_music path
+- `src/models/ace_step/dit_runner.cpp` — DiT graph builder (under investigation)
+- `notes/ace-step-pipeline.md` — older architecture note (FSQ section outdated)
