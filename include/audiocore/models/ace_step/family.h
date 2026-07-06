@@ -32,6 +32,7 @@
 #include "audiocore/models/qwen3/runner.h"
 #include "audiocore/models/ace_step/dit_runner.h"
 #include "audiocore/models/ace_step/vae_runner.h"
+#include "audiocore/models/ace_step/detokenizer_runner.h"
 
 #include "ggml.h"
 
@@ -123,6 +124,7 @@ private:
     std::unique_ptr<qwen3::Runner> te_;   // Qwen3-Embedding text encoder
     std::unique_ptr<DiTRunner>     dit_runner_;   // DiT graph builder
     std::unique_ptr<VAERunner>     vae_runner_;   // VAE decoder
+    std::unique_ptr<DetokenizerRunner> detokenizer_runner_;  // FSQ codes → 25 Hz latents
 
     ggml_context*  ext_ctx_   = nullptr;  // DiT (decoder.*) + VAE (vae.decoder.*).
     // Anchored hot tensors. DiT names are unprefixed; VAE names are

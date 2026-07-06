@@ -387,6 +387,7 @@ bool AceStepSession::load(const std::string& model_path,
     // (5d) Construct DiTRunner and VAERunner.
     dit_runner_ = std::make_unique<DiTRunner>(ext_ctx_, cfg_.dit);
     vae_runner_ = std::make_unique<VAERunner>(ext_ctx_);
+    detokenizer_runner_ = std::make_unique<DetokenizerRunner>(ext_ctx_);
 
     // (5d) Compute FSQ code offset: audio codes are the last 64000 tokens
     //      in the LM's vocabulary (appended after the Qwen3 BPE tokens).

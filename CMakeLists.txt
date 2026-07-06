@@ -96,6 +96,12 @@ add_library(audiocore_framework STATIC
     src/models/ace_step/session.cpp
     src/models/ace_step/dit_runner.cpp
     src/models/ace_step/vae_runner.cpp
+    src/models/ace_step/detokenizer_runner.cpp
+    # MOSS-SoundEffect-v2 (diffusion transformer + DAC VAE decoder):
+    src/models/moss_sfx_v2/loader.cpp
+    src/models/moss_sfx_v2/dit_runner.cpp
+    src/models/moss_sfx_v2/session.cpp
+    src/models/moss_sfx_v2/vae_runner.cpp
     # Qwen3-TTS (C++ via llama.cpp; Stage 17 codec + Stage 17b speaker encoder from CrispASR/MIT):
     src/models/qwen3_tts/loader.cpp
     src/models/qwen3_tts/session.cpp
@@ -198,6 +204,10 @@ target_link_libraries(convert_qwen3tts PRIVATE audiocore_framework)
 # unchanged. See docs/MODEL-GAPS.md Gap J.
 add_executable(convert_ecapa tools/convert_ecapa.cpp)
 target_link_libraries(convert_ecapa PRIVATE audiocore_framework)
+
+# MOSS-SoundEffect-v2 safetensors → GGUF converter.
+add_executable(convert_mse2 tools/convert_mse2.cpp)
+target_link_libraries(convert_mse2 PRIVATE audiocore_framework)
 
 # GGUF inspector — dump tensor names, shapes, and sizes. Useful for debugging
 # GGUF layout issues (e.g. truncated files, mismatched tensor counts).

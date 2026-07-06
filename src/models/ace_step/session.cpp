@@ -442,117 +442,50 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
         return false;
     }
 
-    // ── 1. FSQ decode: codes → 6D → upsample 5→25 Hz (skipped for cover) ──
-    // For cover mode the FSQ decode is replaced by cover_latent_cond_ which
-    // already holds VAE-encoded + temporally-smoothed source latents.
-    // For non-cover (text_to_music): the upstream projects the 6D FSQ vectors
-    // through a learned MLP (6 → 2048 → SiLU → LayerNorm → 64). The result
-    // is the structural source latent fed into the DiT context's src channels
-    // (0..63). Without this, the DiT has no musical structure conditioning
+    // ── 1. Detokenize LM codes → 25 Hz structural source latent ────────────
+    // For cover mode this is replaced by cover_latent_cond_ which already
+    // holds VAE-encoded + temporally-smoothed source latents.
+    // For text_to_music: the LM codes (5 Hz, single int per frame) are run
+    // through the detokenizer transformer (embed_tokens → 5-patch expansion
+    // + special_tokens → 2× Qwen3-style encoder layers → proj_out) to
+    // produce the 25 Hz × 64-D src latent fed into the DiT context channels
+    // 0..63. Without this path the DiT has no musical-structure conditioning
     // and produces temporally-incoherent noise output.
+    //
+    // See docs/ACE-STEP-DETOKENIZER-GAP.md for the architecture reference.
     std::vector<float> fsq_latent;
     if (!is_cover_mode) {
-        fsq_latent.assign(static_cast<size_t>(n_frames) * out_ch, 0.0f);
+        const bool has_detokenizer =
+            (ggml_get_tensor(ext_ctx_, "detokenizer.embed_tokens.weight") != nullptr) &&
+            (ggml_get_tensor(ext_ctx_, "tokenizer.quantizer.project_out.weight") != nullptr);
 
-        // Try learned FSQ projection weights
-        ggml_tensor* fsq_proj_w = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.0.weight");
-        if (!fsq_proj_w) fsq_proj_w = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.0.weight");
-        ggml_tensor* fsq_out_w  = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.2.weight");
-        if (!fsq_out_w) fsq_out_w = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.2.weight");
-        ggml_tensor* fsq_norm_w = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.1.weight");
-        if (!fsq_norm_w) fsq_norm_w = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.1.weight");
-
-        const bool has_fsq_mlp = (fsq_proj_w && fsq_out_w);
-
-        // Per 5-Hz frame: decode → project/unpad → repeat 5× at 25 Hz
-        for (int32_t i = 0; i < n_codes_5; i++) {
-        float f6[6];
-        fsq_decode_one(music_codes[static_cast<size_t>(i)], f6);
-
-        float projected[64] = {0};
-
-        if (has_fsq_mlp) {
-            // Learned MLP: 6 → 2048 → SiLU → LayerNorm → 64
-            const float* w1 = static_cast<const float*>(fsq_proj_w->data);
-            const int32_t w1_dim = static_cast<int32_t>(fsq_proj_w->ne[0]);
-
-            // Linear 6 → w1_dim (usually 2048)
-            float h2048[2048] = {0};
-            const int32_t mlp_hidden = std::min(2048, w1_dim);
-            for (int j = 0; j < mlp_hidden; j++) {
-                float s = 0.0f;
-                for (int k = 0; k < 6; k++) {
-                    s += f6[k] * w1[static_cast<size_t>(j) + static_cast<size_t>(k) * w1_dim];
-                }
-                // Bias if present
-                ggml_tensor* fsq_proj_b = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.0.bias");
-                if (!fsq_proj_b) fsq_proj_b = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.0.bias");
-                s += fsq_proj_b ? static_cast<const float*>(fsq_proj_b->data)[j] : 0.0f;
-                h2048[static_cast<size_t>(j)] = s;
+        if (has_detokenizer && detokenizer_runner_) {
+            // Primary path: 2-layer transformer detokenizer (matches upstream
+            // AudioTokenDetokenizer + ResidualFSQ.project_out).
+            if (!detokenizer_runner_->decode(music_codes.data(), n_codes_5,
+                                              &fsq_latent, error)) {
+                return false;
             }
-
-            // SiLU activation
-            for (int j = 0; j < mlp_hidden; j++) {
-                float v = h2048[static_cast<size_t>(j)];
-                h2048[static_cast<size_t>(j)] = v / (1.0f + std::exp(-v));
-            }
-
-            // LayerNorm (if weight available)
-            if (fsq_norm_w) {
-                const float* nw = static_cast<const float*>(fsq_norm_w->data);
-                float mean = 0.0f, var = 0.0f;
-                for (int j = 0; j < mlp_hidden; j++) mean += h2048[static_cast<size_t>(j)];
-                mean /= mlp_hidden;
-                for (int j = 0; j < mlp_hidden; j++) {
-                    float d = h2048[static_cast<size_t>(j)] - mean;
-                    var += d * d;
-                }
-                var /= mlp_hidden;
-                const float inv_std = 1.0f / std::sqrt(var + 1e-5f);
-                for (int j = 0; j < mlp_hidden; j++) {
-                    h2048[static_cast<size_t>(j)] = (h2048[static_cast<size_t>(j)] - mean) * inv_std * nw[j];
-                }
-                // Bias
-                ggml_tensor* fsq_norm_b = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.1.bias");
-                if (!fsq_norm_b) fsq_norm_b = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.1.bias");
-                if (fsq_norm_b) {
-                    const float* nb = static_cast<const float*>(fsq_norm_b->data);
-                    for (int j = 0; j < mlp_hidden; j++)
-                        h2048[static_cast<size_t>(j)] += nb[j];
-                }
-            }
-
-            // Output projection: mlp_hidden → 64
-            const float* w2 = static_cast<const float*>(fsq_out_w->data);
-            const int32_t w2_out = std::min(64, static_cast<int32_t>(fsq_out_w->ne[0]));
-            for (int j = 0; j < w2_out; j++) {
-                float s = 0.0f;
-                for (int k = 0; k < mlp_hidden; k++) {
-                    s += h2048[static_cast<size_t>(k)] *
-                         w2[static_cast<size_t>(j) + static_cast<size_t>(k) * static_cast<size_t>(fsq_out_w->ne[0])];
-                }
-                projected[static_cast<size_t>(j)] = s;
-            }
-            // Bias
-            ggml_tensor* fsq_out_b = ggml_get_tensor(ext_ctx_, "decoder.fsq_proj.2.bias");
-            if (!fsq_out_b) fsq_out_b = ggml_get_tensor(ext_ctx_, "vae.fsq_proj.2.bias");
-            if (fsq_out_b) {
-                const float* ob = static_cast<const float*>(fsq_out_b->data);
-                for (int j = 0; j < w2_out; j++)
-                    projected[static_cast<size_t>(j)] += ob[j];
-            }
+            // detokenizer_runner_ emits [N * 5 * 64] (time-major at 25 Hz).
+            // n_frames is already N * 5 (set above from music_codes.size() * 5).
+            fprintf(stderr, "[ace_step] detokenizer produced %zu latent values "
+                    "(expected %d)\n", fsq_latent.size(), n_frames * out_ch);
         } else {
-            // No learned weights: simple pad (6 → 64) with the FSQ values
-            for (int d = 0; d < 6 && d < out_ch; d++)
-                projected[static_cast<size_t>(d)] = f6[d];
+            // Legacy fallback: pad the 6-D FSQ values to 64-D and repeat 5×.
+            // Kept for checkpoints without the detokenizer.* tensors.
+            fsq_latent.assign(static_cast<size_t>(n_frames) * out_ch, 0.0f);
+            for (int32_t i = 0; i < n_codes_5; i++) {
+                float f6[6];
+                fsq_decode_one(music_codes[static_cast<size_t>(i)], f6);
+                float projected[64] = {0};
+                for (int d = 0; d < 6 && d < out_ch; d++)
+                    projected[d] = f6[d];
+                for (int j = 0; j < 5; j++) {
+                    std::memcpy(&fsq_latent[static_cast<size_t>(i * 5 + j) * out_ch],
+                                projected, static_cast<size_t>(out_ch) * sizeof(float));
+                }
+            }
         }
-
-        // Repeat each 5 Hz frame 5× to get 25 Hz
-        for (int j = 0; j < 5; j++) {
-            std::memcpy(&fsq_latent[static_cast<size_t>(i * 5 + j) * out_ch],
-                        projected, static_cast<size_t>(out_ch) * sizeof(float));
-        }
-    }
     }  // end if (!is_cover_mode)
 
     // ── 2. Prepare conditioning for DiT ─────────────────────────────────────
@@ -1044,6 +977,7 @@ bool AceStepSession::run_music(const void* request, void* response,
 AceStepSession::~AceStepSession() {
     dit_runner_.reset();
     vae_runner_.reset();
+    detokenizer_runner_.reset();
     if (owns_ext_ctx_ && ext_ctx_) {
         ggml_free(ext_ctx_);
         ext_ctx_ = nullptr;
