@@ -156,27 +156,29 @@ static void conv1d_k2_s1_p0(const float* x, int32_t T, int32_t IC, int32_t OC,
 }
 
 // ── Patchify proj_in: stride=P non-overlapping patch + linear ──────────
-// Ported from HOT-Step engine/src/dit-graph.h:583-592.
-// Input  x: [T, IC]     raw context (192 channels per frame)
-// Weight w: ne=[P, IC, H], element [p, ic, h] at offset p + ic*P + h*P*IC
-// Output y: [T/P, H]    hidden state patches
-// T must be divisible by P.
+// Matches PyTorch nn.Conv1d(in_channels=IC, out_channels=H, kernel_size=P,
+// stride=P, padding=0). The GGUF stores the weight in PyTorch's natural
+// C-order of shape (out=H, in=IC, K=P), so weight[oc, ic, k] lives at
+// flat[oc*IC*K + ic*K + k] in the raw buffer. The ggml tensor's ne array is
+// the reversed PyTorch shape [K, IC, H], but the byte layout matches PyTorch.
+// Verified numerically against torch.nn.functional.conv1d.
 static void patchify_proj_in(const float* x, int32_t T, int32_t IC, int32_t P,
                               int32_t H, const float* w, const float* bias,
                               float* y) {
     const int32_t S = T / P;
-    const int32_t PIC = P * IC;  // patch input dim (e.g. 384)
+    const int32_t K = P;
+    const int32_t IC_K = IC * K;   // stride between output channels in flat weight
     for (int32_t s = 0; s < S; s++) {
         float* ys = y + static_cast<size_t>(s) * H;
         for (int32_t h = 0; h < H; h++) ys[h] = bias ? bias[h] : 0.0f;
         for (int32_t p = 0; p < P; p++) {
             const float* xp = x + static_cast<size_t>(s * P + p) * IC;
             for (int32_t ic = 0; ic < IC; ic++) {
-                float xv = xp[ic];
-                // w[p, ic, h] at offset p + ic*P + h*P*IC
-                const float* wp = w + static_cast<size_t>(p + ic * P);
+                const float xv = xp[ic];
+                // weight[h, ic, p] at flat[h*IC*K + ic*K + p]
+                const float* wbase = w + static_cast<size_t>(ic) * K + p;
                 for (int32_t h = 0; h < H; h++) {
-                    ys[h] += xv * wp[static_cast<size_t>(h) * PIC];
+                    ys[h] += xv * wbase[static_cast<size_t>(h) * IC_K];
                 }
             }
         }
@@ -184,15 +186,17 @@ static void patchify_proj_in(const float* x, int32_t T, int32_t IC, int32_t P,
 }
 
 // ── Un-patchify proj_out: linear + reshape (ConvTranspose1d equivalent) ─
-// Ported from HOT-Step engine/src/dit-graph.h:637-638.
-// Input  x: [S, H]      hidden state patches (S = T/P)
-// Weight w: ne=[P, OC, H], element [p, oc, h] at offset p + oc*P + h*P*OC
-// Output y: [S*P, OC]   latent frames (un-patchified to T = S*P)
+// Matches PyTorch nn.ConvTranspose1d(in_channels=H, out_channels=OC,
+// kernel_size=P, stride=P, padding=0). The GGUF stores the weight in
+// PyTorch's natural C-order of shape (in=H, out=OC, K=P), so weight[ic, oc, k]
+// lives at flat[ic*OC*K + oc*K + k]. Verified against
+// torch.nn.functional.conv_transpose1d.
 static void unpatchify_proj_out(const float* x, int32_t S, int32_t H, int32_t P,
                                  int32_t OC, const float* w, const float* bias,
                                  float* y) {
     const int32_t T = S * P;
-    const int32_t POC = P * OC;  // 128
+    const int32_t K = P;
+    const int32_t OC_K = OC * K;  // stride between input channels in flat weight
     for (int32_t t = 0; t < T; t++) {
         const int32_t s = t / P;
         const int32_t p = t % P;
@@ -200,10 +204,10 @@ static void unpatchify_proj_out(const float* x, int32_t S, int32_t H, int32_t P,
         float* yt = y + static_cast<size_t>(t) * OC;
         for (int32_t oc = 0; oc < OC; oc++) {
             float sum = bias ? bias[oc] : 0.0f;
-            // w[p, oc, h] at offset p + oc*P + h*P*OC
-            const float* wp = w + static_cast<size_t>(p + oc * P);
+            // weight[h, oc, p] at flat[h*OC*K + oc*K + p]
+            const float* wbase = w + static_cast<size_t>(oc) * K + p;
             for (int32_t h = 0; h < H; h++) {
-                sum += xs[h] * wp[static_cast<size_t>(h) * POC];
+                sum += xs[h] * wbase[static_cast<size_t>(h) * OC_K];
             }
             yt[oc] = sum;
         }
@@ -578,30 +582,32 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
     // Load silence latent (used as src for text2music and inside repaint zone)
     const float* silence_ptr = nullptr;
     int32_t silence_T = 0;
-    // silence_latent in the GGUF is stored in PyTorch [C, T] C-order (t fastest
-    // within each c block: flat[c*T + t]), but downstream code reads it as
-    // time-major [T, C] (flat[t*C + c]). Pre-transpose once into a buffer that
-    // matches the downstream layout so all `silence_ptr + t*out_ch` reads are
-    // correct. Without this, the VAE receives scrambled channels and produces
-    // broadband hiss instead of music.
-    std::vector<float> silence_tc;
+    // silence_latent is shipped in the GGUF as ne=[D=64, T=15000] but the raw
+    // bytes are ALREADY in time-major flat order (flat[t*64 + c]). The
+    // converter (infra/repos/acestep.cpp/convert.py:165) does
+    //   src = np.frombuffer(raw, dtype=np.float32).reshape(64, 15000)
+    //   return src.T.copy()    # shape (15000, 64), C-contiguous
+    // before writing, so the bytes hit the GGUF already time-major. In ggml
+    // ne[0] is the fastest-varying dim — ne[0]=64 matches the inner stride of
+    // a (15000, 64) C-contiguous array. The direct pointer is correct; any
+    // additional transpose here would scramble the data.
     {
         ggml_tensor* st = ggml_get_tensor(ext_ctx_, "silence_latent");
         if (st) {
-            const int32_t C = static_cast<int32_t>(st->ne[0]);  // 64
-            silence_T = static_cast<int32_t>(st->ne[1]);        // 15000
-            const float* raw = static_cast<const float*>(st->data);
-            silence_tc.resize(static_cast<size_t>(silence_T) * C);
-            // raw[c*T + t] → silence_tc[t*C + c]
-            for (int32_t t = 0; t < silence_T; t++) {
-                for (int32_t c = 0; c < C; c++) {
-                    silence_tc[static_cast<size_t>(t) * C + c] =
-                        raw[static_cast<size_t>(c) * silence_T + t];
-                }
+            silence_ptr = static_cast<const float*>(st->data);
+            silence_T   = static_cast<int32_t>(st->ne[1]);
+            const int32_t D = static_cast<int32_t>(st->ne[0]);
+            // Sanity stats — silence_latent should be ~N(0, 0.5)-ish.
+            double sum = 0.0, sq = 0.0; float mn = 1e30f, mx = -1e30f;
+            const size_t N = static_cast<size_t>(silence_T) * D;
+            for (size_t i = 0; i < N; i++) {
+                float v = silence_ptr[i];
+                sum += v; sq += (double)v * v;
+                if (v < mn) mn = v; if (v > mx) mx = v;
             }
-            silence_ptr = silence_tc.data();
-            fprintf(stderr, "[ace_step] silence_latent transposed [C=%d, T=%d] → [%d, %d] "
-                            "time-major, RMS calc skipped\n", C, silence_T, silence_T, C);
+            fprintf(stderr, "[ace_step] silence_latent [D=%d, T=%d] flat-time-major "
+                            "mean=%.4f RMS=%.4f range=[%.4f,%.4f]\n",
+                    D, silence_T, sum / N, std::sqrt(sq / N), mn, mx);
         }
     }
 
