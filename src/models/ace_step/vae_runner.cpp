@@ -30,6 +30,7 @@
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "audiocore/framework/ggml/backend_helper.h"  // BackendPair full def for unique_ptr destructor
 
 #include <algorithm>
 #include <cmath>
@@ -277,67 +278,125 @@ static void nan_check(const char* tag, const float* p, size_t n) {
 //
 // Weights are always f32 pre-computed vectors.
 
+// ── Scheduler helper: run one VAE op graph via GPU scheduler ──────────────
+// Each VAE op builds a small graph with input tensors marked ggml_set_input.
+// This helper allocates the graph, uploads inputs, computes, downloads output.
+struct VaeInputUpload { ggml_tensor* t; const void* data; size_t nbytes; };
+
+static bool vae_sched_compute(ggml_backend_sched_t sched,
+                                ggml_context* ctx, ggml_cgraph* gf,
+                                ggml_tensor* out_tensor,
+                                const std::vector<VaeInputUpload>& uploads,
+                                float* out_data, size_t out_nbytes) {
+    if (!sched) return false;
+    ggml_set_output(out_tensor);
+    ggml_build_forward_expand(gf, out_tensor);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) return false;
+    for (const auto& u : uploads) {
+        ggml_backend_tensor_set(u.t, u.data, 0, u.nbytes);
+    }
+    ggml_backend_sched_graph_compute(sched, gf);
+    ggml_backend_sched_reset(sched);
+    if (out_data && out_nbytes) {
+        ggml_backend_tensor_get(out_tensor, out_data, 0, out_nbytes);
+    }
+    return true;
+}
+
 // ── Conv1d ───────────────────────────────────────────────────────────────────
 // x: [T_in, IC] time-major, w: [K, IC, OC] f32, returns: [T_out, OC] time-major
 static bool op_conv1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
                       const float* w_data, int32_t K, const float* bias,
                       int32_t stride, int32_t pad, int32_t dilation,
                       std::vector<float>* out, int32_t* out_T,
-                      char* buf, size_t buf_size) {
-    struct ggml_init_params gip = {buf_size, buf, false};
+                      char* buf, size_t buf_size,
+                      ggml_backend_sched_t sched = nullptr) {
+    // GPU path: no_alloc ctx, mark inputs, run via scheduler.
+    // CPU path: no_alloc=false ctx, direct memcpy, ggml_graph_compute_with_ctx.
+    const bool use_sched = (sched != nullptr);
+    struct ggml_init_params gip = {buf_size, buf, use_sched};
     ggml_context* ctx = ggml_init(gip);
     ggml_cgraph* gf  = ggml_new_graph(ctx);
+
+    std::vector<VaeInputUpload> uploads;
 
     // ggml_conv_1d expects input as [T, IC] (ne0=T, ne1=IC) but our input
     // x is time-major [T, IC] in memory.  ggml_tensor with ne0=T, ne1=IC
     // has layout data[t + c*T], so we must transpose the copy.
     ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_in, IC);
-    {
+    ggml_set_name(in, "conv1d_in");
+    if (use_sched) {
+        // Build transposed buffer on CPU, then upload after alloc.
+        static thread_local std::vector<float> x_t;
+        x_t.resize(static_cast<size_t>(T_in) * IC);
+        for (int32_t t = 0; t < T_in; t++)
+            for (int32_t c = 0; c < IC; c++)
+                x_t[t + c * T_in] = x[t * IC + c];
+        ggml_set_input(in);
+        uploads.push_back({in, x_t.data(),
+                           static_cast<size_t>(T_in) * IC * sizeof(float)});
+    } else {
         float* dst = (float*)in->data;
-        for (int32_t t = 0; t < T_in; t++) {
-            for (int32_t c = 0; c < IC; c++) {
+        for (int32_t t = 0; t < T_in; t++)
+            for (int32_t c = 0; c < IC; c++)
                 dst[t + c * T_in] = x[t * IC + c];
-            }
-        }
     }
 
     // Build weight tensor from pre-computed f32 data — convert to F16
     // (im2col compute requires F16 kernel on CPU backend).
-    //
     // Conv1d weights are stored in GGUF (and our compute_wsconv output) in
     // [K, IC, OC] layout, which matches ggml_conv_1d's expected ne=[K,IC,OC].
-    // Linear copy is correct.
     ggml_tensor* w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, IC, OC);
-    {
+    if (use_sched) {
+        static thread_local std::vector<ggml_fp16_t> w16;
+        const size_t n_w = static_cast<size_t>(K) * IC * OC;
+        w16.resize(n_w);
+        for (size_t i = 0; i < n_w; i++) w16[i] = ggml_fp32_to_fp16(w_data[i]);
+        ggml_set_input(w);
+        uploads.push_back({w, w16.data(), n_w * sizeof(ggml_fp16_t)});
+    } else {
         ggml_fp16_t* wd = static_cast<ggml_fp16_t*>(w->data);
         const size_t n_w = static_cast<size_t>(K) * IC * OC;
-        for (size_t i = 0; i < n_w; i++) {
-            wd[i] = ggml_fp32_to_fp16(w_data[i]);
-        }
+        for (size_t i = 0; i < n_w; i++) wd[i] = ggml_fp32_to_fp16(w_data[i]);
     }
 
     // ggml_conv_1d: weight [K, IC, OC], input [T, IC] → [OL, OC, 1]
     ggml_tensor* r = ggml_conv_1d(ctx, w, in, stride, pad, dilation);
     if (bias) {
-        // Bias [OC] → reshape to [1, OC] so it broadcasts across T_out in r
         ggml_tensor* bt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, OC);
-        memcpy(bt->data, bias, static_cast<size_t>(OC) * sizeof(float));
+        if (use_sched) {
+            ggml_set_input(bt);
+            uploads.push_back({bt, bias, static_cast<size_t>(OC) * sizeof(float)});
+        } else {
+            memcpy(bt->data, bias, static_cast<size_t>(OC) * sizeof(float));
+        }
         r = ggml_add(ctx, r, ggml_repeat(ctx, bt, r));
     }
-    ggml_build_forward_expand(gf, r);
-    ggml_graph_compute_with_ctx(ctx, gf, 1);
 
     *out_T = (int32_t)r->ne[0];  // OL
     int32_t T_out = *out_T;
     out->resize(static_cast<size_t>(T_out) * OC);
 
-    // ggml output data[t + c·T_out] → our output[t·OC + c]
-    const float* src = (const float*)r->data;
-    float* dst = out->data();
-    for (int32_t t = 0; t < T_out; t++) {
-        for (int32_t c = 0; c < OC; c++) {
-            dst[t * static_cast<size_t>(OC) + c] = src[t + c * static_cast<size_t>(T_out)];
+    if (use_sched) {
+        if (!vae_sched_compute(sched, ctx, gf, r, uploads,
+                               out->data(),
+                               static_cast<size_t>(T_out) * OC * sizeof(float))) {
+            ggml_free(ctx); return false;
         }
+        // ggml output data[t + c·T_out] → our output[t·OC + c] (transpose)
+        static thread_local std::vector<float> tmp;
+        tmp.resize(static_cast<size_t>(T_out) * OC);
+        memcpy(tmp.data(), out->data(), tmp.size() * sizeof(float));
+        for (int32_t t = 0; t < T_out; t++)
+            for (int32_t c = 0; c < OC; c++)
+                (*out)[t * static_cast<size_t>(OC) + c] = tmp[t + c * static_cast<size_t>(T_out)];
+    } else {
+        ggml_build_forward_expand(gf, r);
+        ggml_graph_compute_with_ctx(ctx, gf, 1);
+        const float* src = (const float*)r->data;
+        for (int32_t t = 0; t < T_out; t++)
+            for (int32_t c = 0; c < OC; c++)
+                (*out)[t * static_cast<size_t>(OC) + c] = src[t + c * static_cast<size_t>(T_out)];
     }
 
     ggml_free(ctx);
@@ -350,18 +409,27 @@ static bool op_snake(const float* x, int32_t T, int32_t C,
                      const float* exp_a,  // [C] pre-computed
                      const float* inv_b,  // [C] pre-computed
                      std::vector<float>* out,
-                     char* buf, size_t buf_size) {
-    struct ggml_init_params gip = {buf_size, buf, false};
+                     char* buf, size_t buf_size,
+                     ggml_backend_sched_t sched = nullptr) {
+    const bool use_sched = (sched != nullptr);
+    struct ggml_init_params gip = {buf_size, buf, use_sched};
     ggml_context* ctx = ggml_init(gip);
     ggml_cgraph* gf  = ggml_new_graph(ctx);
 
-    ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
-    memcpy(in->data, x, static_cast<size_t>(T) * C * sizeof(float));
+    std::vector<VaeInputUpload> uploads;
 
+    ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
     ggml_tensor* a_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
-    memcpy(a_t->data, exp_a, C * sizeof(float));
     ggml_tensor* b_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
-    memcpy(b_t->data, inv_b, C * sizeof(float));
+    if (use_sched) {
+        ggml_set_input(in); uploads.push_back({in, x, static_cast<size_t>(T) * C * sizeof(float)});
+        ggml_set_input(a_t); uploads.push_back({a_t, exp_a, C * sizeof(float)});
+        ggml_set_input(b_t); uploads.push_back({b_t, inv_b, C * sizeof(float)});
+    } else {
+        memcpy(in->data, x, static_cast<size_t>(T) * C * sizeof(float));
+        memcpy(a_t->data, exp_a, C * sizeof(float));
+        memcpy(b_t->data, inv_b, C * sizeof(float));
+    }
 
     // x + sin²(α·x) · inv_beta
     ggml_tensor* ax   = ggml_mul(ctx, in, a_t);
@@ -370,11 +438,17 @@ static bool op_snake(const float* x, int32_t T, int32_t C,
     ggml_tensor* term = ggml_mul(ctx, s2, b_t);
     ggml_tensor* r    = ggml_add(ctx, in, term);
 
-    ggml_build_forward_expand(gf, r);
-    ggml_graph_compute_with_ctx(ctx, gf, 1);
-
     out->resize(static_cast<size_t>(T) * C);
-    memcpy(out->data(), r->data, static_cast<size_t>(T) * C * sizeof(float));
+    if (use_sched) {
+        if (!vae_sched_compute(sched, ctx, gf, r, uploads, out->data(),
+                               static_cast<size_t>(T) * C * sizeof(float))) {
+            ggml_free(ctx); return false;
+        }
+    } else {
+        ggml_build_forward_expand(gf, r);
+        ggml_graph_compute_with_ctx(ctx, gf, 1);
+        memcpy(out->data(), r->data, static_cast<size_t>(T) * C * sizeof(float));
+    }
 
     ggml_free(ctx);
     return true;
@@ -388,47 +462,70 @@ static bool op_conv_t1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
                         const float* w_data, int32_t K,
                         const float* bias,
                         std::vector<float>* out, int32_t* out_T,
-                        char* buf, size_t buf_size) {
-    struct ggml_init_params gip = {buf_size, buf, false};
+                        char* buf, size_t buf_size,
+                        ggml_backend_sched_t sched = nullptr) {
+    const bool use_sched = (sched != nullptr);
+    struct ggml_init_params gip = {buf_size, buf, use_sched};
     ggml_context* ctx = ggml_init(gip);
     ggml_cgraph* gf  = ggml_new_graph(ctx);
 
+    std::vector<VaeInputUpload> uploads;
+
     // Input [T, IC] → ne[0]=IC, ne[1]=T
     ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, T_in);
-    memcpy(in->data, x, static_cast<size_t>(T_in) * IC * sizeof(float));
-
     // Weight tensor [IC, K·OC] f32
     ggml_tensor* w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, K * OC);
-    memcpy(w->data, w_data, static_cast<size_t>(IC) * K * OC * sizeof(float));
+    if (use_sched) {
+        ggml_set_input(in);
+        uploads.push_back({in, x, static_cast<size_t>(T_in) * IC * sizeof(float)});
+        ggml_set_input(w);
+        uploads.push_back({w, w_data, static_cast<size_t>(IC) * K * OC * sizeof(float)});
+    } else {
+        memcpy(in->data, x, static_cast<size_t>(T_in) * IC * sizeof(float));
+        memcpy(w->data, w_data, static_cast<size_t>(IC) * K * OC * sizeof(float));
+    }
 
     // mul_mat: contracts over ne[0]=IC (both w and in have ne[0]=IC)
     // →  ne[0]=K·OC, ne[1]=T_in
     ggml_tensor* col = ggml_mul_mat(ctx, w, in);
-    ggml_build_forward_expand(gf, col);
 
     // col2im: [K·OC, T_in] → [T_out, OC] where T_out = stride·T_in
     ggml_tensor* r = ggml_col2im_1d(ctx, col, stride, OC, pad);
     if (bias) {
-        // Bias [OC] → reshape to [1, OC] so it broadcasts across T_out in r
         ggml_tensor* bt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, OC);
-        memcpy(bt->data, bias, static_cast<size_t>(OC) * sizeof(float));
+        if (use_sched) {
+            ggml_set_input(bt);
+            uploads.push_back({bt, bias, static_cast<size_t>(OC) * sizeof(float)});
+        } else {
+            memcpy(bt->data, bias, static_cast<size_t>(OC) * sizeof(float));
+        }
         r = ggml_add(ctx, r, ggml_repeat(ctx, bt, r));
     }
-    ggml_build_forward_expand(gf, r);
-    ggml_graph_compute_with_ctx(ctx, gf, 1);
 
     *out_T = (int32_t)r->ne[0];  // T_out
     int32_t T_out = *out_T;
     out->resize(static_cast<size_t>(T_out) * OC);
 
-    // ggml output: ne[0]=T_out, ne[1]=OC, data[t + c·T_out]
-    // our output:  [T, C] time-major → data[t·OC + c]
-    const float* src = (const float*)r->data;
-    float* dst = out->data();
-    for (int32_t t = 0; t < T_out; t++) {
-        for (int32_t c = 0; c < OC; c++) {
-            dst[t * static_cast<size_t>(OC) + c] = src[t + c * static_cast<size_t>(T_out)];
+    if (use_sched) {
+        if (!vae_sched_compute(sched, ctx, gf, r, uploads, out->data(),
+                               static_cast<size_t>(T_out) * OC * sizeof(float))) {
+            ggml_free(ctx); return false;
         }
+        // Transpose from ggml [T,C] to time-major [T,C]
+        static thread_local std::vector<float> tmp;
+        tmp.resize(static_cast<size_t>(T_out) * OC);
+        memcpy(tmp.data(), out->data(), tmp.size() * sizeof(float));
+        for (int32_t t = 0; t < T_out; t++)
+            for (int32_t c = 0; c < OC; c++)
+                (*out)[t * static_cast<size_t>(OC) + c] = tmp[t + c * static_cast<size_t>(T_out)];
+    } else {
+        ggml_build_forward_expand(gf, col);
+        ggml_build_forward_expand(gf, r);
+        ggml_graph_compute_with_ctx(ctx, gf, 1);
+        const float* src = (const float*)r->data;
+        for (int32_t t = 0; t < T_out; t++)
+            for (int32_t c = 0; c < OC; c++)
+                (*out)[t * static_cast<size_t>(OC) + c] = src[t + c * static_cast<size_t>(T_out)];
     }
 
     ggml_free(ctx);
@@ -446,33 +543,34 @@ static bool op_resunit(const float* x, int32_t T, int32_t C,
                        const float* c2w, int32_t c2K,
                        const float* c2b,
                        std::vector<float>* out,
-                       char* buf, size_t buf_size) {
+                       char* buf, size_t buf_size,
+                       ggml_backend_sched_t sched = nullptr) {
     // Save skip connection
     std::vector<float> skip(x, x + static_cast<size_t>(T) * C);
 
     // Snake 1
     std::vector<float> h1;
-    if (!op_snake(x, T, C, s1a, s1b, &h1, buf, buf_size)) return false;
+    if (!op_snake(x, T, C, s1a, s1b, &h1, buf, buf_size, sched)) return false;
     nan_check("ru_snake1", h1.data(), h1.size());
 
     // Conv1 (k=7, dilated)
     std::vector<float> h2;
     int32_t T2 = 0;
     if (!op_conv1d(h1.data(), T, C, C, c1w, c1K, c1b,
-                   1, 3 * dilation, dilation, &h2, &T2, buf, buf_size))
+                   1, 3 * dilation, dilation, &h2, &T2, buf, buf_size, sched))
         return false;
     nan_check("ru_conv1", h2.data(), h2.size());
 
     // Snake 2
     std::vector<float> h3;
-    if (!op_snake(h2.data(), T2, C, s2a, s2b, &h3, buf, buf_size)) return false;
+    if (!op_snake(h2.data(), T2, C, s2a, s2b, &h3, buf, buf_size, sched)) return false;
     nan_check("ru_snake2", h3.data(), h3.size());
 
     // Conv2 (k=1)
     std::vector<float> h4;
     int32_t T4 = 0;
     if (!op_conv1d(h3.data(), T2, C, C, c2w, c2K, c2b,
-                   1, 0, 1, &h4, &T4, buf, buf_size))
+                   1, 0, 1, &h4, &T4, buf, buf_size, sched))
         return false;
     nan_check("ru_conv2", h4.data(), h4.size());
 
@@ -625,7 +723,36 @@ VAERunner::VAERunner(ggml_context* ext_ctx) : ext_ctx_(ext_ctx) {
     precompute_weights(ext_ctx_);
 }
 
-VAERunner::~VAERunner() = default;
+VAERunner::~VAERunner() {
+    if (sched_) {
+        ggml_backend_sched_free(sched_);
+        sched_ = nullptr;
+    }
+    backend_pair_.reset();
+}
+
+bool VAERunner::ensure_backend() {
+    if (backend_ready_) return sched_ != nullptr;
+
+    namespace bu = audiocore::ggml_utils;
+    backend_pair_  = std::make_unique<bu::BackendPair>(bu::backend_init("VAE"));
+    sched_         = bu::backend_sched_new(*backend_pair_, 8192);
+    backend_ready_ = (sched_ != nullptr);
+    // VAE weights are NOT in ext_ctx_ — they're pre-computed into per-op
+    // f32 vectors at construction time. Each op builds its own small graph
+    // with input tensors that get uploaded via ggml_backend_tensor_set.
+    return backend_ready_;
+}
+
+// Helper: run a single-op graph through the VAE scheduler.
+// Each VAE op (conv1d, snake, conv_t1d, etc.) builds a small graph with
+// input tensors marked via ggml_set_input(). This helper:
+//   1. Allocates the graph on the scheduler (GPU if available)
+//   2. Uploads input data from CPU
+//   3. Computes
+//   4. Downloads output to CPU
+// Returns true on success.
+// (VaeInputUpload struct + vae_sched_compute defined earlier, before op_* fns.)
 
 ggml_tensor* VAERunner::weight(const char* name) const {
     return ggml_get_tensor(ext_ctx_, name);
@@ -879,6 +1006,11 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
         if (error) *error = "VAE: invalid state";
         return false;
     }
+    // Initialize GPU backend + scheduler on first call.
+    if (!ensure_backend()) {
+        if (error) *error = "VAE: backend init failed";
+        return false;
+    }
     fprintf(stderr, "[vae] decode: n_frames=%d\n", n_frames);
 
     // ── Tiled decode for long-form generation ────────────────────────────
@@ -980,7 +1112,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                        dec_conv1_w_.data(), dec_conv1_K_,
                        dec_conv1_b_.empty() ? nullptr : dec_conv1_b_.data(),
                        1, 3, 1,
-                       &out, &T_out, buf.data(), buf_size))
+                       &out, &T_out, buf.data(), buf_size, sched_))
             return false;
         cur = std::move(out);
         T = T_out;
@@ -1001,7 +1133,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
         std::vector<float> h1;
         if (!op_snake(cur.data(), T, bc.in_ch,
                       w.snake_a_.data(), w.snake_b_.data(),
-                      &h1, buf.data(), buf_size))
+                      &h1, buf.data(), buf_size, sched_))
             return false;
         { char t[48]; std::snprintf(t, sizeof(t), "blk%d_snake", b); nan_check(t, h1.data(), h1.size()); }
 
@@ -1012,7 +1144,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                          bc.stride, bc.padding,
                          w.ct1_w_.data(), w.ct1_K_,
                          w.ct1_b_.empty() ? nullptr : w.ct1_b_.data(),
-                         &h2, &T2, buf.data(), buf_size))
+                         &h2, &T2, buf.data(), buf_size, sched_))
             return false;
         fprintf(stderr, "[vae] block %d: conv_t1d done T2=%d\n", b, T2);
         { char t[48]; std::snprintf(t, sizeof(t), "blk%d_ct1d", b); nan_check(t, h2.data(), h2.size()); }
@@ -1035,7 +1167,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                             ru.s2a_.data(), ru.s2b_.data(),
                             ru.c2w_.data(), ru.c2K_,
                             ru.c2b_.empty() ? nullptr : ru.c2b_.data(),
-                            &h_ru, buf.data(), buf_size))
+                            &h_ru, buf.data(), buf_size, sched_))
                 return false;
             { char t[48]; std::snprintf(t, sizeof(t), "blk%d_res%d", b, r); nan_check(t, h_ru.data(), h_ru.size()); }
             h_prev = std::move(h_ru);
@@ -1062,7 +1194,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
     std::vector<float> after_fn;
     if (!op_snake(cur.data(), T, 128,
                   dec_fn_exp_a_.data(), dec_fn_inv_b_.data(),
-                  &after_fn, buf.data(), buf_size))
+                  &after_fn, buf.data(), buf_size, sched_))
         return false;
     nan_check("final_snake", after_fn.data(), after_fn.size());
 
@@ -1073,7 +1205,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                    dec_conv2_w_.data(), dec_conv2_K_,
                    nullptr,
                    1, 3, 1,
-                   &audio, &T_audio, buf.data(), buf_size))
+                   &audio, &T_audio, buf.data(), buf_size, sched_))
         return false;
     nan_check("final_conv2_out", audio.data(), audio.size());
 
@@ -1096,6 +1228,10 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
         if (error) *error = "VAE encode: invalid state";
         return false;
     }
+    if (!ensure_backend()) {
+        if (error) *error = "VAE: backend init failed";
+        return false;
+    }
 
     // ── Shared scratch buffer (4 GB — matches decoder capacity) ──────────
     const size_t buf_size = 4096ULL * 1024 * 1024;
@@ -1112,7 +1248,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
                        enc_conv1_w_.data(), enc_conv1_K_,
                        enc_conv1_b_.empty() ? nullptr : enc_conv1_b_.data(),
                        1, 3, 1,
-                       &out, &T_out, buf.data(), buf_size))
+                       &out, &T_out, buf.data(), buf_size, sched_))
             return false;
         cur = std::move(out);
         T = T_out;
@@ -1139,7 +1275,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
                             ru.s2a_.data(), ru.s2b_.data(),
                             ru.c2w_.data(), ru.c2K_,
                             ru.c2b_.empty() ? nullptr : ru.c2b_.data(),
-                            &h, buf.data(), buf_size))
+                            &h, buf.data(), buf_size, sched_))
                 return false;
             h_prev = std::move(h);
             in = h_prev.data();
@@ -1150,7 +1286,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
         std::vector<float> after_snake;
         if (!op_snake(in, T_in, bc.channel,
                        blk.snake_a_.data(), blk.snake_b_.data(),
-                       &after_snake, buf.data(), buf_size))
+                       &after_snake, buf.data(), buf_size, sched_))
             return false;
 
         // 2c. Strided conv1d: bc.channel → bc.out_ch
@@ -1160,7 +1296,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
                         blk.conv_w_.data(), blk.conv_K_,
                         blk.conv_b_.empty() ? nullptr : blk.conv_b_.data(),
                         bc.stride, bc.padding, 1,
-                        &after_conv, &T_conv, buf.data(), buf_size))
+                        &after_conv, &T_conv, buf.data(), buf_size, sched_))
             return false;
 
         // Copy block output
@@ -1177,7 +1313,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
         std::vector<float> after_fn;
         if (!op_snake(cur.data(), T, 2048,
                        enc_fn_exp_a_.data(), enc_fn_inv_b_.data(),
-                       &after_fn, buf.data(), buf_size))
+                       &after_fn, buf.data(), buf_size, sched_))
             return false;
         cur = std::move(after_fn);
     }
@@ -1189,7 +1325,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
                     enc_conv2_w_.data(), enc_conv2_K_,
                     enc_conv2_b_.empty() ? nullptr : enc_conv2_b_.data(),
                     1, 1, 1,
-                    &encoded_128, &T_128, buf.data(), buf_size))
+                    &encoded_128, &T_128, buf.data(), buf_size, sched_))
         return false;
 
     // ── Extract mean: channels 0..63 → [T, 64] time-major ────────────────

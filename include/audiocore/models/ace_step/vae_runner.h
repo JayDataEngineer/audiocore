@@ -21,6 +21,14 @@
 struct ggml_context;
 struct ggml_cgraph;
 struct ggml_tensor;
+struct ggml_backend;
+struct ggml_backend_sched;
+using ggml_backend_t       = ggml_backend*;
+using ggml_backend_sched_t = ggml_backend_sched*;
+
+namespace audiocore::ggml_utils {
+struct BackendPair;
+}  // namespace audiocore::ggml_utils
 
 namespace audiocore::acestep {
 
@@ -46,6 +54,9 @@ public:
 
     // Look up a VAE weight tensor (bound with vae. prefix).
     ggml_tensor* weight(const char* name) const;
+
+    // Lazily initialize GPU backend + scheduler on first call. Idempotent.
+    bool ensure_backend();
 
 private:
     // ── Per-layer pre-computed weight structs ────────────────────────────
@@ -101,6 +112,11 @@ private:
     std::vector<float> enc_fn_exp_a_;   // final encoder snake alpha [2048]
     std::vector<float> enc_fn_inv_b_;   // final encoder snake beta  [2048]
     BlockWeights       enc_blk_[5];     // 5 encoder blocks
+
+    // Backend state — lazily initialized on first decode/encode call.
+    std::unique_ptr<ggml_utils::BackendPair> backend_pair_;
+    ggml_backend_sched_t                     sched_        = nullptr;
+    bool                                     backend_ready_ = false;
 };
 
 }  // namespace audiocore::acestep

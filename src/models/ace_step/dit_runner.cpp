@@ -37,9 +37,10 @@
 // formula over-amplifies when diff is large (FIXME: upgrade to match upstream).
 
 #include "audiocore/models/ace_step/dit_runner.h"
+#include "audiocore/framework/ggml/backend_helper.h"
 
 #include "ggml.h"
-#include "ggml-cpu.h"   // ggml_new_f32, ggml_graph_compute_with_ctx
+#include "ggml-cpu.h"   // ggml_new_f32 (used by scheduler fallback paths)
 
 #include <cmath>
 #include <cstdio>
@@ -100,6 +101,9 @@ static ggml_tensor* apply_qk_norm(ggml_context* ctx, ggml_tensor* t,
     return ggml_reshape_2d(ctx, t3d, nh * hd, T);
 }
 
+// ── Input upload record (tensor + cpu data to copy into it after alloc) ────
+struct DiTInputUpload { ggml_tensor* t; const void* data; size_t nbytes; };
+
 // ── Self-attention (GQA + QK-norm + RoPE) ───────────────────────────────────
 // Returns just the attention (or O-projected) output — NO residual added.
 static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
@@ -107,7 +111,8 @@ static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
                                 ggml_tensor* q_w, ggml_tensor* k_w,
                                 ggml_tensor* v_w, ggml_tensor* o_w,
                                 ggml_tensor* q_norm_w, ggml_tensor* k_norm_w,
-                                float rope_theta) {
+                                float rope_theta,
+                                std::vector<DiTInputUpload>& inputs) {
     if (!q_w || !k_w || !v_w) return nullptr;
 
     auto q = ggml_mul_mat(ctx, q_w, x);
@@ -126,11 +131,15 @@ static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
     k = to_3d(k, nk);
     v = to_3d(v, nk);
 
-    // Build position IDs [0, 1, 2, ..., T-1] for RoPE
+    // Build position IDs [0, 1, 2, ..., T-1] for RoPE — uploaded as input.
     ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+    ggml_set_input(pos);
     {
-        int32_t* pd = static_cast<int32_t*>(pos->data);
-        for (int i = 0; i < T; i++) pd[i] = i;
+        static thread_local std::vector<int32_t> pos_buf;
+        pos_buf.resize(static_cast<size_t>(T));
+        for (int i = 0; i < T; i++) pos_buf[i] = i;
+        inputs.push_back({pos, pos_buf.data(),
+                          static_cast<size_t>(T) * sizeof(int32_t)});
     }
 
     // RoPE (Neox-style: mode=2) on 3D tensors
@@ -241,10 +250,36 @@ DiTRunner::DiTRunner(ggml_context* ext_ctx, const DitConfig& cfg)
     }
 }
 
-DiTRunner::~DiTRunner() = default;
+DiTRunner::~DiTRunner() {
+    if (sched_) {
+        ggml_backend_sched_free(sched_);
+        sched_ = nullptr;
+    }
+    backend_pair_.reset();
+}
 
 ggml_tensor* DiTRunner::weight(const char* name) const {
     return ggml_get_tensor(ext_ctx_, name);
+}
+
+bool DiTRunner::ensure_backend() {
+    if (backend_ready_) return sched_ != nullptr;
+
+    namespace bu = audiocore::ggml_utils;
+    backend_pair_  = std::make_unique<bu::BackendPair>(bu::backend_init("DiT"));
+    sched_         = bu::backend_sched_new(*backend_pair_, 8192);
+    backend_ready_ = (sched_ != nullptr);
+
+    // Migrate weight tensors from GGUF mmap → backend buffer (GPU if available).
+    // After this, all weight tensors in ext_ctx_ have buffer set; the
+    // scheduler routes ops to GPU. Data pointers are updated in place.
+    if (backend_ready_ && backend_pair_->has_gpu) {
+        ggml_backend_buffer_t buf =
+            bu::migrate_ctx_to_backend(ext_ctx_, backend_pair_->backend, "DiT");
+        // buf is intentionally not freed — it owns the weight memory for the
+        // lifetime of ext_ctx_, which is freed by the Session.
+    }
+    return backend_ready_;
 }
 
 // ── Timestep sinusoidal embedding ────────────────────────────────────────────
@@ -264,22 +299,24 @@ static void timestep_embed(float t, float* out, int dim) {
     }
 }
 
+// (struct DiTInputUpload defined earlier, before self_attn)
+
 // ── Timbre encoder: silence_latent [T, 64] → [1, 2048] CLS-pooled token ──────
 // 4-layer pre-LN transformer with GQA + QK-norm + RoPE.
 // Matches encoder.timbre_encoder in ace_step/modeling_ace_step.py:325.
 // Bidirectional attention (NOT causal); layer_types alternate
-// [sliding, full, sliding, full] but we use full attention for all layers
-// (window=128 over T=750 only affects efficiency; the upstream pipeline
-// applies the SAME padding mask to all tokens — for an unpadded single
-// batch with no padding mask, the only practical effect of sliding_window
-// is to limit attention range. We use full attention to keep the CLS token
-// well-mixed with all 750 silence frames, which preserves timbre info.)
+// [sliding, full, sliding, full]. Upstream cond-enc.h:266 applies a
+// sliding-window mask (|i-j| <= 128) on EVEN layers and full attention
+// on ODD layers. We match this — without the mask the CLS token sees all
+// 750 silence frames at every layer, which is OOD and produces
+// industrial/machinery DiT output.
 static ggml_tensor* timbre_encode(ggml_context* ctx,
                                     ggml_context* ext_ctx,
                                     const float* refer_audio,
                                     int T_refer, int timbre_dim,
                                     int H, int nh, int nk, int hd,
-                                    float rope_theta) {
+                                    float rope_theta,
+                                    std::vector<DiTInputUpload>& inputs) {
     constexpr int kNumTimbreLayers = 4;
 
     // embed_tokens: Linear(timbre_dim=64 → H=2048) with bias.
@@ -289,18 +326,53 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
 
     // Load refer_audio [timbre_dim, T_refer]
     ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, timbre_dim, T_refer);
-    memcpy(input->data, refer_audio,
-           static_cast<size_t>(timbre_dim) * T_refer * sizeof(float));
+    ggml_set_name(input, "timbre_in");
+    ggml_set_input(input);
+    inputs.push_back({input, refer_audio,
+                      static_cast<size_t>(timbre_dim) * T_refer * sizeof(float)});
 
     // Project to H: weight [H, 64] @ x [64, T] → [H, T]
     ggml_tensor* hidden = ggml_mul_mat(ctx, et_w, input);
     if (et_b) hidden = ggml_add(ctx, hidden, ggml_repeat(ctx, et_b, hidden));
 
-    // Position IDs [0..T_refer-1]
+    // Position IDs [0..T_refer-1] — built on CPU then uploaded as input.
     ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_refer);
+    ggml_set_name(pos, "timbre_pos");
+    ggml_set_input(pos);
     {
-        int32_t* pd = static_cast<int32_t*>(pos->data);
-        for (int i = 0; i < T_refer; i++) pd[i] = i;
+        // Build position data on CPU stack then queue for upload.
+        static thread_local std::vector<int32_t> pos_buf;
+        pos_buf.resize(static_cast<size_t>(T_refer));
+        for (int i = 0; i < T_refer; i++) pos_buf[i] = i;
+        inputs.push_back({pos, pos_buf.data(),
+                          static_cast<size_t>(T_refer) * sizeof(int32_t)});
+    }
+
+    // Sliding-window attention mask (matches upstream cond-enc.h:342-352).
+    // Bidirectional window of size 128: position i may attend to j when |i-j| <= 128.
+    // Applied to EVEN layers (i % 2 == 0); ODD layers use full attention.
+    // Trains-distribution requirement: the timbre encoder was trained with
+    // this mask. Using full attention for all layers produces OOD behaviour
+    // and steers the DiT toward industrial/machinery output.
+    constexpr int kSlideWindow = 128;
+    ggml_tensor* slide_mask = nullptr;
+    static thread_local std::vector<ggml_fp16_t> mask_buf;
+    if (T_refer > kSlideWindow) {
+        slide_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, T_refer, T_refer);
+        ggml_set_name(slide_mask, "timbre_slide_mask");
+        ggml_set_input(slide_mask);
+        const ggml_fp16_t kZero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t kNegInf = ggml_fp32_to_fp16(-INFINITY);
+        mask_buf.assign(static_cast<size_t>(T_refer) * T_refer, kZero);
+        for (int i = 0; i < T_refer; i++) {
+            for (int j = 0; j < T_refer; j++) {
+                int d = i - j; if (d < 0) d = -d;
+                mask_buf[static_cast<size_t>(i) * T_refer + j] =
+                    (d <= kSlideWindow) ? kZero : kNegInf;
+            }
+        }
+        inputs.push_back({slide_mask, mask_buf.data(),
+                          static_cast<size_t>(T_refer) * T_refer * sizeof(ggml_fp16_t)});
     }
 
     // 4 transformer layers
@@ -366,8 +438,10 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
         v = rsh(v, nk);
 
         float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-        // Bidirectional (mask=nullptr → attend to all)
-        auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        // Even layers use sliding window mask; odd layers use full attention.
+        // Matches upstream cond-enc.h:266 layer_mask = (i % 2 == 0) ? slide : NULL.
+        ggml_tensor* layer_mask = (slide_mask && (i % 2 == 0)) ? slide_mask : nullptr;
+        auto a = ggml_flash_attn_ext(ctx, q, k, v, layer_mask, scale, 0.0f, 0.0f);
         a = ggml_cont(ctx, ggml_permute(ctx, a, 0, 2, 1, 3));
         a = ggml_reshape_2d(ctx, a, nh * hd, T_refer);
         a = ggml_mul_mat(ctx, o_w, a);
@@ -416,6 +490,7 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
 // ── Single forward: build graph + compute ────────────────────────────────────
 static bool run_one_forward(
     const DitConfig& cfg, ggml_context* ext_ctx,
+    ggml_backend_sched_t sched,
     const float* x_t, int32_t T, int32_t H,
     const float* temb, int temb_dim,
     const float* cond_data, int ct_len, int cond_hidden,
@@ -453,29 +528,34 @@ static bool run_one_forward(
     const int32_t n_layer = cfg.n_layers    > 0 ? cfg.n_layers    : 24;
     const float   eps     = cfg.rms_norm_eps > 0 ? cfg.rms_norm_eps : 1e-6f;
     const float   theta   = cfg.rope_theta  > 0 ? cfg.rope_theta  : 1000000.0f;
-    const int     nthr    = 4;
 
-    // Context memory: scales with T_latent. 6 GB handles T≤375 (15 s @ 25 Hz).
-    // For longer sequences we scale linearly (graph is mostly matmuls with
-    // T-dependent activations). Capped at 24 GB to avoid system OOM.
-    size_t mem;
-    if (T <= 375)       mem = 6144ULL * 1024 * 1024;       // 6 GB  (≤15 s)
-    else if (T <= 750)  mem = 12288ULL * 1024 * 1024;      // 12 GB (≤30 s)
-    else if (T <= 1125) mem = 18432ULL * 1024 * 1024;      // 18 GB (≤45 s)
-    else                mem = 24576ULL * 1024 * 1024;      // 24 GB (>45 s)
+    // ── Graph context (no_alloc=true: scheduler allocates intermediates) ──
+    // For CPU fallback path (no GPU), we still need a memory pool because
+    // ggml_graph_compute_with_ctx expects tensors to have data pointers.
+    // The scheduler path uses no_alloc=true and lets the scheduler manage
+    // all intermediate storage on the backend buffer.
+    const bool use_sched = (sched != nullptr);
+    size_t mem = ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(8192, false);
     char* ctx_buf = new (std::nothrow) char[mem];
-    if (!ctx_buf) { if (error) *error = "DiT OOM"; return false; }
+    if (!ctx_buf) { if (error) *error = "DiT OOM (metadata)"; return false; }
 
-    ggml_init_params p = { mem, ctx_buf, /*no_alloc=*/false };
+    ggml_init_params p = { mem, ctx_buf, /*no_alloc=*/true };
     ggml_context* ctx = ggml_init(p);
-    ggml_cgraph* gf  = ggml_new_graph_custom(ctx, 4096, false);
+    ggml_cgraph* gf  = ggml_new_graph_custom(ctx, 8192, false);
     if (!ctx || !gf) {
         delete[] ctx_buf; if (error) *error = "DiT ggml_init"; return false;
     }
 
     // ── Input x [T, H] ───────────────────────────────────────────────────
+    // Mark as scheduler input; data is set after sched_alloc_graph via
+    // ggml_backend_tensor_set (see "Compute" block below).
+    // We queue all input uploads in `inputs` and flush them after alloc.
+    std::vector<DiTInputUpload> inputs;
+
     ggml_tensor* cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
-    memcpy(cur->data, x_t, static_cast<size_t>(T) * H * sizeof(float));
+    ggml_set_name(cur, "x_t");
+    ggml_set_input(cur);
+    inputs.push_back({cur, x_t, static_cast<size_t>(T) * H * sizeof(float)});
 
     // ── Dual-timestep embedding (mean-flow two-branch) ───────────────────
     // Upstream AceStepTransformer1DModel.forward (ace_step_transformer.py:560):
@@ -490,7 +570,8 @@ static bool run_one_forward(
     auto build_time_mlp = [&](const char* prefix, const float* sin_buf,
                               int sin_dim) -> ggml_tensor* {
         ggml_tensor* t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sin_dim);
-        memcpy(t->data, sin_buf, static_cast<size_t>(sin_dim) * sizeof(float));
+        ggml_set_input(t);
+        inputs.push_back({t, sin_buf, static_cast<size_t>(sin_dim) * sizeof(float)});
         t = ggml_reshape_2d(ctx, t, sin_dim, 1);
 
         char buf[160];
@@ -566,7 +647,7 @@ static bool run_one_forward(
     const int timbre_dim = 64;   // timbre_hidden_dim
     ggml_tensor* timbre_tok = timbre_encode(ctx, ext_ctx, refer_audio, T_refer,
                                             timbre_dim, H,
-                                            nh, nk, hd, theta);
+                                            nh, nk, hd, theta, inputs);
     if (!timbre_tok) {
         if (error) *error = "DiT: timbre_encode returned null (missing tensor?)";
         return false;
@@ -580,9 +661,10 @@ static bool run_one_forward(
     if (cond_data && ct_len > 0) {
         int64_t te_hs = (cond_hidden > 0) ? cond_hidden : 1024;
         ggml_tensor* ct = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, te_hs, ct_len);
-        memcpy(ct->data, cond_data,
-               static_cast<size_t>(ct_len) * static_cast<size_t>(te_hs) *
-               sizeof(float));
+        ggml_set_input(ct);
+        inputs.push_back({ct, cond_data,
+                          static_cast<size_t>(ct_len) * static_cast<size_t>(te_hs) *
+                          sizeof(float)});
         text_proj = ggml_mul_mat(ctx, tp_w, ct);   // [2048, T_text]
     } else {
         // CFG uncond: null_condition_emb [2048] is already in encoder_hidden space.
@@ -604,62 +686,22 @@ static bool run_one_forward(
     ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, packed);
     ggml_tensor* cond_emb = ggml_add(ctx, ce_out, ggml_repeat(ctx, ceb, ce_out));
 
-    // ── Diagnostic: cond_emb stats (compute it eagerly to read real values) ──
-    if (std::getenv("ACE_STEP_DIT_DEBUG")) {
-        // Compute ct (raw TE hidden state) stats — this tells us whether the
-        // text encoder output magnitude is reasonable BEFORE any projection.
-        if (cond_data && ct_len > 0) {
-            int64_t te_hs = (cond_hidden > 0) ? cond_hidden : 1024;
-            const float* cdv = cond_data;
-            double sq = 0.0, sum = 0.0; float mn = 1e30f, mx = -1e30f;
-            int64_t n = static_cast<int64_t>(ct_len) * te_hs;
-            for (int64_t i = 0; i < n; i++) {
-                float v = cdv[i]; sq += (double)v*v; sum += v;
-                if (v < mn) mn = v; if (v > mx) mx = v;
-            }
-            fprintf(stderr, "[dit] te_cond: T=%d H=%ld mean=%.4f RMS=%.4f range=[%.4f,%.4f]\n",
-                    ct_len, (long)te_hs, sum/n, std::sqrt(sq/n), mn, mx);
-            fprintf(stderr, "[dit] te_cond[0..5]: ");
-            for (int i = 0; i < 6 && i < n; i++) fprintf(stderr, "%.3f ", cdv[i]);
-            fprintf(stderr, "\n");
-            // Per-token RMS to see if any token has wildly different magnitude
-            fprintf(stderr, "[dit] te_cond per-token RMS (all %d): ", ct_len);
-            for (int t = 0; t < ct_len; t++) {
-                double s = 0;
-                for (int64_t h = 0; h < te_hs; h++) s += (double)cdv[t*te_hs + h] * cdv[t*te_hs + h];
-                fprintf(stderr, "[t=%d]%.3f ", t, std::sqrt(s / te_hs));
-            }
-            fprintf(stderr, "\n");
+    // ── Diagnostic: input cond stats (raw, before projection) ──────────────
+    // NOTE: The intermediate-tensor stats_of diagnostics that were here used
+    // ggml_graph_compute_with_ctx, which is incompatible with the scheduler
+    // (no_alloc=true ctx). They were one-shot debug helpers; the final
+    // output RMS below still runs.
+    if (std::getenv("ACE_STEP_DIT_DEBUG") && cond_data && ct_len > 0) {
+        int64_t te_hs = (cond_hidden > 0) ? cond_hidden : 1024;
+        const float* cdv = cond_data;
+        double sq = 0.0, sum = 0.0; float mn = 1e30f, mx = -1e30f;
+        int64_t n = static_cast<int64_t>(ct_len) * te_hs;
+        for (int64_t i = 0; i < n; i++) {
+            float v = cdv[i]; sq += (double)v*v; sum += v;
+            if (v < mn) mn = v; if (v > mx) mx = v;
         }
-
-        auto stats_of = [&](const char* name, ggml_tensor* t) {
-            ggml_build_forward_expand(gf, t);
-            ggml_graph_compute_with_ctx(ctx, gf, 1);
-            double sq = 0.0, sum = 0.0; float mn = 1e30f, mx = -1e30f;
-            int64_t n = ggml_nelements(t);
-            const float* d = (const float*)t->data;
-            for (int64_t i = 0; i < n; i++) {
-                float v = d[i]; sq += (double)v*v; sum += v;
-                if (v < mn) mn = v; if (v > mx) mx = v;
-            }
-            fprintf(stderr, "[dit] %s: shape=[%ld,%ld] mean=%.4f RMS=%.4f range=[%.4f,%.4f]\n",
-                    name, (long)t->ne[0], (long)t->ne[1], sum/n, std::sqrt(sq/n), mn, mx);
-        };
-        stats_of("text_proj", text_proj);
-        stats_of("timbre_tok", timbre_tok);
-        stats_of("packed", packed);
-        stats_of("cond_emb", cond_emb);
-        // Also dump text_proj first few values
-        const float* td = (const float*)text_proj->data;
-        fprintf(stderr, "[dit] text_proj[0..5]: ");
-        for (int i = 0; i < 6; i++) fprintf(stderr, "%.3f ", td[i]);
-        fprintf(stderr, "\n");
-        // And timbre_tok first few values
-        const float* ttd = (const float*)timbre_tok->data;
-        fprintf(stderr, "[dit] timbre_tok[0..5]: ");
-        for (int i = 0; i < 6 && i < (int)(ggml_nelements(timbre_tok)); i++)
-            fprintf(stderr, "%.3f ", ttd[i]);
-        fprintf(stderr, "\n");
+        fprintf(stderr, "[dit] te_cond: T=%d H=%ld mean=%.4f RMS=%.4f range=[%.4f,%.4f]\n",
+                ct_len, (long)te_hs, sum/n, std::sqrt(sq/n), mn, mx);
     }
 
     // ── DiT layers ───────────────────────────────────────────────────────
@@ -670,8 +712,9 @@ static bool run_one_forward(
         ggml_tensor* layer_time_mod = time_mod;
         if (i < (int)ss_table_f32.size() && !ss_table_f32[i].empty()) {
             ggml_tensor* sst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 6);
-            memcpy(sst->data, ss_table_f32[i].data(),
-                   static_cast<size_t>(H) * 6 * sizeof(float));
+            ggml_set_input(sst);
+            inputs.push_back({sst, ss_table_f32[i].data(),
+                              static_cast<size_t>(H) * 6 * sizeof(float)});
             layer_time_mod = ggml_add(ctx, time_mod, sst);
         }
 
@@ -720,7 +763,7 @@ static bool run_one_forward(
 
             h = self_attn(ctx, h, T, H, nh, nk, hd,
                           q_w, k_w, v_w, o_w,
-                          qn_w, kn_w, theta);
+                          qn_w, kn_w, theta, inputs);
             // GATED residual: cur += h * gate[row2]
             auto gate = ggml_reshape_2d(ctx,
                 ggml_view_1d(ctx, layer_time_mod, H,
@@ -827,8 +870,9 @@ static bool run_one_forward(
         // We need (scale_shift_table + temb) broadcast across the 2 rows.
         if (!global_ss_f32.empty()) {
             ggml_tensor* gss = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
-            memcpy(gss->data, global_ss_f32.data(),
-                   static_cast<size_t>(H) * 2 * sizeof(float));
+            ggml_set_input(gss);
+            inputs.push_back({gss, global_ss_f32.data(),
+                              static_cast<size_t>(H) * 2 * sizeof(float)});
             // temb_combined is [H, 1] — broadcast to [H, 2] via ggml_repeat.
             auto temb_bc = ggml_repeat(ctx, temb_combined, gss);
             auto gss_temb = ggml_add(ctx, gss, temb_bc);
@@ -839,38 +883,62 @@ static bool run_one_forward(
                 ggml_view_1d(ctx, gss_temb, H,
                              static_cast<size_t>(H) * sizeof(float)),
                 H, 1);
-            // (1 + scale)
-            auto one_plus_scale = ggml_add(ctx,
-                scale, ggml_new_f32(ctx, 1.0f));
-            n_out = ggml_add(ctx,
-                ggml_mul(ctx, n_out, ggml_repeat(ctx, one_plus_scale, n_out)),
-                ggml_repeat(ctx, shift, n_out));
+            // (1 + scale) * n_out + shift = n_out + n_out*scale + shift
+            // (rewritten to avoid ggml_new_f32 which asserts on no_alloc ctx)
+            auto n_scaled = ggml_mul(ctx, n_out, ggml_repeat(ctx, scale, n_out));
+            n_out = ggml_add(ctx, ggml_add(ctx, n_out, n_scaled),
+                              ggml_repeat(ctx, shift, n_out));
         }
         cur = n_out;
     }
 
     // ── Compute ──────────────────────────────────────────────────────────
+    // Mark output, build graph, allocate via scheduler, upload inputs,
+    // compute, download output. The scheduler places ops on GPU when their
+    // input tensors live on the GPU buffer (ext_ctx_ weights migrated in
+    // ensure_backend); CPU otherwise.
+    ggml_set_name(cur, "dit_out");
+    ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
-    int st = ggml_graph_compute_with_ctx(ctx, gf, nthr);
-    if (st != 0) {
-        if (error) *error = "DiT compute failed (status " +
-                            std::to_string(st) + ")";
+
+    static bool kDebugSched = (std::getenv("ACE_STEP_SCHED_DEBUG") != nullptr);
+    if (kDebugSched) {
+        fprintf(stderr, "[dit] graph: %d nodes, %d inputs queued\n",
+                ggml_graph_n_nodes(gf), (int)inputs.size());
+    }
+
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        if (error) *error = "DiT: sched_alloc_graph failed";
         ggml_free(ctx); delete[] ctx_buf; return false;
     }
+
+    if (kDebugSched) {
+        int n_splits = ggml_backend_sched_get_n_splits(sched);
+        fprintf(stderr, "[dit] scheduler splits: %d (1=pure GPU or CPU, >1=mixed)\n", n_splits);
+    }
+
+    // Upload input tensor data (x_t, sinusoids, cond, ss_tables).
+    for (const auto& in : inputs) {
+        ggml_backend_tensor_set(in.t, in.data, 0, in.nbytes);
+    }
+
+    ggml_backend_sched_graph_compute(sched, gf);
+    ggml_backend_sched_reset(sched);
+
+    // Download output to caller's buffer.
+    ggml_backend_tensor_get(cur, result, 0,
+                            static_cast<size_t>(T) * H * sizeof(float));
 
     // Output RMS diagnostic
     {
         double sq = 0.0;
-        float* d = (float*)cur->data;
         for (int64_t ii = 0; ii < static_cast<int64_t>(T) * H; ii++)
-            sq += (double)d[ii] * d[ii];
+            sq += (double)result[ii] * result[ii];
         double out_rms = std::sqrt(sq / (static_cast<double>(T) * H));
         fprintf(stderr, "[dit] output RMS=%.4f (in was %.4f, ratio=%.2f)\n",
                 out_rms, inp_rms, out_rms / (inp_rms + 1e-10));
     }
 
-    memcpy(result, cur->data,
-           static_cast<size_t>(T) * H * sizeof(float));
     ggml_free(ctx);
     delete[] ctx_buf;
     return true;
@@ -889,14 +957,25 @@ bool DiTRunner::forward(
     const int32_t T = n_patches;
     const int temb_dim = 256;
 
+    // Initialize backend + scheduler on first call (GPU if available,
+    // CPU fallback otherwise). Migrates ext_ctx_ weights to GPU buffer.
+    if (!ensure_backend()) {
+        if (error) *error = "DiT: backend initialization failed";
+        return false;
+    }
+
     // Pre-compute timestep embedding (shared by cond + uncond)
     std::vector<float> temb(static_cast<size_t>(temb_dim));
-    // Scale timestep by 1000 (diffusion convention, matches HOT-Step
-    // dit-graph.h:118: ggml_scale(ctx, t_scalar, 1000.0f))
+    // Scale timestep by 1000 (matches TimestepEmbedding.scale=1000 default
+    // in vendor/acestep/models/turbo/modeling_acestep_v15_turbo.py:215 and
+    // HOT-Step dit-graph.h:87 ggml_scale(ctx, t_scalar, 1000.0f)).
+    // The diffusers pipeline_op.py wrapper passes raw [0,1] timesteps, but
+    // the model's own TimestepEmbedding class applies scale=1000 internally
+    // (line 247: t = t * self.scale) before computing the sinusoid.
     timestep_embed(t * 1000.0f, temb.data(), temb_dim);
 
     if (guidance_scale == 1.0f) {
-        return run_one_forward(cfg_, ext_ctx_, x_t, T, H,
+        return run_one_forward(cfg_, ext_ctx_, sched_, x_t, T, H,
                                 temb.data(), temb_dim,
                                 cond, T_cond, cond_hidden,
                                 refer_audio, T_refer,
@@ -908,7 +987,7 @@ bool DiTRunner::forward(
     std::vector<float> c_out(static_cast<size_t>(T) * H);
     std::vector<float> u_out(static_cast<size_t>(T) * H);
 
-    if (!run_one_forward(cfg_, ext_ctx_, x_t, T, H,
+    if (!run_one_forward(cfg_, ext_ctx_, sched_, x_t, T, H,
                           temb.data(), temb_dim,
                           cond, T_cond, cond_hidden,
                           refer_audio, T_refer,
@@ -920,7 +999,7 @@ bool DiTRunner::forward(
 
     const float* uc = (cond_nc && T_cond_nc > 0) ? cond_nc : nullptr;
     int uc_len = (cond_nc && T_cond_nc > 0) ? T_cond_nc : 0;
-    if (!run_one_forward(cfg_, ext_ctx_, x_t, T, H,
+    if (!run_one_forward(cfg_, ext_ctx_, sched_, x_t, T, H,
                           temb.data(), temb_dim,
                           uc, uc_len, cond_hidden,
                           refer_audio, T_refer,
