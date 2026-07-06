@@ -384,6 +384,93 @@ bool AceStepSession::load(const std::string& model_path,
     proj_in_w_f32_  = bf16_to_f32_vec(dit_proj_in_);
     proj_out_w_f32_ = bf16_to_f32_vec(dit_proj_out_);
 
+    // (5c.1) Strict required-tensor validation. Fail LOUDLY at load time if
+    //        any architecture-critical weight is missing — silent fallbacks
+    //        hide checkpoint/format mismatches and produce garbage output
+    //        that's painful to debug. The runtime DiT/VAE graph builders
+    //        can then assume all required tensors exist.
+    auto must_have = [&](const char* name) -> bool {
+        if (ggml_get_tensor(ext_ctx_, name)) return true;
+        if (error) *error = std::string("ACE-Step: missing required tensor '") +
+                            name + "' in DiT GGUF";
+        return false;
+    };
+    // Global tensors.
+    if (!must_have("decoder.time_embed.linear_1.weight") ||
+        !must_have("decoder.time_embed.linear_2.weight") ||
+        !must_have("decoder.time_embed.time_proj.weight") ||
+        !must_have("decoder.condition_embedder.weight")  ||
+        !must_have("decoder.condition_embedder.bias")    ||
+        !must_have("encoder.text_projector.weight")      ||
+        !must_have("silence_latent")                     ||
+        !must_have("decoder.scale_shift_table")          ||
+        !must_have("decoder.norm_out.weight")) {
+        return false;
+    }
+    // Timbre encoder tensors (4 layers).
+    {
+        const char* timbre_names[] = {
+            "encoder.timbre_encoder.embed_tokens.weight",
+            "encoder.timbre_encoder.embed_tokens.bias",
+            "encoder.timbre_encoder.norm.weight",
+        };
+        for (const char* n : timbre_names) if (!must_have(n)) return false;
+        for (int i = 0; i < 4; i++) {
+            char buf[160];
+            const char* suffixes[] = {
+                ".input_layernorm.weight",
+                ".post_attention_layernorm.weight",
+                ".self_attn.q_proj.weight",
+                ".self_attn.k_proj.weight",
+                ".self_attn.v_proj.weight",
+                ".self_attn.o_proj.weight",
+                ".self_attn.q_norm.weight",
+                ".self_attn.k_norm.weight",
+                ".mlp.gate_proj.weight",
+                ".mlp.up_proj.weight",
+                ".mlp.down_proj.weight",
+            };
+            for (const char* sfx : suffixes) {
+                std::snprintf(buf, sizeof(buf),
+                              "encoder.timbre_encoder.layers.%d%s", i, sfx);
+                if (!must_have(buf)) return false;
+            }
+        }
+    }
+    // Per-layer DiT tensors.
+    if (cfg_.dit.n_layers <= 0) {
+        if (error) *error = "ACE-Step: DitConfig.n_layers not set";
+        return false;
+    }
+    for (int i = 0; i < cfg_.dit.n_layers; i++) {
+        char buf[160];
+        const char* suffixes[] = {
+            ".self_attn_norm.weight",
+            ".cross_attn_norm.weight",
+            ".mlp_norm.weight",
+            ".self_attn.q_proj.weight",
+            ".self_attn.k_proj.weight",
+            ".self_attn.v_proj.weight",
+            ".self_attn.o_proj.weight",
+            ".self_attn.q_norm.weight",
+            ".self_attn.k_norm.weight",
+            ".cross_attn.q_proj.weight",
+            ".cross_attn.k_proj.weight",
+            ".cross_attn.v_proj.weight",
+            ".cross_attn.o_proj.weight",
+            ".cross_attn.q_norm.weight",
+            ".cross_attn.k_norm.weight",
+            ".mlp.gate_proj.weight",
+            ".mlp.up_proj.weight",
+            ".mlp.down_proj.weight",
+            ".scale_shift_table",
+        };
+        for (const char* sfx : suffixes) {
+            std::snprintf(buf, sizeof(buf), "decoder.layers.%d%s", i, sfx);
+            if (!must_have(buf)) return false;
+        }
+    }
+
     // (5d) Construct DiTRunner and VAERunner.
     dit_runner_ = std::make_unique<DiTRunner>(ext_ctx_, cfg_.dit);
     vae_runner_ = std::make_unique<VAERunner>(ext_ctx_);

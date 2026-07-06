@@ -279,10 +279,10 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
                                     float rope_theta) {
     constexpr int kNumTimbreLayers = 4;
 
-    // embed_tokens: Linear(timbre_dim=64 → H=2048) with bias
+    // embed_tokens: Linear(timbre_dim=64 → H=2048) with bias.
+    // Validated at load time — no null check needed.
     auto et_w = ggml_get_tensor(ext_ctx, "encoder.timbre_encoder.embed_tokens.weight");
     auto et_b = ggml_get_tensor(ext_ctx, "encoder.timbre_encoder.embed_tokens.bias");
-    if (!et_w) return nullptr;
 
     // Load refer_audio [timbre_dim, T_refer]
     ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, timbre_dim, T_refer);
@@ -309,7 +309,7 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
                       "encoder.timbre_encoder.layers.%d.input_layernorm.weight", i);
         ggml_tensor* ln_w = ggml_get_tensor(ext_ctx, buf);
         ggml_tensor* h = ggml_rms_norm(ctx, hidden, 1e-6f);
-        if (ln_w) h = ggml_mul(ctx, h, ggml_repeat(ctx, ln_w, h));
+        h = ggml_mul(ctx, h, ggml_repeat(ctx, ln_w, h));
 
         // Self-attn projections (GQA: q has nh heads, kv has nk heads)
         std::snprintf(buf, sizeof(buf),
@@ -331,52 +331,51 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
                       "encoder.timbre_encoder.layers.%d.self_attn.k_norm.weight", i);
         auto kn_w = ggml_get_tensor(ext_ctx, buf);
 
-        if (q_w && k_w && v_w) {
-            auto q = ggml_mul_mat(ctx, q_w, h);
-            auto k = ggml_mul_mat(ctx, k_w, h);
-            auto v = ggml_mul_mat(ctx, v_w, h);
+        // All timbre encoder weights validated at load time — no null checks.
+        auto q = ggml_mul_mat(ctx, q_w, h);
+        auto k = ggml_mul_mat(ctx, k_w, h);
+        auto v = ggml_mul_mat(ctx, v_w, h);
 
-            q = apply_qk_norm(ctx, q, hd, nh, qn_w);
-            k = apply_qk_norm(ctx, k, hd, nk, kn_w);
+        q = apply_qk_norm(ctx, q, hd, nh, qn_w);
+        k = apply_qk_norm(ctx, k, hd, nk, kn_w);
 
-            // Reshape 3D for RoPE: [hd, n_heads, T]
-            q = ggml_reshape_3d(ctx, q, hd, nh, T_refer);
-            k = ggml_reshape_3d(ctx, k, hd, nk, T_refer);
-            v = ggml_reshape_3d(ctx, v, hd, nk, T_refer);
+        // Reshape 3D for RoPE: [hd, n_heads, T]
+        q = ggml_reshape_3d(ctx, q, hd, nh, T_refer);
+        k = ggml_reshape_3d(ctx, k, hd, nk, T_refer);
+        v = ggml_reshape_3d(ctx, v, hd, nk, T_refer);
 
-            // RoPE on Q and K
-            auto rope = [&](ggml_tensor* t) {
-                return ggml_rope_ext(ctx, t, pos, nullptr,
-                                      hd, 2, 0,
-                                      rope_theta, 1.0f, 0.0f, 1.0f,
-                                      0.0f, 0.0f);
-            };
-            q = rope(q);
-            k = rope(k);
+        // RoPE on Q and K
+        auto rope = [&](ggml_tensor* t) {
+            return ggml_rope_ext(ctx, t, pos, nullptr,
+                                  hd, 2, 0,
+                                  rope_theta, 1.0f, 0.0f, 1.0f,
+                                  0.0f, 0.0f);
+        };
+        q = rope(q);
+        k = rope(k);
 
-            // Permute → [hd, T, n_heads] for flash_attn_ext
-            auto rsh = [&](ggml_tensor* t, int n_h) {
-                return ggml_cont(ctx, ggml_permute(ctx, t, 0, 2, 1, 3));
-            };
-            q = rsh(q, nh);
-            k = rsh(k, nk);
-            v = rsh(v, nk);
+        // Permute → [hd, T, n_heads] for flash_attn_ext
+        auto rsh = [&](ggml_tensor* t, int n_h) {
+            return ggml_cont(ctx, ggml_permute(ctx, t, 0, 2, 1, 3));
+        };
+        q = rsh(q, nh);
+        k = rsh(k, nk);
+        v = rsh(v, nk);
 
-            float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-            // Bidirectional (mask=nullptr → attend to all)
-            auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
-            a = ggml_cont(ctx, ggml_permute(ctx, a, 0, 2, 1, 3));
-            a = ggml_reshape_2d(ctx, a, nh * hd, T_refer);
-            if (o_w) a = ggml_mul_mat(ctx, o_w, a);
-            hidden = ggml_add(ctx, hidden, a);   // residual
-        }
+        float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+        // Bidirectional (mask=nullptr → attend to all)
+        auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        a = ggml_cont(ctx, ggml_permute(ctx, a, 0, 2, 1, 3));
+        a = ggml_reshape_2d(ctx, a, nh * hd, T_refer);
+        a = ggml_mul_mat(ctx, o_w, a);
+        hidden = ggml_add(ctx, hidden, a);   // residual
 
         // ── post-LN SwiGLU MLP ──
         std::snprintf(buf, sizeof(buf),
                       "encoder.timbre_encoder.layers.%d.post_attention_layernorm.weight", i);
         ggml_tensor* post_ln_w = ggml_get_tensor(ext_ctx, buf);
         h = ggml_rms_norm(ctx, hidden, 1e-6f);
-        if (post_ln_w) h = ggml_mul(ctx, h, ggml_repeat(ctx, post_ln_w, h));
+        h = ggml_mul(ctx, h, ggml_repeat(ctx, post_ln_w, h));
 
         std::snprintf(buf, sizeof(buf),
                       "encoder.timbre_encoder.layers.%d.mlp.gate_proj.weight", i);
@@ -387,18 +386,14 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
         std::snprintf(buf, sizeof(buf),
                       "encoder.timbre_encoder.layers.%d.mlp.down_proj.weight", i);
         auto dw = ggml_get_tensor(ext_ctx, buf);
-        if (gw && uw && dw) {
-            auto mlp_out = swiglu_mlp(ctx, h, gw, uw, dw);
-            if (mlp_out) hidden = ggml_add(ctx, hidden, mlp_out);
-        }
+        auto mlp_out = swiglu_mlp(ctx, h, gw, uw, dw);
+        hidden = ggml_add(ctx, hidden, mlp_out);
     }
 
-    // Final RMSNorm
+    // Final RMSNorm (validated at load time).
     auto final_ln_w = ggml_get_tensor(ext_ctx, "encoder.timbre_encoder.norm.weight");
-    if (final_ln_w) {
-        hidden = ggml_rms_norm(ctx, hidden, 1e-6f);
-        hidden = ggml_mul(ctx, hidden, ggml_repeat(ctx, final_ln_w, hidden));
-    }
+    hidden = ggml_rms_norm(ctx, hidden, 1e-6f);
+    hidden = ggml_mul(ctx, hidden, ggml_repeat(ctx, final_ln_w, hidden));
 
     // CLS pooling: take first token → [H, 1]
     // hidden is [H, T_refer] → view 1d first column
@@ -475,36 +470,26 @@ static bool run_one_forward(
     memcpy(tp->data, temb, static_cast<size_t>(temb_dim) * sizeof(float));
     tp = ggml_reshape_2d(ctx, tp, temb_dim, 1);   // [temb_dim, 1]
 
-    // MLP 1: linear_1 → SiLU → linear_2
+    // MLP 1: linear_1 → SiLU → linear_2. All three weights are validated
+    // at load time (loader.cpp must_have), so no null-check fallback here.
     ggml_tensor* t1w = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_1.weight");
     ggml_tensor* t1b = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_1.bias");
-    if (t1w) {
-        tp = ggml_mul_mat(ctx, t1w, tp);
-        if (t1b) tp = ggml_add(ctx, tp, ggml_repeat(ctx, t1b, tp));
-    }
-    tp = ggml_silu(ctx, tp);
     ggml_tensor* t2w = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_2.weight");
     ggml_tensor* t2b = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_2.bias");
-    if (t2w) {
-        tp = ggml_mul_mat(ctx, t2w, tp);
-        if (t2b) tp = ggml_add(ctx, tp, ggml_repeat(ctx, t2b, tp));
-    }
+    tp = ggml_mul_mat(ctx, t1w, tp);
+    if (t1b) tp = ggml_add(ctx, tp, ggml_repeat(ctx, t1b, tp));
+    tp = ggml_silu(ctx, tp);
+    tp = ggml_mul_mat(ctx, t2w, tp);
+    if (t2b) tp = ggml_add(ctx, tp, ggml_repeat(ctx, t2b, tp));
 
     // Time projection → [H, 6] modulation
     // HOT-Step dit-graph.h:144 applies SiLU before time_proj: h2 = silu(temb)
-    ggml_tensor* time_mod = nullptr;
     ggml_tensor* tpw = ggml_get_tensor(ext_ctx, "decoder.time_embed.time_proj.weight");
     ggml_tensor* tpb = ggml_get_tensor(ext_ctx, "decoder.time_embed.time_proj.bias");
-    if (tpw) {
-        tp = ggml_silu(ctx, tp);  // SiLU before time_proj (HOT-Step dit-graph.h:144)
-        auto pj = ggml_mul_mat(ctx, tpw, tp);
-        if (tpb) pj = ggml_add(ctx, pj, ggml_repeat(ctx, tpb, pj));
-        time_mod = ggml_reshape_2d(ctx, pj, H, 6);   // ne0=H, ne1=6
-    } else {
-        // No time_proj → repeat time-embedding as time_mod
-        time_mod = ggml_repeat(ctx, tp,
-            ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 6));
-    }
+    tp = ggml_silu(ctx, tp);  // SiLU before time_proj (HOT-Step dit-graph.h:144)
+    auto pj = ggml_mul_mat(ctx, tpw, tp);
+    if (tpb) pj = ggml_add(ctx, pj, ggml_repeat(ctx, tpb, pj));
+    ggml_tensor* time_mod = ggml_reshape_2d(ctx, pj, H, 6);   // ne0=H, ne1=6
 
     // ── Condition embedder ───────────────────────────────────────────────
     // Full upstream pipeline (modeling_ace_step.py:830):
@@ -517,59 +502,57 @@ static bool run_one_forward(
     // Without timbre, the DiT produces white noise (verified: the silence_latent
     // is the "no music" reference that anchors the timbre encoder — passing
     // literal zeros is OOD and produces drone-like output).
-    ggml_tensor* cond_emb = nullptr;
+    // Conditioning weights — validated at load time (loader.cpp must_have).
     ggml_tensor* tp_w = ggml_get_tensor(ext_ctx, "encoder.text_projector.weight");
-    ggml_tensor* cew = ggml_get_tensor(ext_ctx, "decoder.condition_embedder.weight");
-    ggml_tensor* ceb = ggml_get_tensor(ext_ctx, "decoder.condition_embedder.bias");
+    ggml_tensor* cew  = ggml_get_tensor(ext_ctx, "decoder.condition_embedder.weight");
+    ggml_tensor* ceb  = ggml_get_tensor(ext_ctx, "decoder.condition_embedder.bias");
 
-    // (A) Timbre token from silence_latent (single CLS-pooled 2048-dim token)
-    ggml_tensor* timbre_tok = nullptr;
-    if (refer_audio && T_refer > 0 && cew) {
-        const int timbre_dim = 64;   // timbre_hidden_dim
-        timbre_tok = timbre_encode(ctx, ext_ctx, refer_audio, T_refer, timbre_dim,
-                                    H,  /* same hidden_size as DiT */
-                                    nh, nk, hd, theta);
-        // timbre_tok is [H, 1] = [2048, 1] (same hidden as encoder output)
+    // (A) Timbre token from silence_latent (single CLS-pooled 2048-dim token).
+    //     Upstream ALWAYS supplies refer_audio (silence_latent slice for
+    //     text2music). If the caller didn't, that's a bug — fail loudly.
+    if (!refer_audio || T_refer <= 0) {
+        if (error) *error = "DiT: refer_audio (silence_latent) required but not provided";
+        return false;
+    }
+    const int timbre_dim = 64;   // timbre_hidden_dim
+    ggml_tensor* timbre_tok = timbre_encode(ctx, ext_ctx, refer_audio, T_refer,
+                                            timbre_dim, H,
+                                            nh, nk, hd, theta);
+    if (!timbre_tok) {
+        if (error) *error = "DiT: timbre_encode returned null (missing tensor?)";
+        return false;
     }
 
-    // (B) Text projection: TE_text_hs [1024, T_text] → [2048, T_text]
-    ggml_tensor* text_proj = nullptr;
-    if (tp_w && cond_data && ct_len > 0) {
+    // (B) Text projection: TE_text_hs [1024, T_text] → [2048, T_text].
+    //     CFG uncond branch passes cond_data=null; in that case we project
+    //     the learned null_condition_emb instead.
+    ggml_tensor* text_proj;
+    if (cond_data && ct_len > 0) {
         int64_t te_hs = (cond_hidden > 0) ? cond_hidden : 1024;
         ggml_tensor* ct = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, te_hs, ct_len);
         memcpy(ct->data, cond_data,
                static_cast<size_t>(ct_len) * static_cast<size_t>(te_hs) *
                sizeof(float));
         text_proj = ggml_mul_mat(ctx, tp_w, ct);   // [2048, T_text]
+    } else {
+        // CFG uncond: use null_condition_emb. This is the ONE legitimate
+        // "fallback" — it's how upstream represents the null prompt.
+        ggml_tensor* nce = ggml_get_tensor(ext_ctx, "null_condition_emb");
+        if (!nce) {
+            if (error) *error = "DiT: null_condition_emb missing (CFG uncond)";
+            return false;
+        }
+        text_proj = ggml_mul_mat(ctx, tp_w, nce);
     }
 
     // (C) Pack [timbre | text] → encoder_hidden_states [2048, T_packed]
     //     Upstream _pack_sequences concatenates then sorts valid tokens first.
     //     For unpadded single-batch, just concat (timbre first per upstream).
-    ggml_tensor* packed = nullptr;
-    if (timbre_tok && text_proj) {
-        // ggml_concat on dim=1 (the sequence dim, ne[1])
-        packed = ggml_concat(ctx, timbre_tok, text_proj, 1);
-    } else if (text_proj) {
-        packed = text_proj;   // degraded: text only
-    } else if (timbre_tok) {
-        packed = timbre_tok;
-    }
+    ggml_tensor* packed = ggml_concat(ctx, timbre_tok, text_proj, 1);
 
     // (D) condition_embedder: [2048, T_packed] → [H_dit, T_packed]
-    if (cew && ceb && packed) {
-        ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, packed);
-        cond_emb = ggml_add(ctx, ce_out, ggml_repeat(ctx, ceb, ce_out));
-    } else if (cew && ceb && (!cond_data || ct_len == 0)) {
-        // No input condition — use learned null_condition_emb.
-        // null_condition_emb is encoder_hidden-dim (2048); condition_embedder
-        // maps it to H. Same bias-repeat fix as above.
-        ggml_tensor* nce = ggml_get_tensor(ext_ctx, "null_condition_emb");
-        if (nce) {
-            ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, nce);
-            cond_emb = ggml_add(ctx, ce_out, ggml_repeat(ctx, ceb, ce_out));
-        }
-    }
+    ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, packed);
+    ggml_tensor* cond_emb = ggml_add(ctx, ce_out, ggml_repeat(ctx, ceb, ce_out));
 
     // ── DiT layers ───────────────────────────────────────────────────────
     for (int i = 0; i < n_layer && i < 48; i++) {
@@ -592,13 +575,11 @@ static bool run_one_forward(
         //   x = x + attn_out * gate_msa                       # gate=chunk[2]
         {
             ggml_tensor* h = ggml_rms_norm(ctx, cur, eps);
-            // Learned norm weight
+            // Learned norm weight (validated at load time)
             std::snprintf(buf, sizeof(buf),
                           "decoder.layers.%d.self_attn_norm.weight", i);
             ggml_tensor* san_w = ggml_get_tensor(ext_ctx, buf);
-            if (san_w) {
-                h = ggml_mul(ctx, h, ggml_repeat(ctx, san_w, h));
-            }
+            h = ggml_mul(ctx, h, ggml_repeat(ctx, san_w, h));
             // AdaLN modulation: h * (1 + scale[row1]) + shift[row0]
             h = adaln(ctx, h, layer_time_mod, 1, 0, H);  // row_s=1 (scale), row_h=0 (shift)
 
@@ -628,14 +609,12 @@ static bool run_one_forward(
                           q_w, k_w, v_w, o_w,
                           qn_w, kn_w, theta);
             // GATED residual: cur += h * gate[row2]
-            if (h) {
-                auto gate = ggml_reshape_2d(ctx,
-                    ggml_view_1d(ctx, layer_time_mod, H,
-                                 static_cast<size_t>(2) * H * sizeof(float)),
-                    H, 1);
-                cur = ggml_add(ctx, cur,
-                                ggml_mul(ctx, h, ggml_repeat(ctx, gate, h)));
-            }
+            auto gate = ggml_reshape_2d(ctx,
+                ggml_view_1d(ctx, layer_time_mod, H,
+                             static_cast<size_t>(2) * H * sizeof(float)),
+                H, 1);
+            cur = ggml_add(ctx, cur,
+                            ggml_mul(ctx, h, ggml_repeat(ctx, gate, h)));
         }
 
         // ── Cross-attention block (NO modulation, plain residual) ───────
@@ -643,15 +622,13 @@ static bool run_one_forward(
         //   norm_h = cross_attn_norm(x)   # NO scale/shift modulation
         //   attn_out = cross_attn(norm_h, cond)
         //   x = x + attn_out              # plain residual, NO gate
-        if (cond_emb) {
+        {
             ggml_tensor* h = ggml_rms_norm(ctx, cur, eps);
-            // Learned norm weight
+            // Learned norm weight (validated)
             std::snprintf(buf, sizeof(buf),
                           "decoder.layers.%d.cross_attn_norm.weight", i);
             ggml_tensor* can_w = ggml_get_tensor(ext_ctx, buf);
-            if (can_w) {
-                h = ggml_mul(ctx, h, ggml_repeat(ctx, can_w, h));
-            }
+            h = ggml_mul(ctx, h, ggml_repeat(ctx, can_w, h));
             // NO adaln modulation for cross-attention
 
             int c_len = static_cast<int>(cond_emb->ne[1]);
@@ -679,20 +656,18 @@ static bool run_one_forward(
             h = cross_attn(ctx, h, cond_emb, T, c_len, H, nh, nk, hd,
                            ca_q, ca_k, ca_v, ca_o,
                            ca_qn, ca_kn);
-            if (h) cur = ggml_add(ctx, cur, h);   // plain residual
+            cur = ggml_add(ctx, cur, h);   // plain residual
         }
 
         // ── MLP block ────────────────────────────────────────────────────
         // Upstream: norm_h = norm(x) * (1 + c_scale[4]) + c_shift[3]; x += mlp * c_gate[5]
         {
             ggml_tensor* h = ggml_rms_norm(ctx, cur, eps);
-            // Learned norm weight
+            // Learned norm weight (validated)
             std::snprintf(buf, sizeof(buf),
                           "decoder.layers.%d.mlp_norm.weight", i);
             ggml_tensor* mn_w = ggml_get_tensor(ext_ctx, buf);
-            if (mn_w) {
-                h = ggml_mul(ctx, h, ggml_repeat(ctx, mn_w, h));
-            }
+            h = ggml_mul(ctx, h, ggml_repeat(ctx, mn_w, h));
             // AdaLN modulation: c_scale=row4, c_shift=row3
             h = adaln(ctx, h, layer_time_mod, 4, 3, H);  // row_s=4 (scale), row_h=3 (shift)
 
@@ -708,14 +683,12 @@ static bool run_one_forward(
 
             h = swiglu_mlp(ctx, h, gw, uw, dw);
             // GATED residual: cur += h * c_gate[row5]
-            if (h) {
-                auto c_gate = ggml_reshape_2d(ctx,
-                    ggml_view_1d(ctx, layer_time_mod, H,
-                                 static_cast<size_t>(5) * H * sizeof(float)),
-                    H, 1);
-                cur = ggml_add(ctx, cur,
-                                ggml_mul(ctx, h, ggml_repeat(ctx, c_gate, h)));
-            }
+            auto c_gate = ggml_reshape_2d(ctx,
+                ggml_view_1d(ctx, layer_time_mod, H,
+                             static_cast<size_t>(5) * H * sizeof(float)),
+                H, 1);
+            cur = ggml_add(ctx, cur,
+                            ggml_mul(ctx, h, ggml_repeat(ctx, c_gate, h)));
         }
     }
 
@@ -724,12 +697,10 @@ static bool run_one_forward(
     //   shift, scale = (scale_shift_table + temb).chunk(2)  # 2 chunks: shift, scale
     //   out = norm_out(x) * (1 + scale[row1]) + shift[row0]
     {
-        // Learned output norm weight
+        // Learned output norm weight (validated at load time)
         ggml_tensor* norm_out_w = ggml_get_tensor(ext_ctx, "decoder.norm_out.weight");
         ggml_tensor* n_out = ggml_rms_norm(ctx, cur, eps);
-        if (norm_out_w) {
-            n_out = ggml_mul(ctx, n_out, ggml_repeat(ctx, norm_out_w, n_out));
-        }
+        n_out = ggml_mul(ctx, n_out, ggml_repeat(ctx, norm_out_w, n_out));
 
         // Global scale/shift: decoder.scale_shift_table [H, 2] → ne0=H, ne1=2
         // Upstream: out = norm(x) * (1 + scale[row1]) + shift[row0]
