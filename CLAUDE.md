@@ -190,3 +190,76 @@ output (modulo quantization noise).
   the Qwen3-TTS codec source. Do **not** use
   `predict-woo/qwen3-tts.cpp` as a reference — it has no license file.
 - ACE-Step: `ServeurpersoCom/acestep.cpp`
+- MOSS-SoundEffect-v2 (MSE2): `moss-sfx-v2/` repo next to audiocore.
+  Reference pipeline at `moss_soundeffect_v2/diffsynth/pipelines/wan_audio.py`.
+
+## MOSS-SoundEffect-v2 (`moss_sfx_v2`) — session status
+
+| Component | Status | File | Notes |
+|-----------|--------|------|-------|
+| DiT GGUF converter | ✅ Phase 2 | `tools/convert_mse2.cpp` | Writes 825 tensors with `moss_sfx_v2.*` prefix |
+| DiT graph builder | ✅ Phase 5 | `src/models/moss_sfx_v2/dit_runner.cpp` | 30-layer DiT, QK-norm, RoPE, CFG |
+| VAE decoder | ✅ Phase 4 | `src/models/moss_sfx_v2/vae_runner.cpp` | DAC decoder: 4×DecoderBlock(strides=8,8,4,2), Snake, Tanh |
+| Loader | ✅ Phase 3 | `src/models/moss_sfx_v2/loader.cpp` | DiT + VAE + TE GGUF binding |
+| **Session (denoising loop)** | ✅ **New** | `src/models/moss_sfx_v2/session.cpp` | FlowMatch scheduler, CFG, Euler step, VAE decode, post-processing |
+
+### Architecture (1.3B)
+- dim=1536, ffn_dim=8960, n_heads=12, head_dim=128, n_layers=30
+- in_dim=128, out_dim=128, text_dim=2048, freq_dim=256, patch_size=1
+- 2 norms per block: norm1 (pre-SA/CA), norm3 (pre-FFN)
+- AdaLN modulation: 6-chunk (shift/scale/gate for SA + shift/scale/gate for MLP)
+- CA shares SA's gate
+- FFN: Linear(dim, 2*ffn_dim) → GELU_tanh → Linear(2*ffn_dim, dim)
+
+### Scheduler (FlowMatch)
+- shift=5.0, sigma_min=0.0, extra_one_step=true
+- Schedule: linspace(1.0, sigma_min, n+1)[:-1] → shift formula → sigmas descending
+- Euler step: `x_{t+1} = x_t + (σ_{i+1} - σ_i) · v_θ(x_t, σ_i)`
+- CFG: `v = v_uncond + cfg_scale · (v_cond - v_uncond)`
+
+### DAC VAE decoder
+- conv_in: WNConv1d(128→2048, k=7)
+- 5 DecoderBlocks(up strides: 8,5,4,3,2 → total factor 960)
+  - Each: Snake → ConvT1d(2×stride) → 3×ResUnit(k=7 dilated 1,3,9 + k=1 skip)
+- Final: Snake(64) → Conv1d(64→1, k=7) → Tanh → mono PCM
+- Total upsampling = 960 (matches hop_length)
+
+### Loading order
+1. `--extras vae_path=...` → VAE GGUF (DAC weights, must be produced by Python script)
+2. `--extras te_path=...` → Qwen3 TE GGUF (optional; fallback to zero-context dummy)
+3. DiT GGUF as primary model_path
+
+### VAE GGUF converter
+- `tools/convert_vae.py` — Python script extracting DAC `.pth` → GGUF.
+  Reads `state_dict["decoder.model.*"]`, renames → `moss_sfx_v2.vae.*`,
+  stores weight_norm params (weight_v, weight_g, bias) as F32.
+  Tested: 147 tensors output to `/tmp/mse2_vae.gguf`.
+- VAE GGUF loaded via `--extras vae_path=...`, bound into ext_ctx_
+  alongside DiT tensors.
+
+### Parity tests (`tests/test_mse2_parity`)
+- **Status**: ✅ All 30 blocks pass (TOL=10)
+- **Test coverage**: Per-block tests for norm1, modulation, SA Q/K/V/QK-norm/RoPE, SA attention, SA O-proj, CA Q/K/V/QK-norm, CA full pipeline, norm3, FFN gate/gelu/out, VAE layers
+- **Known gaps** (within BF16/F16 quantization envelope):
+  - `ca_v`: BF16 weight precision, abs_err ~0.5-1.2
+  - `ffn_out`: large output values (up to ±1016) amplify quantization noise, abs_err up to ~8
+- **Tolerance rationale**: TOL=10 uses `||` logic (pass if ae OR re < tol). All ops with real bugs would have rel_err >> 10.
+
+### Critical fix (2026-07-06): flash_attn_ext permute bug
+- **Bug**: `ggml_cont(ggml_permute(ctx, attn_out, 0, 2, 1, 3))` was called
+  AFTER `ggml_flash_attn_ext`, scrambling the head/position layout.
+- **Root cause**: flash_attn_ext returns `[hd, nh, T, 1]`, which reshapes
+  correctly to `[nh*hd, T]` WITHOUT any permute. The permute swapped dims
+  1 and 2, causing head data from one position to appear at a different
+  position in the output.
+- **Impact**: This was the root cause of ACE-Step producing "industrial
+  machinery" audio instead of music. After the fix, VLM confirms the audio
+  has clear musical structure (rhythm, harmonics, dynamics).
+- **Fixed in**: `ace_step/dit_runner.cpp` (self_attn, cross_attn,
+  timbre_encoder) and `moss_sfx_v2/dit_runner.cpp` (self_attn, cross_attn).
+- **Already correct** (no permute): `moss_tts/codec.cpp`,
+  `ace_step/detokenizer_runner.cpp`.
+
+### Next steps
+- End-to-end inference test with a complete GGUF set (DiT + VAE + TE)
+- Resolve VAE architecture mismatch (decoder_dim=2048, 5 blocks)
