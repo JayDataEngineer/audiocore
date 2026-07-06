@@ -668,9 +668,15 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                          hidden.data());
 
         // DiT forward: hidden [S, H] → v_hidden [S, H]
+        // Pass silence_latent slice for timbre conditioning.
+        // Upstream uses timbre_fix_frame = ceil(30 * 25) = 750 frames.
+        const int32_t T_refer = silence_ptr ?
+            std::min<int32_t>(750, silence_T) : 0;
+        const float* refer_audio = silence_ptr;
         if (!dit_runner_->forward(hidden.data(), t,
                                   cond_ptr, T_cond, enc_hs,
                                   uncond_ptr, T_uncond,
+                                  refer_audio, T_refer,
                                   req.guidance_scale,
                                   S_patches,
                                   v_hidden.data(), error))
@@ -682,15 +688,15 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                             proj_out_w_f32_.data(), proj_out_bias,
                             v_latent.data());
 
-        // NaN check on v_latent
+        // NaN check on v_latent (warn-only)
         {
-            int nan_cnt = 0; float mx = 0, mn = 0;
-            for (size_t i = 0; i < v_latent.size(); i++) {
+            int nan_cnt = 0;
+            for (size_t i = 0; i < v_latent.size(); i++)
                 if (std::isnan(v_latent[i])) nan_cnt++;
-                else { if (v_latent[i] > mx) mx = v_latent[i]; if (v_latent[i] < mn) mn = v_latent[i]; }
+            if (nan_cnt > 0) {
+                fprintf(stderr, "[ace_step] WARNING: step %d v_latent NaN=%d/%zu\n",
+                        step, nan_cnt, v_latent.size());
             }
-            fprintf(stderr, "[ace_step] dit: step %d v_latent NaN=%d/%zu range=[%.3f,%.3f]\n",
-                    step, nan_cnt, v_latent.size(), mn, mx);
         }
 
         // Euler step in LATENT space: xt += dt · v_latent
@@ -727,8 +733,10 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
         int nan_l = 0;
         for (size_t i = 0; i < xt_current.size(); i++)
             if (std::isnan(xt_current[i])) nan_l++;
-        fprintf(stderr, "[ace_step] NaN check: latents=%d/%zu\n",
-                nan_l, xt_current.size());
+        if (nan_l > 0) {
+            fprintf(stderr, "[ace_step] WARNING: %d/%zu NaN in final latent\n",
+                    nan_l, xt_current.size());
+        }
     }
     if (!vae_runner_->decode(xt_current.data(), T_latent, pcm_stereo, error))
         return false;

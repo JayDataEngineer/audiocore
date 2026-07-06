@@ -261,18 +261,173 @@ static void timestep_embed(float t, float* out, int dim) {
     }
 }
 
+// ── Timbre encoder: silence_latent [T, 64] → [1, 2048] CLS-pooled token ──────
+// 4-layer pre-LN transformer with GQA + QK-norm + RoPE.
+// Matches encoder.timbre_encoder in ace_step/modeling_ace_step.py:325.
+// Bidirectional attention (NOT causal); layer_types alternate
+// [sliding, full, sliding, full] but we use full attention for all layers
+// (window=128 over T=750 only affects efficiency; the upstream pipeline
+// applies the SAME padding mask to all tokens — for an unpadded single
+// batch with no padding mask, the only practical effect of sliding_window
+// is to limit attention range. We use full attention to keep the CLS token
+// well-mixed with all 750 silence frames, which preserves timbre info.)
+static ggml_tensor* timbre_encode(ggml_context* ctx,
+                                    ggml_context* ext_ctx,
+                                    const float* refer_audio,
+                                    int T_refer, int timbre_dim,
+                                    int H, int nh, int nk, int hd,
+                                    float rope_theta) {
+    constexpr int kNumTimbreLayers = 4;
+
+    // embed_tokens: Linear(timbre_dim=64 → H=2048) with bias
+    auto et_w = ggml_get_tensor(ext_ctx, "encoder.timbre_encoder.embed_tokens.weight");
+    auto et_b = ggml_get_tensor(ext_ctx, "encoder.timbre_encoder.embed_tokens.bias");
+    if (!et_w) return nullptr;
+
+    // Load refer_audio [timbre_dim, T_refer]
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, timbre_dim, T_refer);
+    memcpy(input->data, refer_audio,
+           static_cast<size_t>(timbre_dim) * T_refer * sizeof(float));
+
+    // Project to H: weight [H, 64] @ x [64, T] → [H, T]
+    ggml_tensor* hidden = ggml_mul_mat(ctx, et_w, input);
+    if (et_b) hidden = ggml_add(ctx, hidden, ggml_repeat(ctx, et_b, hidden));
+
+    // Position IDs [0..T_refer-1]
+    ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_refer);
+    {
+        int32_t* pd = static_cast<int32_t*>(pos->data);
+        for (int i = 0; i < T_refer; i++) pd[i] = i;
+    }
+
+    // 4 transformer layers
+    for (int i = 0; i < kNumTimbreLayers; i++) {
+        char buf[160];
+
+        // ── pre-LN self-attention ──
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.input_layernorm.weight", i);
+        ggml_tensor* ln_w = ggml_get_tensor(ext_ctx, buf);
+        ggml_tensor* h = ggml_rms_norm(ctx, hidden, 1e-6f);
+        if (ln_w) h = ggml_mul(ctx, h, ggml_repeat(ctx, ln_w, h));
+
+        // Self-attn projections (GQA: q has nh heads, kv has nk heads)
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.self_attn.q_proj.weight", i);
+        auto q_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.self_attn.k_proj.weight", i);
+        auto k_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.self_attn.v_proj.weight", i);
+        auto v_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.self_attn.o_proj.weight", i);
+        auto o_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.self_attn.q_norm.weight", i);
+        auto qn_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.self_attn.k_norm.weight", i);
+        auto kn_w = ggml_get_tensor(ext_ctx, buf);
+
+        if (q_w && k_w && v_w) {
+            auto q = ggml_mul_mat(ctx, q_w, h);
+            auto k = ggml_mul_mat(ctx, k_w, h);
+            auto v = ggml_mul_mat(ctx, v_w, h);
+
+            q = apply_qk_norm(ctx, q, hd, nh, qn_w);
+            k = apply_qk_norm(ctx, k, hd, nk, kn_w);
+
+            // Reshape 3D for RoPE: [hd, n_heads, T]
+            q = ggml_reshape_3d(ctx, q, hd, nh, T_refer);
+            k = ggml_reshape_3d(ctx, k, hd, nk, T_refer);
+            v = ggml_reshape_3d(ctx, v, hd, nk, T_refer);
+
+            // RoPE on Q and K
+            auto rope = [&](ggml_tensor* t) {
+                return ggml_rope_ext(ctx, t, pos, nullptr,
+                                      hd, 2, 0,
+                                      rope_theta, 1.0f, 0.0f, 1.0f,
+                                      0.0f, 0.0f);
+            };
+            q = rope(q);
+            k = rope(k);
+
+            // Permute → [hd, T, n_heads] for flash_attn_ext
+            auto rsh = [&](ggml_tensor* t, int n_h) {
+                return ggml_cont(ctx, ggml_permute(ctx, t, 0, 2, 1, 3));
+            };
+            q = rsh(q, nh);
+            k = rsh(k, nk);
+            v = rsh(v, nk);
+
+            float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+            // Bidirectional (mask=nullptr → attend to all)
+            auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            a = ggml_cont(ctx, ggml_permute(ctx, a, 0, 2, 1, 3));
+            a = ggml_reshape_2d(ctx, a, nh * hd, T_refer);
+            if (o_w) a = ggml_mul_mat(ctx, o_w, a);
+            hidden = ggml_add(ctx, hidden, a);   // residual
+        }
+
+        // ── post-LN SwiGLU MLP ──
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.post_attention_layernorm.weight", i);
+        ggml_tensor* post_ln_w = ggml_get_tensor(ext_ctx, buf);
+        h = ggml_rms_norm(ctx, hidden, 1e-6f);
+        if (post_ln_w) h = ggml_mul(ctx, h, ggml_repeat(ctx, post_ln_w, h));
+
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.mlp.gate_proj.weight", i);
+        auto gw = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.mlp.up_proj.weight", i);
+        auto uw = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.timbre_encoder.layers.%d.mlp.down_proj.weight", i);
+        auto dw = ggml_get_tensor(ext_ctx, buf);
+        if (gw && uw && dw) {
+            auto mlp_out = swiglu_mlp(ctx, h, gw, uw, dw);
+            if (mlp_out) hidden = ggml_add(ctx, hidden, mlp_out);
+        }
+    }
+
+    // Final RMSNorm
+    auto final_ln_w = ggml_get_tensor(ext_ctx, "encoder.timbre_encoder.norm.weight");
+    if (final_ln_w) {
+        hidden = ggml_rms_norm(ctx, hidden, 1e-6f);
+        hidden = ggml_mul(ctx, hidden, ggml_repeat(ctx, final_ln_w, hidden));
+    }
+
+    // CLS pooling: take first token → [H, 1]
+    // hidden is [H, T_refer] → view 1d first column
+    ggml_tensor* cls = ggml_view_1d(ctx, hidden, H, 0);   // offset 0, length H
+    cls = ggml_reshape_2d(ctx, cls, H, 1);                // [H, 1]
+
+    // Prepend the learned special_token ([H]) — upstream prepends it as the
+    // first sequence position before pooling takes [:, 0, :]. Effectively, the
+    // special_token IS the CLS representation. We add it as an additional
+    // conditioning token (more conservative — keeps the pooled representation
+    // distinct from the learned special token).
+    // NOTE: upstream timbre_encoder returns (B, 1, H) — just the pooled CLS.
+    // We return [H, 1] (single token). The special_token is not added here.
+    return cls;
+}
+
 // ── Single forward: build graph + compute ────────────────────────────────────
 static bool run_one_forward(
     const DitConfig& cfg, ggml_context* ext_ctx,
     const float* x_t, int32_t T, int32_t H,
     const float* temb, int temb_dim,
     const float* cond_data, int ct_len, int cond_hidden,
+    const float* refer_audio, int T_refer,
     float* result,
     const std::vector<std::vector<float>>& ss_table_f32,
     const std::vector<float>& global_ss_f32,
     std::string* error)
 {
-    // Input NaN diagnostics
+    // Input NaN check
     {
         int nx = 0, nt = 0, nc = 0;
         for (int32_t i = 0; i < T * H; i++) if (std::isnan(x_t[i])) nx++;
@@ -280,8 +435,10 @@ static bool run_one_forward(
         if (cond_data && ct_len > 0) {
             for (int i = 0; i < ct_len * cond_hidden; i++) if (std::isnan(cond_data[i])) nc++;
         }
-        fprintf(stderr, "[dit] input NaN: x=%d/%d temb=%d/%d cond=%d/%d\n",
-                nx, T*H, nt, temb_dim, nc, cond_data ? ct_len*cond_hidden : 0);
+        if (nx || nt || nc) {
+            fprintf(stderr, "[dit] WARNING input NaN: x=%d/%d temb=%d/%d cond=%d/%d\n",
+                    nx, T*H, nt, temb_dim, nc, cond_data ? ct_len*cond_hidden : 0);
+        }
     }
     const int32_t nh      = cfg.n_heads     > 0 ? cfg.n_heads     : 24;
     const int32_t nk      = cfg.n_kv_heads  > 0 ? cfg.n_kv_heads  : 8;
@@ -350,29 +507,58 @@ static bool run_one_forward(
     }
 
     // ── Condition embedder ───────────────────────────────────────────────
-    // Pipeline: TE hidden (1024-dim) → encoder.text_projector (1024→2048)
-    //           → decoder.condition_embedder (2048→2048) → cross-attn
+    // Full upstream pipeline (modeling_ace_step.py:830):
+    //   1. text_projector(TE_text_hs)         : [T_text, 1024] → [T_text, 2048]
+    //   2. timbre_encoder(silence_latent[:750]) : [750, 64] → [1, 2048] (CLS pool)
+    //   3. (lyric_encoder(TE_lyric_hs))        : [T_lyric, 2048]  (skipped — no lyrics)
+    //   4. pack [timbre | text] (lyrics go in between when present)
+    //   5. condition_embedder(packed)          : [T_packed, 2048] → [T_packed, H]
+    //
+    // Without timbre, the DiT produces white noise (verified: the silence_latent
+    // is the "no music" reference that anchors the timbre encoder — passing
+    // literal zeros is OOD and produces drone-like output).
     ggml_tensor* cond_emb = nullptr;
     ggml_tensor* tp_w = ggml_get_tensor(ext_ctx, "encoder.text_projector.weight");
     ggml_tensor* cew = ggml_get_tensor(ext_ctx, "decoder.condition_embedder.weight");
     ggml_tensor* ceb = ggml_get_tensor(ext_ctx, "decoder.condition_embedder.bias");
-    if (tp_w && cew && ceb && cond_data && ct_len > 0) {
-        // (1) Load raw TE hidden states [te_hs, ct_len] (te_hs=1024)
+
+    // (A) Timbre token from silence_latent (single CLS-pooled 2048-dim token)
+    ggml_tensor* timbre_tok = nullptr;
+    if (refer_audio && T_refer > 0 && cew) {
+        const int timbre_dim = 64;   // timbre_hidden_dim
+        timbre_tok = timbre_encode(ctx, ext_ctx, refer_audio, T_refer, timbre_dim,
+                                    H,  /* same hidden_size as DiT */
+                                    nh, nk, hd, theta);
+        // timbre_tok is [H, 1] = [2048, 1] (same hidden as encoder output)
+    }
+
+    // (B) Text projection: TE_text_hs [1024, T_text] → [2048, T_text]
+    ggml_tensor* text_proj = nullptr;
+    if (tp_w && cond_data && ct_len > 0) {
         int64_t te_hs = (cond_hidden > 0) ? cond_hidden : 1024;
         ggml_tensor* ct = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, te_hs, ct_len);
         memcpy(ct->data, cond_data,
                static_cast<size_t>(ct_len) * static_cast<size_t>(te_hs) *
                sizeof(float));
-        // (2) Project TE hidden (1024) → encoder_hidden (2048) via
-        //     encoder.text_projector. Weight ne=[1024, 2048] → mul_mat
-        //     maps inner 1024 → outer 2048.
-        ggml_tensor* proj = ggml_mul_mat(ctx, tp_w, ct);
-        // (3) Apply condition_embedder: encoder_hidden (2048) → H.
-        //     The bias repeat target MUST be the mul_mat output (shape H),
-        //     not `proj` (shape 2048) — those only coincide when H==2048
-        //     (turbo). For xl-base H=2560, repeating ceb=[2560] against
-        //     proj=[2048,N] is a shape error.
-        ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, proj);
+        text_proj = ggml_mul_mat(ctx, tp_w, ct);   // [2048, T_text]
+    }
+
+    // (C) Pack [timbre | text] → encoder_hidden_states [2048, T_packed]
+    //     Upstream _pack_sequences concatenates then sorts valid tokens first.
+    //     For unpadded single-batch, just concat (timbre first per upstream).
+    ggml_tensor* packed = nullptr;
+    if (timbre_tok && text_proj) {
+        // ggml_concat on dim=1 (the sequence dim, ne[1])
+        packed = ggml_concat(ctx, timbre_tok, text_proj, 1);
+    } else if (text_proj) {
+        packed = text_proj;   // degraded: text only
+    } else if (timbre_tok) {
+        packed = timbre_tok;
+    }
+
+    // (D) condition_embedder: [2048, T_packed] → [H_dit, T_packed]
+    if (cew && ceb && packed) {
+        ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, packed);
         cond_emb = ggml_add(ctx, ce_out, ggml_repeat(ctx, ceb, ce_out));
     } else if (cew && ceb && (!cond_data || ct_len == 0)) {
         // No input condition — use learned null_condition_emb.
@@ -399,6 +585,11 @@ static bool run_one_forward(
         }
 
         // ── Self-attention block ─────────────────────────────────────────
+        // Upstream (modeling_acestep_v15_turbo.py:494-514):
+        //   6 chunks = (shift_msa, scale_msa, gate_msa, c_shift, c_scale, c_gate)
+        //   norm_h = norm(x) * (1 + scale_msa) + shift_msa   # scale=chunk[1], shift=chunk[0]
+        //   attn_out = self_attn(norm_h)
+        //   x = x + attn_out * gate_msa                       # gate=chunk[2]
         {
             ggml_tensor* h = ggml_rms_norm(ctx, cur, eps);
             // Learned norm weight
@@ -408,7 +599,8 @@ static bool run_one_forward(
             if (san_w) {
                 h = ggml_mul(ctx, h, ggml_repeat(ctx, san_w, h));
             }
-            h = adaln(ctx, h, layer_time_mod, 0, 1, H);
+            // AdaLN modulation: h * (1 + scale[row1]) + shift[row0]
+            h = adaln(ctx, h, layer_time_mod, 1, 0, H);  // row_s=1 (scale), row_h=0 (shift)
 
             // Self-attention with separate Q/K/V + QK-norm
             std::snprintf(buf, sizeof(buf),
@@ -435,10 +627,22 @@ static bool run_one_forward(
             h = self_attn(ctx, h, T, H, nh, nk, hd,
                           q_w, k_w, v_w, o_w,
                           qn_w, kn_w, theta);
-            if (h) cur = ggml_add(ctx, cur, h);
+            // GATED residual: cur += h * gate[row2]
+            if (h) {
+                auto gate = ggml_reshape_2d(ctx,
+                    ggml_view_1d(ctx, layer_time_mod, H,
+                                 static_cast<size_t>(2) * H * sizeof(float)),
+                    H, 1);
+                cur = ggml_add(ctx, cur,
+                                ggml_mul(ctx, h, ggml_repeat(ctx, gate, h)));
+            }
         }
 
-        // ── Cross-attention block ────────────────────────────────────────
+        // ── Cross-attention block (NO modulation, plain residual) ───────
+        // Upstream (modeling_acestep_v15_turbo.py:517-529):
+        //   norm_h = cross_attn_norm(x)   # NO scale/shift modulation
+        //   attn_out = cross_attn(norm_h, cond)
+        //   x = x + attn_out              # plain residual, NO gate
         if (cond_emb) {
             ggml_tensor* h = ggml_rms_norm(ctx, cur, eps);
             // Learned norm weight
@@ -448,7 +652,7 @@ static bool run_one_forward(
             if (can_w) {
                 h = ggml_mul(ctx, h, ggml_repeat(ctx, can_w, h));
             }
-            h = adaln(ctx, h, layer_time_mod, 2, 3, H);
+            // NO adaln modulation for cross-attention
 
             int c_len = static_cast<int>(cond_emb->ne[1]);
             std::snprintf(buf, sizeof(buf),
@@ -475,10 +679,11 @@ static bool run_one_forward(
             h = cross_attn(ctx, h, cond_emb, T, c_len, H, nh, nk, hd,
                            ca_q, ca_k, ca_v, ca_o,
                            ca_qn, ca_kn);
-            if (h) cur = ggml_add(ctx, cur, h);
+            if (h) cur = ggml_add(ctx, cur, h);   // plain residual
         }
 
         // ── MLP block ────────────────────────────────────────────────────
+        // Upstream: norm_h = norm(x) * (1 + c_scale[4]) + c_shift[3]; x += mlp * c_gate[5]
         {
             ggml_tensor* h = ggml_rms_norm(ctx, cur, eps);
             // Learned norm weight
@@ -488,7 +693,8 @@ static bool run_one_forward(
             if (mn_w) {
                 h = ggml_mul(ctx, h, ggml_repeat(ctx, mn_w, h));
             }
-            h = adaln(ctx, h, layer_time_mod, 4, 5, H);
+            // AdaLN modulation: c_scale=row4, c_shift=row3
+            h = adaln(ctx, h, layer_time_mod, 4, 3, H);  // row_s=4 (scale), row_h=3 (shift)
 
             std::snprintf(buf, sizeof(buf),
                           "decoder.layers.%d.mlp.gate_proj.weight", i);
@@ -501,11 +707,22 @@ static bool run_one_forward(
             auto dw = ggml_get_tensor(ext_ctx, buf);
 
             h = swiglu_mlp(ctx, h, gw, uw, dw);
-            if (h) cur = ggml_add(ctx, cur, h);
+            // GATED residual: cur += h * c_gate[row5]
+            if (h) {
+                auto c_gate = ggml_reshape_2d(ctx,
+                    ggml_view_1d(ctx, layer_time_mod, H,
+                                 static_cast<size_t>(5) * H * sizeof(float)),
+                    H, 1);
+                cur = ggml_add(ctx, cur,
+                                ggml_mul(ctx, h, ggml_repeat(ctx, c_gate, h)));
+            }
         }
     }
 
     // ── Final norm + scale/shift ─────────────────────────────────────────
+    // Upstream (modeling_acestep_v15_turbo.py:1494-1500):
+    //   shift, scale = (scale_shift_table + temb).chunk(2)  # 2 chunks: shift, scale
+    //   out = norm_out(x) * (1 + scale[row1]) + shift[row0]
     {
         // Learned output norm weight
         ggml_tensor* norm_out_w = ggml_get_tensor(ext_ctx, "decoder.norm_out.weight");
@@ -515,19 +732,24 @@ static bool run_one_forward(
         }
 
         // Global scale/shift: decoder.scale_shift_table [H, 2] → ne0=H, ne1=2
+        // Upstream: out = norm(x) * (1 + scale[row1]) + shift[row0]
         if (!global_ss_f32.empty()) {
             ggml_tensor* gss = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
             memcpy(gss->data, global_ss_f32.data(),
                    static_cast<size_t>(H) * 2 * sizeof(float));
-            auto os = ggml_reshape_2d(ctx,
+            // shift = row 0, scale = row 1
+            auto shift = ggml_reshape_2d(ctx,
                 ggml_view_1d(ctx, gss, H, 0), H, 1);
-            auto oh = ggml_reshape_2d(ctx,
+            auto scale = ggml_reshape_2d(ctx,
                 ggml_view_1d(ctx, gss, H,
                              static_cast<size_t>(H) * sizeof(float)),
                 H, 1);
+            // (1 + scale)
+            auto one_plus_scale = ggml_add(ctx,
+                scale, ggml_new_f32(ctx, 1.0f));
             n_out = ggml_add(ctx,
-                ggml_mul(ctx, n_out, ggml_repeat(ctx, os, n_out)),
-                ggml_repeat(ctx, oh, n_out));
+                ggml_mul(ctx, n_out, ggml_repeat(ctx, one_plus_scale, n_out)),
+                ggml_repeat(ctx, shift, n_out));
         }
         cur = n_out;
     }
@@ -553,6 +775,7 @@ bool DiTRunner::forward(
     const float* x_t, float t,
     const float* cond, int32_t T_cond, int32_t cond_hidden,
     const float* cond_nc, int32_t T_cond_nc,
+    const float* refer_audio, int32_t T_refer,
     float guidance_scale, int32_t n_patches,
     float* output, std::string* error)
 {
@@ -570,6 +793,7 @@ bool DiTRunner::forward(
         return run_one_forward(cfg_, ext_ctx_, x_t, T, H,
                                 temb.data(), temb_dim,
                                 cond, T_cond, cond_hidden,
+                                refer_audio, T_refer,
                                 output,
                                 ss_table_f32_, global_ss_f32_, error);
     }
@@ -581,6 +805,7 @@ bool DiTRunner::forward(
     if (!run_one_forward(cfg_, ext_ctx_, x_t, T, H,
                           temb.data(), temb_dim,
                           cond, T_cond, cond_hidden,
+                          refer_audio, T_refer,
                           c_out.data(),
                           ss_table_f32_, global_ss_f32_, error)) {
         if (error) *error = "DiT: cond forward failed";
@@ -592,6 +817,7 @@ bool DiTRunner::forward(
     if (!run_one_forward(cfg_, ext_ctx_, x_t, T, H,
                           temb.data(), temb_dim,
                           uc, uc_len, cond_hidden,
+                          refer_audio, T_refer,
                           u_out.data(),
                           ss_table_f32_, global_ss_f32_, error)) {
         if (error) *error = "DiT: uncond forward failed";

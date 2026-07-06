@@ -49,10 +49,14 @@ public:
     //   t:      scalar timestep (0..1)
     //   cond:   [T_cond, encoder_hidden] float32 — text encoder output
     //   cond_nc:[T_cond, encoder_hidden] float32 — null-text encoder (CFG uncond)
+    //   refer_audio: [T_refer, 64] float32 — silence_latent slice (for timbre enc)
+    //                If null, the timbre encoder is skipped (degraded mode).
+    //   T_refer: number of refer_audio frames (typically 750 = 30s @ 25Hz)
     //   output: [T_patches, hidden_size] float32 — predicted velocity v
     bool forward(const float* x_t, float t,
                  const float* cond, int32_t T_cond, int32_t cond_hidden,
                  const float* cond_nc, int32_t T_cond_nc,
+                 const float* refer_audio, int32_t T_refer,
                  float guidance_scale, int32_t n_patches,
                  float* output, std::string* error);
 
