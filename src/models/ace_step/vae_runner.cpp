@@ -93,64 +93,69 @@ static std::vector<float> compute_wsconv(const void* wv_data, const void* wg_dat
                                           int K, int OC, int IC,
                                           bool input_is_K_IC_OC,
                                           float eps = 1e-12f) {
-    // The GGUF stores weight_v in PyTorch C-order of the REVERSED tensor shape
-    // (ggml's natural flat order of the reversed PyTorch ne). Verified element-
-    // wise against diffusers' actual loaded weight_v (max err = 0.0).
+    // The GGUF stores weight_v in PyTorch's natural C-order of the ORIGINAL
+    // PyTorch shape. The ggml tensor's ne array is the REVERSED PyTorch shape,
+    // but the byte layout matches PyTorch C-order.
+    //
+    // Conv1d: PyTorch shape (OC, IC, K), so v_pytorch[oc, ic, k] lives at
+    //         flat[oc*IC*K + ic*K + k] in the raw buffer.
+    //
+    // ConvTranspose1d: PyTorch shape (IC, OC, K), so v_pytorch[ic, oc, k]
+    //         lives at flat[ic*OC*K + oc*K + k].
     //
     // PyTorch weight_norm normalizes per dim-0 of the ORIGINAL PyTorch shape:
     //   w = g * v / ||v||_dim0
     //
-    // We output in ggml natural flat for the reversed shape so that downstream
-    // ggml ops (ggml_conv_1d expects ne=[K,IC,OC]; our permute_conv_t1d_weight
-    // indexes wsconv_3d[k + oc*K + ic*K*OC]) read the right values.
+    // We OUTPUT in ggml natural flat for the reversed shape:
+    //   Conv1d         [K, IC, OC]: result[k + ic*K + oc*K*IC]
+    //   ConvTranspose1d [K, OC, IC]: result[k + oc*K + ic*K*OC]
+    // so that downstream ggml ops (ggml_conv_1d expects ne=[K,IC,OC];
+    // permute_conv_t1d_weight indexes wsconv_3d[k + oc*K + ic*K*OC])
+    // read the right values.
     const uint16_t* v = static_cast<const uint16_t*>(wv_data);
     const uint16_t* g = static_cast<const uint16_t*>(wg_data);
     const size_t total = static_cast<size_t>(K) * OC * IC;
     std::vector<float> result(total);
 
     if (input_is_K_IC_OC) {
-        // Conv1d: PyTorch shape [OC, IC, K] → stored reversed [K, IC, OC].
-        // raw_v[k*IC*OC + ic*OC + oc] = v_pytorch[oc, ic, k]
-        // Normalize per oc (PyTorch dim 0).
-        // Output ggml natural flat for [K, IC, OC]:
-        //   result[k + ic*K + oc*K*IC]
+        // Conv1d: PyTorch shape (OC, IC, K). Normalize per oc (PyTorch dim 0).
+        // Source: v[((oc*IC + ic)*K) + k] = v[oc*IC*K + ic*K + k].
+        // Output: result[k + ic*K + oc*K*IC] (ggml natural flat for [K,IC,OC]).
         for (int oc = 0; oc < OC; oc++) {
             float gv  = bf16_to_f32(g[oc]);
             double nsq = 0.0;
             for (int ic = 0; ic < IC; ic++) {
                 for (int k = 0; k < K; k++) {
-                    float vv = bf16_to_f32(v[(static_cast<size_t>(k) * IC + ic) * OC + oc]);
+                    float vv = bf16_to_f32(v[(static_cast<size_t>(oc) * IC + ic) * K + k]);
                     nsq += static_cast<double>(vv) * vv;
                 }
             }
             float s = gv / (static_cast<float>(std::sqrt(nsq)) + eps);
             for (int ic = 0; ic < IC; ic++) {
                 for (int k = 0; k < K; k++) {
-                    float vv = bf16_to_f32(v[(static_cast<size_t>(k) * IC + ic) * OC + oc]);
+                    float vv = bf16_to_f32(v[(static_cast<size_t>(oc) * IC + ic) * K + k]);
                     result[static_cast<size_t>(k) + ic * K +
                            static_cast<size_t>(oc) * K * IC] = vv * s;
                 }
             }
         }
     } else {
-        // ConvTranspose1d: PyTorch shape [IC, OC, K] → stored reversed [K, OC, IC].
-        // raw_v[k*OC*IC + oc*IC + ic] = v_pytorch[ic, oc, k]
-        // Normalize per ic (PyTorch dim 0).
-        // Output ggml natural flat for [K, OC, IC]:
-        //   result[k + oc*K + ic*K*OC]
+        // ConvTranspose1d: PyTorch shape (IC, OC, K). Normalize per ic (dim 0).
+        // Source: v[((ic*OC + oc)*K) + k] = v[ic*OC*K + oc*K + k].
+        // Output: result[k + oc*K + ic*K*OC] (ggml natural flat for [K,OC,IC]).
         for (int ic = 0; ic < IC; ic++) {
             float gv  = bf16_to_f32(g[ic]);
             double nsq = 0.0;
             for (int oc = 0; oc < OC; oc++) {
                 for (int k = 0; k < K; k++) {
-                    float vv = bf16_to_f32(v[(static_cast<size_t>(k) * OC + oc) * IC + ic]);
+                    float vv = bf16_to_f32(v[(static_cast<size_t>(ic) * OC + oc) * K + k]);
                     nsq += static_cast<double>(vv) * vv;
                 }
             }
             float s = gv / (static_cast<float>(std::sqrt(nsq)) + eps);
             for (int oc = 0; oc < OC; oc++) {
                 for (int k = 0; k < K; k++) {
-                    float vv = bf16_to_f32(v[(static_cast<size_t>(k) * OC + oc) * IC + ic]);
+                    float vv = bf16_to_f32(v[(static_cast<size_t>(ic) * OC + oc) * K + k]);
                     result[static_cast<size_t>(k) + oc * K +
                            static_cast<size_t>(ic) * K * OC] = vv * s;
                 }
