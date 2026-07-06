@@ -32,6 +32,9 @@
 //   null_condition_emb
 //
 // CFG runs two separate graphs (cond / uncond) and blends outputs.
+// NOTE: vanilla CFG formula = u + g*(c-u). Upstream uses normalized_guidance
+// with pred_cond base + orthogonal update + norm_threshold=2.5. The vanilla
+// formula over-amplifies when diff is large (FIXME: upgrade to match upstream).
 
 #include "audiocore/models/ace_step/dit_runner.h"
 
@@ -422,10 +425,16 @@ static bool run_one_forward(
     const std::vector<float>& global_ss_f32,
     std::string* error)
 {
-    // Input NaN check
+    // Input NaN check + RMS diagnostics
+    double inp_rms = 0.0;
     {
         int nx = 0, nt = 0, nc = 0;
-        for (int32_t i = 0; i < T * H; i++) if (std::isnan(x_t[i])) nx++;
+        double sq = 0.0;
+        for (int32_t i = 0; i < T * H; i++) {
+            if (std::isnan(x_t[i])) nx++;
+            else sq += static_cast<double>(x_t[i]) * x_t[i];
+        }
+        inp_rms = std::sqrt(sq / std::max(1, T * H));
         for (int i = 0; i < temb_dim; i++) if (std::isnan(temb[i])) nt++;
         if (cond_data && ct_len > 0) {
             for (int i = 0; i < ct_len * cond_hidden; i++) if (std::isnan(cond_data[i])) nc++;
@@ -433,6 +442,9 @@ static bool run_one_forward(
         if (nx || nt || nc) {
             fprintf(stderr, "[dit] WARNING input NaN: x=%d/%d temb=%d/%d cond=%d/%d\n",
                     nx, T*H, nt, temb_dim, nc, cond_data ? ct_len*cond_hidden : 0);
+        }
+        if (std::getenv("ACE_STEP_DIT_DEBUG")) {
+            fprintf(stderr, "[dit] input RMS=%.4f T=%d H=%d\n", inp_rms, T, H);
         }
     }
     const int32_t nh      = cfg.n_heads     > 0 ? cfg.n_heads     : 24;
@@ -524,8 +536,9 @@ static bool run_one_forward(
     }
 
     // (B) Text projection: TE_text_hs [1024, T_text] → [2048, T_text].
-    //     CFG uncond branch passes cond_data=null; in that case we project
-    //     the learned null_condition_emb instead.
+    //     CFG uncond branch passes cond_data=null; in that case null_condition_emb
+    //     is already at encoder_hidden dim (2048), so use it directly as text_proj
+    //     without going through text_projector (which maps 1024→2048 — wrong dim).
     ggml_tensor* text_proj;
     if (cond_data && ct_len > 0) {
         int64_t te_hs = (cond_hidden > 0) ? cond_hidden : 1024;
@@ -535,14 +548,14 @@ static bool run_one_forward(
                sizeof(float));
         text_proj = ggml_mul_mat(ctx, tp_w, ct);   // [2048, T_text]
     } else {
-        // CFG uncond: use null_condition_emb. This is the ONE legitimate
-        // "fallback" — it's how upstream represents the null prompt.
+        // CFG uncond: null_condition_emb [2048] is already in encoder_hidden space.
+        // Reshape to [2048, 1] for packing — no text_projector needed.
         ggml_tensor* nce = ggml_get_tensor(ext_ctx, "null_condition_emb");
         if (!nce) {
             if (error) *error = "DiT: null_condition_emb missing (CFG uncond)";
             return false;
         }
-        text_proj = ggml_mul_mat(ctx, tp_w, nce);
+        text_proj = ggml_reshape_2d(ctx, nce, 2048, 1);  // [2048, 1]
     }
 
     // (C) Pack [timbre | text] → encoder_hidden_states [2048, T_packed]
@@ -565,6 +578,15 @@ static bool run_one_forward(
             memcpy(sst->data, ss_table_f32[i].data(),
                    static_cast<size_t>(H) * 6 * sizeof(float));
             layer_time_mod = ggml_add(ctx, time_mod, sst);
+        }
+
+        // ── Diagnostic: pre-layer RMS (set ACE_STEP_DIT_DEBUG=1) ────────
+        if (std::getenv("ACE_STEP_DIT_DEBUG")) {
+            double sq = 0.0; int64_t nel = ggml_nelements(cur);
+            float* d = (float*)cur->data;
+            for (int64_t ii = 0; ii < nel; ii++) sq += (double)d[ii] * d[ii];
+            double rms = std::sqrt(sq / nel);
+            fprintf(stderr, "[dit] layer %d pre RMS=%.4f\n", i, rms);
         }
 
         // ── Self-attention block ─────────────────────────────────────────
@@ -690,6 +712,15 @@ static bool run_one_forward(
             cur = ggml_add(ctx, cur,
                             ggml_mul(ctx, h, ggml_repeat(ctx, c_gate, h)));
         }
+
+        // ── Diagnostic: post-layer RMS (set ACE_STEP_DIT_DEBUG=1) ───────
+        if (std::getenv("ACE_STEP_DIT_DEBUG")) {
+            double sq = 0.0; int64_t nel = ggml_nelements(cur);
+            float* d = (float*)cur->data;
+            for (int64_t ii = 0; ii < nel; ii++) sq += (double)d[ii] * d[ii];
+            double rms = std::sqrt(sq / nel);
+            fprintf(stderr, "[dit] layer %d post RMS=%.4f\n", i, rms);
+        }
     }
 
     // ── Final norm + scale/shift ─────────────────────────────────────────
@@ -732,6 +763,17 @@ static bool run_one_forward(
         if (error) *error = "DiT compute failed (status " +
                             std::to_string(st) + ")";
         ggml_free(ctx); delete[] ctx_buf; return false;
+    }
+
+    // Output RMS diagnostic
+    {
+        double sq = 0.0;
+        float* d = (float*)cur->data;
+        for (int64_t ii = 0; ii < static_cast<int64_t>(T) * H; ii++)
+            sq += (double)d[ii] * d[ii];
+        double out_rms = std::sqrt(sq / (static_cast<double>(T) * H));
+        fprintf(stderr, "[dit] output RMS=%.4f (in was %.4f, ratio=%.2f)\n",
+                out_rms, inp_rms, out_rms / (inp_rms + 1e-10));
     }
 
     memcpy(result, cur->data,
@@ -796,11 +838,116 @@ bool DiTRunner::forward(
     }
 
     int64_t n_el = static_cast<int64_t>(T) * H;
+    // ── CFG diagnostics ────────────────────────────────────────────────
+    double c_rms = 0.0, u_rms = 0.0, diff_rms = 0.0;
     for (int64_t i = 0; i < n_el; i++) {
-        output[i] = u_out[static_cast<size_t>(i)] +
-                    guidance_scale * (c_out[static_cast<size_t>(i)] -
-                                      u_out[static_cast<size_t>(i)]);
+        c_rms += (double)c_out[i] * c_out[i];
+        u_rms += (double)u_out[i] * u_out[i];
+        double d = (double)c_out[i] - (double)u_out[i];
+        diff_rms += d * d;
     }
+    c_rms = std::sqrt(c_rms / n_el);
+    u_rms = std::sqrt(u_rms / n_el);
+    diff_rms = std::sqrt(diff_rms / n_el);
+    fprintf(stderr, "[dit] CFG: c_rms=%.4f u_rms=%.4f diff_rms=%.4f g=%.1f\n",
+            c_rms, u_rms, diff_rms, guidance_scale);
+
+    // ── Adaptive Projected Guidance (APG) ──────────────────────────────
+    // Matches diffusers.guiders.adaptive_projected_guidance.normalized_guidance
+    // called from pipeline_ace_step.py:1173 with:
+    //   guidance_scale_arg = guidance_scale - 1.0
+    //   eta                = 0.0   (drop parallel component)
+    //   norm_threshold     = 2.5   (per-token L2 cap before projection)
+    //   use_original_formulation = True (base = pred_cond, not pred_uncond)
+    //   norm_dim           = (1,)  (per-token norm along hidden dim)
+    //
+    // Algorithm (per token t, along hidden dim H):
+    //   1. diff = pred_cond - pred_uncond                    // [H]
+    //   2. if ||diff|| > norm_threshold: diff *= norm_threshold / ||diff||
+    //   3. v1 = pred_cond / ||pred_cond||                    // unit vector
+    //      diff_parallel   = (diff · v1) * v1
+    //      diff_orthogonal = diff - diff_parallel
+    //      update          = diff_orthogonal + eta * diff_parallel
+    //   4. output = pred_cond + guidance_scale_arg * update
+    //
+    // With eta=0 the parallel component (which would amplify the cond
+    // magnitude) is dropped, leaving only the orthogonal steering signal.
+    // This is the OPPOSITE of vanilla CFG which goes
+    //   u + gs*(c-u) = gs*c + (1-gs)*u  — that blows up magnitude when gs>1.
+    const float eta = 0.0f;
+    const float norm_threshold = 2.5f;
+    const float gs_arg = std::max(0.0f, guidance_scale - 1.0f);
+
+    double post_rms = 0.0;
+    int64_t n_clamped = 0;
+    for (int64_t t = 0; t < T; t++) {
+        const float* c_row = &c_out[static_cast<size_t>(t) * H];
+        const float* u_row = &u_out[static_cast<size_t>(t) * H];
+        float* out_row = &output[static_cast<size_t>(t) * H];
+
+        // Step 1+2: compute diff with norm cap.
+        double diff_sq = 0.0;
+        for (int64_t h = 0; h < H; h++) {
+            double d = (double)c_row[h] - (double)u_row[h];
+            diff_sq += d * d;
+        }
+        float diff_scale = 1.0f;
+        float diff_norm = static_cast<float>(std::sqrt(diff_sq));
+        if (diff_norm > norm_threshold && diff_norm > 1e-12f) {
+            diff_scale = norm_threshold / diff_norm;
+            n_clamped++;
+        }
+
+        // Step 3: project diff onto pred_cond direction.
+        //   v1 = pred_cond / ||pred_cond||  (per-token unit vector)
+        //   parallel = (diff · v1) * v1
+        //   ortho    = diff - parallel
+        //   update   = ortho + eta * parallel
+        double cond_sq = 0.0;
+        for (int64_t h = 0; h < H; h++)
+            cond_sq += (double)c_row[h] * (double)c_row[h];
+        float cond_norm = static_cast<float>(std::sqrt(cond_sq));
+        // Handle degenerate ||pred_cond||≈0 — fall back to raw diff as update.
+        if (cond_norm < 1e-12f) {
+            // output = pred_cond + gs_arg * diff  (no projection possible)
+            for (int64_t h = 0; h < H; h++) {
+                float d = (c_row[h] - u_row[h]) * diff_scale;
+                float v = c_row[h] + gs_arg * d;
+                out_row[h] = v;
+                post_rms += (double)v * v;
+            }
+            continue;
+        }
+        float inv_cn = 1.0f / cond_norm;
+        // diff · v1 = sum(diff[h] * c_row[h]) / ||c||
+        double dot_dc = 0.0;
+        for (int64_t h = 0; h < H; h++) {
+            float d = (c_row[h] - u_row[h]) * diff_scale;
+            dot_dc += (double)d * (double)c_row[h];
+        }
+        float parallel_factor = static_cast<float>(dot_dc) * inv_cn;  // scalar = (diff·v1)
+        // For each h:
+        //   diff_parallel[h] = parallel_factor * c_row[h] / cond_norm  (= parallel_factor * v1[h])
+        //   diff_ortho[h]    = diff[h] - diff_parallel[h]
+        //   update[h]        = diff_ortho[h] + eta * diff_parallel[h]
+        //                   = diff[h] - (1 - eta) * parallel_factor * c_row[h] / cond_norm
+        //   output[h]        = c_row[h] + gs_arg * update[h]
+        float one_minus_eta = 1.0f - eta;
+        float proj_coef = one_minus_eta * parallel_factor * inv_cn;  // multiplies c_row[h]
+        for (int64_t h = 0; h < H; h++) {
+            float d = (c_row[h] - u_row[h]) * diff_scale;
+            float update_h = d - proj_coef * c_row[h];
+            float v = c_row[h] + gs_arg * update_h;
+            out_row[h] = v;
+            post_rms += (double)v * v;
+        }
+    }
+    post_rms = std::sqrt(post_rms / static_cast<double>(n_el));
+    fprintf(stderr,
+            "[dit] APG: gs_arg=%.2f eta=%.2f threshold=%.1f "
+            "tokens_clamped=%lld/%lld post_rms=%.4f\n",
+            gs_arg, eta, norm_threshold,
+            (long long)n_clamped, (long long)T, post_rms);
     return true;
 }
 

@@ -33,7 +33,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace audiocore::acestep {
@@ -91,36 +93,68 @@ static std::vector<float> compute_wsconv(const void* wv_data, const void* wg_dat
                                           int K, int OC, int IC,
                                           bool input_is_K_IC_OC,
                                           float eps = 1e-12f) {
+    // The GGUF stores weight_v in PyTorch C-order of the REVERSED tensor shape
+    // (ggml's natural flat order of the reversed PyTorch ne). Verified element-
+    // wise against diffusers' actual loaded weight_v (max err = 0.0).
+    //
+    // PyTorch weight_norm normalizes per dim-0 of the ORIGINAL PyTorch shape:
+    //   w = g * v / ||v||_dim0
+    //
+    // We output in ggml natural flat for the reversed shape so that downstream
+    // ggml ops (ggml_conv_1d expects ne=[K,IC,OC]; our permute_conv_t1d_weight
+    // indexes wsconv_3d[k + oc*K + ic*K*OC]) read the right values.
     const uint16_t* v = static_cast<const uint16_t*>(wv_data);
     const uint16_t* g = static_cast<const uint16_t*>(wg_data);
-
-    // dim0 = PyTorch dim 0 = ggml ne[n_dims-1].
-    // fan  = K * middle_axis (the fast-varying dims).
-    int dim0, fan;
-    if (input_is_K_IC_OC) {
-        // Conv1d: ne=[K, IC, OC] → dim0=OC, fan=K*IC
-        dim0 = OC;
-        fan  = K * IC;
-    } else {
-        // ConvTranspose1d: ne=[K, OC, IC] → dim0=IC, fan=K*OC
-        dim0 = IC;
-        fan  = K * OC;
-    }
-
     const size_t total = static_cast<size_t>(K) * OC * IC;
     std::vector<float> result(total);
 
-    for (int d = 0; d < dim0; d++) {
-        float gv  = bf16_to_f32(g[d]);
-        double nsq = 0.0;
-        for (int i = 0; i < fan; i++) {
-            float vv = bf16_to_f32(v[d * fan + i]);
-            nsq += static_cast<double>(vv) * vv;
+    if (input_is_K_IC_OC) {
+        // Conv1d: PyTorch shape [OC, IC, K] → stored reversed [K, IC, OC].
+        // raw_v[k*IC*OC + ic*OC + oc] = v_pytorch[oc, ic, k]
+        // Normalize per oc (PyTorch dim 0).
+        // Output ggml natural flat for [K, IC, OC]:
+        //   result[k + ic*K + oc*K*IC]
+        for (int oc = 0; oc < OC; oc++) {
+            float gv  = bf16_to_f32(g[oc]);
+            double nsq = 0.0;
+            for (int ic = 0; ic < IC; ic++) {
+                for (int k = 0; k < K; k++) {
+                    float vv = bf16_to_f32(v[(static_cast<size_t>(k) * IC + ic) * OC + oc]);
+                    nsq += static_cast<double>(vv) * vv;
+                }
+            }
+            float s = gv / (static_cast<float>(std::sqrt(nsq)) + eps);
+            for (int ic = 0; ic < IC; ic++) {
+                for (int k = 0; k < K; k++) {
+                    float vv = bf16_to_f32(v[(static_cast<size_t>(k) * IC + ic) * OC + oc]);
+                    result[static_cast<size_t>(k) + ic * K +
+                           static_cast<size_t>(oc) * K * IC] = vv * s;
+                }
+            }
         }
-        float s = gv / (static_cast<float>(std::sqrt(nsq)) + eps);
-        for (int i = 0; i < fan; i++) {
-            float vv = bf16_to_f32(v[d * fan + i]);
-            result[d * fan + i] = vv * s;
+    } else {
+        // ConvTranspose1d: PyTorch shape [IC, OC, K] → stored reversed [K, OC, IC].
+        // raw_v[k*OC*IC + oc*IC + ic] = v_pytorch[ic, oc, k]
+        // Normalize per ic (PyTorch dim 0).
+        // Output ggml natural flat for [K, OC, IC]:
+        //   result[k + oc*K + ic*K*OC]
+        for (int ic = 0; ic < IC; ic++) {
+            float gv  = bf16_to_f32(g[ic]);
+            double nsq = 0.0;
+            for (int oc = 0; oc < OC; oc++) {
+                for (int k = 0; k < K; k++) {
+                    float vv = bf16_to_f32(v[(static_cast<size_t>(k) * OC + oc) * IC + ic]);
+                    nsq += static_cast<double>(vv) * vv;
+                }
+            }
+            float s = gv / (static_cast<float>(std::sqrt(nsq)) + eps);
+            for (int oc = 0; oc < OC; oc++) {
+                for (int k = 0; k < K; k++) {
+                    float vv = bf16_to_f32(v[(static_cast<size_t>(k) * OC + oc) * IC + ic]);
+                    result[static_cast<size_t>(k) + oc * K +
+                           static_cast<size_t>(ic) * K * OC] = vv * s;
+                }
+            }
         }
     }
     return result;
@@ -130,7 +164,12 @@ static std::vector<float> compute_wsconv(const void* wv_data, const void* wg_dat
 // conv_t1d op expects w as 2D [IC, K·OC] (ggml ne: ne[0]=IC, ne[1]=K*OC).
 // The WSConv result is 3D [K, OC, IC] (ggml ne order, matching input layout).
 // For ggml ne=[IC, K*OC] tensor, memory is data[ic + k_oc*IC].
-// Permute: out[ic + (k*OC+o)*IC] = wsconv_3d[k + o*K + ic*K*OC]
+//
+// CRITICAL: ggml_col2im_1d reads the columns tensor as col[(oc*K + k) + t_in*K*OC],
+// i.e. the column index encodes (oc, k) as oc*K + k (k fast, oc slow). So the
+// 2D weight column index must also be oc*K + k for the matmul to place each
+// W[ic, oc, k] contribution in the slot col2im_1d will read for (oc, k).
+// Permute: out[ic + (o*K + k)*IC] = wsconv_3d[k + o*K + ic*K*OC]
 static std::vector<float> permute_conv_t1d_weight(const float* wsconv_3d,
                                                     int K, int OC, int IC) {
     std::vector<float> out(static_cast<size_t>(IC) * K * OC);
@@ -141,8 +180,8 @@ static std::vector<float> permute_conv_t1d_weight(const float* wsconv_3d,
                                  static_cast<size_t>(o) * K +
                                  static_cast<size_t>(i) * K * OC;
                 size_t dst_idx = static_cast<size_t>(i) +
-                                 (static_cast<size_t>(k) * OC +
-                                  static_cast<size_t>(o)) * IC;
+                                 (static_cast<size_t>(o) * K +
+                                  static_cast<size_t>(k)) * IC;
                 out[dst_idx] = wsconv_3d[src_idx];
             }
         }
@@ -193,12 +232,30 @@ static const int32_t kResDilations[3] = {1, 3, 9};
 static void nan_check(const char* tag, const float* p, size_t n) {
     int nan_cnt = 0;
     float mx = -1e30f, mn = 1e30f;
+    double sum_sq = 0.0;
     for (size_t i = 0; i < n; i++) {
         float v = p[i];
         if (std::isnan(v)) nan_cnt++;
-        else { if (v > mx) mx = v; if (v < mn) mn = v; }
+        else {
+            if (v > mx) mx = v;
+            if (v < mn) mn = v;
+            sum_sq += (double)v * v;
+        }
     }
-    fprintf(stderr, "[vae] %-20s NaN=%d/%zu range=[%g,%g]\n", tag, nan_cnt, n, mn, mx);
+    double rms = (n > 0) ? std::sqrt(sum_sq / n) : 0.0;
+    fprintf(stderr, "[vae] %-20s NaN=%d/%zu range=[%g,%g] RMS=%.4f\n",
+            tag, nan_cnt, n, mn, mx, rms);
+    // Optional tensor dump (set ACE_STEP_DUMP_VAE=dir)
+    if (const char* dir = std::getenv("ACE_STEP_DUMP_VAE")) {
+        std::string path = std::string(dir) + "/" + tag + ".bin";
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            // Write as [T, C] row-major (our layout); numpy can mmap via np.fromfile
+            uint64_t n64 = (uint64_t)n;
+            std::fwrite(&n64, sizeof(n64), 1, f);
+            std::fwrite(p, sizeof(float), n, f);
+            std::fclose(f);
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -596,7 +653,6 @@ void VAERunner::precompute_weights(ggml_context* ext_ctx) {
             int K = (int)wv->ne[0], IC = (int)wv->ne[1], OC = (int)wv->ne[2];
             dec_conv2_w_ = compute_wsconv(wv->data, wg->data, K, OC, IC, /*K_IC_OC=*/true);
             dec_conv2_K_ = K;
-            // conv2 has no bias
         }
     }
 
@@ -1003,6 +1059,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                   dec_fn_exp_a_.data(), dec_fn_inv_b_.data(),
                   &after_fn, buf.data(), buf_size))
         return false;
+    nan_check("final_snake", after_fn.data(), after_fn.size());
 
     // Final conv2: [T, 128] → [T, 2] stereo
     std::vector<float> audio;
@@ -1013,6 +1070,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                    1, 3, 1,
                    &audio, &T_audio, buf.data(), buf_size))
         return false;
+    nan_check("final_conv2_out", audio.data(), audio.size());
 
     pcm->resize(static_cast<size_t>(T_audio) * 2);
     memcpy(pcm->data(), audio.data(),

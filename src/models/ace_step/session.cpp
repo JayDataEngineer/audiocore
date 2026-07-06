@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -77,32 +78,43 @@ struct FlowSchedule {
 static FlowSchedule build_schedule(const std::string& variant, int override_steps) {
     FlowSchedule s;
 
-    // ── Turbo: shifted-cosine, 8 steps, shift=3.0 ──────────────────────────
-    if ((variant == "turbo" || variant.empty()) &&
-        (override_steps <= 0 || override_steps == 8)) {
-        // Verified against upstream acestep.cpp (turbo mode)
-        static const float tbl[] = {
-            1.0f, 0.955f, 0.9f, 0.833f, 0.75f, 0.643f, 0.5f, 0.3f
-        };
-        s.timesteps.assign(tbl, tbl + 8);
-        s.n_steps = 8;
+    // ── Turbo: shifted-cosine, 8 steps by default, shift=3.0 ───────────────
+    // Matches upstream pipeline_ace_step.py:_get_timestep_schedule:
+    //   t = linspace(1, 0, N+1)
+    //   t = shift * t / (1 + (shift - 1) * t)   # shift=3 for turbo
+    //   return t[:-1]                            # drop terminal t=0
+    // For N=8 shift=3 this reproduces the hardcoded table
+    //   [1.0, 0.9545, 0.9, 0.8333, 0.75, 0.6429, 0.5, 0.3]
+    // exactly. Apply the same formula for any N so 4/16/20-step turbo runs
+    // match what upstream would produce.
+    if (variant == "turbo" || variant.empty()) {
+        const int steps = (override_steps > 0) ? override_steps : 8;
+        const float shift = 3.0f;
+        s.timesteps.reserve(steps);
+        for (int i = 0; i < steps; i++) {
+            float t = 1.0f - static_cast<float>(i) / steps;   // N+1 grid, drop last
+            float ts = (shift * t) / (1.0f + (shift - 1.0f) * t);
+            s.timesteps.push_back(ts);
+        }
+        s.n_steps = steps;
         return s;
     }
 
     // ── SFT / Base: linear schedule, 50 steps, shift=1.0 ────────────────────
     // Base (the pretrained root, not instruction-tuned for the 8-step turbo
     // shortcut) uses the same linear 50-step schedule as SFT.
-    if ((variant == "sft" || variant == "base") &&
-        (override_steps <= 0 || override_steps == 50)) {
-        s.timesteps.reserve(50);
-        for (int i = 0; i < 50; i++) {
-            s.timesteps.push_back(0.98f - i * (0.96f / 49.0f));
+    if (variant == "sft" || variant == "base") {
+        const int steps = (override_steps > 0) ? override_steps : 50;
+        s.timesteps.reserve(steps);
+        for (int i = 0; i < steps; i++) {
+            float t = 1.0f - static_cast<float>(i) / steps;
+            s.timesteps.push_back(t);
         }
-        s.n_steps = 50;
+        s.n_steps = steps;
         return s;
     }
 
-    // ── Custom: uniform spacing ────────────────────────────────────────────
+    // ── Fallback: uniform spacing, shift=1 ─────────────────────────────────
     const int steps = (override_steps > 0) ? override_steps : 8;
     s.timesteps.reserve(steps);
     for (int i = 0; i < steps; i++) {
@@ -282,6 +294,36 @@ static void bf16_to_f32_buf_local(const void* src, float* dst, int32_t n) {
 //    comes from the DiT-side CFG in step 2).  Each LM token in the code
 //    vocabulary range [vocab_size − 64000, vocab_size) is a music code.
 
+// SFT prompt template — matches pipeline_ace_step.py:SFT_GEN_PROMPT exactly.
+//   "# Instruction\n{instruction}\n\n# Caption\n{prompt}\n\n# Metas\n{metas}<|endoftext|>\n"
+// Training-time template; without it the TE/LM see OOD input and conditioning
+// is weak (verified: identical-sounding outputs for different prompts).
+static std::string format_sft_prompt(const std::string& caption,
+                                     const std::string& lyrics,
+                                     float audio_duration) {
+    // Default instruction for text2music (DEFAULT_DIT_INSTRUCTION upstream).
+    const std::string instruction =
+        "Fill the audio semantic mask based on the given conditions:";
+
+    // Metadata string. Upstream _build_metadata_string defaults unset fields
+    // to "N/A"; the duration uses "{int(d)} seconds".
+    int dur_int = (audio_duration > 0.0f) ? static_cast<int>(audio_duration) : 30;
+    std::string metas = "- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n"
+                        "- duration: " + std::to_string(dur_int) + " seconds\n";
+
+    std::string text = "# Instruction\n" + instruction + "\n\n"
+                       "# Caption\n" + caption + "\n\n"
+                       "# Metas\n" + metas + "<|endoftext|>\n";
+    return text;
+}
+
+// Lyrics formatting (only used when req.lyrics is non-empty). Matches upstream
+// _format_lyrics: "# Languages\n{lang}\n\n# Lyric\n{lyrics}<|endoftext|>"
+static std::string format_lyrics(const std::string& lyrics,
+                                 const std::string& lang = "en") {
+    return "# Languages\n" + lang + "\n\n# Lyric\n" + lyrics + "<|endoftext|>";
+}
+
 bool AceStepSession::run_lm(const MusicRequest& req,
                             std::vector<int32_t>* music_codes,
                             std::string* error) {
@@ -292,13 +334,25 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     if (lm_) lm_->clear_kv_cache();
     if (te_) te_->clear_kv_cache();
 
-    // (1) Assemble the text prompt
-    std::string prompt = req.caption;
+    // (1) Assemble the text prompt using the SFT template.
+    //     Upstream _format_prompt wraps the caption + metadata in
+    //     SFT_GEN_PROMPT (Instruction/Caption/Metas). Without this template
+    //     the TE/LM receive OOD input and conditioning collapses to near-zero
+    //     prompt sensitivity (verified: identical audio for different prompts).
+    std::string prompt = format_sft_prompt(req.caption, req.lyrics, req.duration);
+    // Lyrics are encoded separately through the TE and routed to the lyric
+    // encoder. We currently only feed the SFT-formatted text to the TE/LM —
+    // the lyric-encoder path is a TODO (unlocked when req.lyrics is non-empty
+    // AND the lyric encoder port lands).
+    std::string lyrics_formatted;
     if (!req.lyrics.empty()) {
-        prompt += "\nLyrics: " + req.lyrics;
+        lyrics_formatted = format_lyrics(req.lyrics);
+        // Append lyrics to the LM prompt so the LM can condition on them.
+        prompt += lyrics_formatted;
     }
 
-    fprintf(stderr, "[ace_step] run_lm: tokenizing...\n");
+    fprintf(stderr, "[ace_step] run_lm: tokenizing (caption='%s', dur=%.1f)...\n",
+            req.caption.c_str(), req.duration);
     std::vector<int32_t> te_tokens;
     if (!te_->tokenize(prompt, /*add_special=*/true, /*parse_special=*/true,
                        &te_tokens, nullptr, error))
@@ -524,11 +578,30 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
     // Load silence latent (used as src for text2music and inside repaint zone)
     const float* silence_ptr = nullptr;
     int32_t silence_T = 0;
+    // silence_latent in the GGUF is stored in PyTorch [C, T] C-order (t fastest
+    // within each c block: flat[c*T + t]), but downstream code reads it as
+    // time-major [T, C] (flat[t*C + c]). Pre-transpose once into a buffer that
+    // matches the downstream layout so all `silence_ptr + t*out_ch` reads are
+    // correct. Without this, the VAE receives scrambled channels and produces
+    // broadband hiss instead of music.
+    std::vector<float> silence_tc;
     {
         ggml_tensor* st = ggml_get_tensor(ext_ctx_, "silence_latent");
         if (st) {
-            silence_ptr = static_cast<const float*>(st->data);
-            silence_T = static_cast<int32_t>(st->ne[1]);
+            const int32_t C = static_cast<int32_t>(st->ne[0]);  // 64
+            silence_T = static_cast<int32_t>(st->ne[1]);        // 15000
+            const float* raw = static_cast<const float*>(st->data);
+            silence_tc.resize(static_cast<size_t>(silence_T) * C);
+            // raw[c*T + t] → silence_tc[t*C + c]
+            for (int32_t t = 0; t < silence_T; t++) {
+                for (int32_t c = 0; c < C; c++) {
+                    silence_tc[static_cast<size_t>(t) * C + c] =
+                        raw[static_cast<size_t>(c) * silence_T + t];
+                }
+            }
+            silence_ptr = silence_tc.data();
+            fprintf(stderr, "[ace_step] silence_latent transposed [C=%d, T=%d] → [%d, %d] "
+                            "time-major, RMS calc skipped\n", C, silence_T, silence_T, C);
         }
     }
 
@@ -639,10 +712,67 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
     fprintf(stderr, "[ace_step] dit: schedule n_steps=%d variant='%s'\n",
             sched.n_steps, cfg_.variant.c_str());
 
+    // Turbo checkpoints have classifier-free guidance distilled into the
+    // velocity head (pipeline_ace_step.py:920-925): running CFG on top of
+    // that double-counts guidance and shatters the prediction. Mirror the
+    // upstream behavior and force gs=1.0 for turbo.
+    const bool is_turbo = (cfg_.variant == "turbo" || cfg_.variant.empty());
+    const float effective_gs = is_turbo ? 1.0f : req.guidance_scale;
+    if (is_turbo && req.guidance_scale > 1.0f) {
+        fprintf(stderr,
+                "[ace_step] NOTE: requested guidance_scale=%.2f ignored for "
+                "turbo checkpoint (guidance is distilled into weights); "
+                "using gs=1.0\n",
+                req.guidance_scale);
+    }
+
     std::vector<float> hidden(static_cast<size_t>(S_patches) * H);
     std::vector<float> v_hidden(static_cast<size_t>(S_patches) * H);
     std::vector<float> v_latent(static_cast<size_t>(T_latent) * out_ch);
 
+    // DEBUG: env var ACE_STEP_VAE_ONLY=1 skips the DiT loop entirely and
+    // decodes silence_latent directly through the VAE. silence_latent is
+    // the model's learned "silent source" — VAE decoding it should yield
+    // near-silence (a faint hiss at most), NOT noise/whirl/tone. If you
+    // hear noise, the VAE itself is broken.
+    const bool vae_only_debug = (std::getenv("ACE_STEP_VAE_ONLY") != nullptr);
+    if (vae_only_debug && silence_ptr) {
+        fprintf(stderr, "[ace_step] DEBUG: ACE_STEP_VAE_ONLY set — bypassing DiT, "
+                        "feeding silence_latent directly to VAE\n");
+        // Copy silence_latent slice into xt_current
+        const int32_t copy_T = std::min(T_latent, silence_T);
+        for (int32_t t = 0; t < copy_T; t++) {
+            std::memcpy(&xt_current[static_cast<size_t>(t) * out_ch],
+                        silence_ptr + static_cast<size_t>(t) * out_ch,
+                        static_cast<size_t>(out_ch) * sizeof(float));
+        }
+        // Pad any remaining frames with silence (zeros)
+        for (int32_t t = copy_T; t < T_latent; t++)
+            std::memset(&xt_current[static_cast<size_t>(t) * out_ch], 0,
+                        static_cast<size_t>(out_ch) * sizeof(float));
+        // Dump xt_current for offline comparison with diffusers
+        if (const char* p = std::getenv("ACE_STEP_DUMP_INPUT")) {
+            FILE* f = std::fopen(p, "wb");
+            if (f) {
+                uint32_t T32 = (uint32_t)T_latent, D32 = (uint32_t)out_ch;
+                std::fwrite(&T32, sizeof(T32), 1, f);
+                std::fwrite(&D32, sizeof(D32), 1, f);
+                std::fwrite(xt_current.data(), sizeof(float),
+                            (size_t)T_latent * out_ch, f);
+                std::fclose(f);
+                double rms = 0.0; double mn = 1e30, mx = -1e30;
+                for (size_t i = 0; i < (size_t)T_latent * out_ch; i++) {
+                    double v = xt_current[i];
+                    rms += v * v;
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                fprintf(stderr, "[ace_step] dumped xt_current [%u, %u] RMS=%.4f range=[%.4f, %.4f] to %s\n",
+                        T32, D32, std::sqrt(rms / ((size_t)T_latent * out_ch)),
+                        mn, mx, p);
+            }
+        }
+    } else
     for (int step = 0; step < sched.n_steps; step++) {
         const float t  = sched.timesteps[static_cast<size_t>(step)];
         const float dt = (step + 1 < sched.n_steps)
@@ -677,7 +807,7 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                                   cond_ptr, T_cond, enc_hs,
                                   uncond_ptr, T_uncond,
                                   refer_audio, T_refer,
-                                  req.guidance_scale,
+                                  effective_gs,
                                   S_patches,
                                   v_hidden.data(), error))
             return false;
@@ -699,9 +829,42 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
             }
         }
 
-        // Euler step in LATENT space: xt += dt · v_latent
+        // Euler step in LATENT space. Convention matches upstream
+        // FlowMatchEulerDiscreteScheduler.step():
+        //   sigma_next < sigma, so dt_sched = sigma_next - sigma < 0,
+        //   prev = sample + dt_sched * v = sample - |dt| * v.
+        // We keep dt positive (dt = t_curr - t_next) and SUBTRACT it.
+        // ── Pre-step diagnostic ──
+        {
+            double sq_v = 0.0, sq_x = 0.0;
+            float v_mx = -1e30f, v_mn = 1e30f;
+            for (size_t i = 0; i < v_latent.size(); i++) {
+                sq_v += (double)v_latent[i] * v_latent[i];
+                if (v_latent[i] > v_mx) v_mx = v_latent[i];
+                if (v_latent[i] < v_mn) v_mn = v_latent[i];
+            }
+            for (size_t i = 0; i < xt_current.size(); i++)
+                sq_x += (double)xt_current[i] * xt_current[i];
+            double rms_v = std::sqrt(sq_v / v_latent.size());
+            double rms_x = std::sqrt(sq_x / xt_current.size());
+            fprintf(stderr, "[ace_step] step %d: pre_x_rms=%.4f v_rms=%.4f v_range=[%.2f,%.2f] dt=%.4f\n",
+                    step, rms_x, rms_v, v_mn, v_mx, dt);
+        }
         for (size_t i = 0; i < xt_current.size(); i++) {
-            xt_current[i] += dt * v_latent[i];
+            xt_current[i] -= dt * v_latent[i];
+        }
+        // ── Post-step diagnostic ──
+        {
+            double sq = 0.0;
+            float mx = -1e30f, mn = 1e30f;
+            for (size_t i = 0; i < xt_current.size(); i++) {
+                sq += (double)xt_current[i] * xt_current[i];
+                if (xt_current[i] > mx) mx = xt_current[i];
+                if (xt_current[i] < mn) mn = xt_current[i];
+            }
+            double rms = std::sqrt(sq / xt_current.size());
+            fprintf(stderr, "[ace_step] step %d: post_x_rms=%.4f range=[%.2f,%.2f]\n",
+                    step, rms, mn, mx);
         }
 
         // Repaint injection (outside zone → noised source)
@@ -736,6 +899,48 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
         if (nan_l > 0) {
             fprintf(stderr, "[ace_step] WARNING: %d/%zu NaN in final latent\n",
                     nan_l, xt_current.size());
+        }
+        // TEMP DEBUG: dump final xt_current stats + first frame values.
+        // Compare against silence_latent (the "no music" reference) to see
+        // whether the DiT produced something silence-like or actually
+        // musical. The VAE expects ~[-3, 3] range latents.
+        double mn = 1e30, mx = -1e30, sum = 0, abs_sum = 0;
+        for (size_t i = 0; i < xt_current.size(); i++) {
+            float v = xt_current[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            sum += v; abs_sum += std::fabs(v);
+        }
+        fprintf(stderr,
+                "[ace_step] final xt_current: N=%zu range=[%.4f,%.4f] "
+                "mean=%.4f mean_abs=%.4f\n",
+                xt_current.size(), mn, mx, sum / xt_current.size(),
+                abs_sum / xt_current.size());
+        // First 8 values of channel 0
+        fprintf(stderr, "[ace_step] xt_current[0..7]: ");
+        for (int i = 0; i < 8 && i < (int)xt_current.size(); i++)
+            fprintf(stderr, "%.4f ", xt_current[i]);
+        fprintf(stderr, "\n");
+        // Compare with silence_latent first 8 values
+        if (silence_ptr) {
+            fprintf(stderr, "[ace_step] silence_latent[0..7]: ");
+            for (int i = 0; i < 8 && i < silence_T * out_ch; i++)
+                fprintf(stderr, "%.4f ", silence_ptr[i]);
+            fprintf(stderr, "\n");
+        }
+        // Dump xt_current to /tmp for offline diffusers comparison
+        if (const char* p = std::getenv("ACE_STEP_DUMP_XT")) {
+            FILE* f = std::fopen(p, "wb");
+            if (f) {
+                uint32_t T = (uint32_t)T_latent, D = (uint32_t)out_ch;
+                std::fwrite(&T, sizeof(T), 1, f);
+                std::fwrite(&D, sizeof(D), 1, f);
+                std::fwrite(xt_current.data(), sizeof(float),
+                            (size_t)T * D, f);
+                std::fclose(f);
+                fprintf(stderr, "[ace_step] dumped xt_current [%u, %u] to %s\n",
+                        T, D, p);
+            }
         }
     }
     if (!vae_runner_->decode(xt_current.data(), T_latent, pcm_stereo, error))
