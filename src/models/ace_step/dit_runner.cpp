@@ -83,22 +83,40 @@ static ggml_tensor* adaln(ggml_context* ctx, ggml_tensor* x,
 }
 
 // ── Apply QK-norm (RMS norm per-head + learned scale) ───────────────────────
-// Input:  [T, nh*hd]  in ggml ne: ne[0]=nh*hd, ne[1]=T
-// Output: [T, nh*hd]  same shape
+// Input:  [nh*hd, T]  in ggml ne: ne[0]=nh*hd, ne[1]=T
+// Output: [nh*hd, T]  same shape
+//
+// Matches upstream's dit-graph.h pattern exactly:
+//   t = reshape_4d(t, hd, nh, T, 1)     # [hd, nh, T, 1]
+//   t = rms_norm(t, eps)                # normalizes over ne[0]=hd per (nh, T)
+//   t = mul(t, norm_w)                  # norm_w is [hd], broadcast via ggml_mul
+//   return reshape_2d(t, nh*hd, T)
 static ggml_tensor* apply_qk_norm(ggml_context* ctx, ggml_tensor* t,
                                     int hd, int nh,
                                     ggml_tensor* norm_w) {
     if (!norm_w) return t;
     // Compute T from total elements: input is [nh*hd, T]
     int64_t T = ggml_nelements(t) / (static_cast<int64_t>(hd) * nh);
-    // Reshape to [hd, nh, T] for per-head norm
-    ggml_tensor* t3d = ggml_reshape_3d(ctx, t, hd, nh, T);
-    t3d = ggml_rms_norm(ctx, t3d, 1e-6f);
-    // norm_w is [hd] → expand to [hd, nh, T]
-    ggml_tensor* nw = ggml_reshape_3d(ctx, norm_w, hd, 1, 1);
-    nw = ggml_repeat(ctx, nw, t3d);
-    t3d = ggml_mul(ctx, t3d, nw);
-    return ggml_reshape_2d(ctx, t3d, nh * hd, T);
+    // Reshape to 4D [hd, nh, T, 1] for per-head norm. Using 4D matches
+    // upstream's pattern and avoids any 3D rms_norm edge cases.
+    ggml_tensor* t4d = ggml_reshape_4d(ctx, t, hd, nh, T, 1);
+    t4d = ggml_rms_norm(ctx, t4d, 1e-6f);
+    // norm_w is [hd] (1D) — ggml_mul broadcasts it across the other dims.
+    // Upstream does this directly without ggml_repeat.
+    t4d = ggml_mul(ctx, t4d, norm_w);
+    return ggml_reshape_2d(ctx, t4d, nh * hd, T);
+}
+
+// Helper: mark a tensor for dumping. Wraps in ggml_cont() to force a unique
+// data buffer (without this, the ggml scheduler can reuse the buffer for later
+// tensors, causing the dump to read stale/overwritten data). Then names and
+// flags it as an output so dump_named() can find it after sched_graph_compute.
+static ggml_tensor* dump_mark(ggml_context* ctx, ggml_tensor* t,
+                                const char* name) {
+    t = ggml_cont(ctx, t);
+    ggml_set_name(t, name);
+    ggml_set_output(t);
+    return t;
 }
 
 // ── Input upload record (tensor + cpu data to copy into it after alloc) ────
@@ -106,22 +124,41 @@ struct DiTInputUpload { ggml_tensor* t; const void* data; size_t nbytes; };
 
 // ── Self-attention (GQA + QK-norm + RoPE) ───────────────────────────────────
 // Returns just the attention (or O-projected) output — NO residual added.
+// When `dump_layer0` is true, names intermediate tensors for layer 0 to enable
+// layer-by-layer comparison with upstream (matches upstream's layer0_* dumps).
 static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
                                 int T, int H, int nh, int nk, int hd,
                                 ggml_tensor* q_w, ggml_tensor* k_w,
                                 ggml_tensor* v_w, ggml_tensor* o_w,
                                 ggml_tensor* q_norm_w, ggml_tensor* k_norm_w,
                                 float rope_theta,
-                                std::vector<DiTInputUpload>& inputs) {
+                                std::vector<DiTInputUpload>& inputs,
+                                bool dump_layer0 = false) {
     if (!q_w || !k_w || !v_w) return nullptr;
 
     auto q = ggml_mul_mat(ctx, q_w, x);
     auto k = ggml_mul_mat(ctx, k_w, x);
     auto v = ggml_mul_mat(ctx, v_w, x);
 
+    // Debug: dump raw Q/K/V (post mul_mat, pre-QK-norm) for layer 0.
+    if (dump_layer0) {
+        q = dump_mark(ctx, q, "layer0_q_raw_after_proj");
+        k = dump_mark(ctx, k, "layer0_k_raw_after_proj");
+    }
+
     // QK-norm (per-head RMS norm before RoPE)
     q = apply_qk_norm(ctx, q, hd, nh, q_norm_w);
     k = apply_qk_norm(ctx, k, hd, nk, k_norm_w);
+
+    // Debug dumps: Q/K AFTER QK-norm but BEFORE RoPE.
+    // At RoPE position 0 the rotation is identity, so post-rope values at
+    // position 0 must equal these. Comparing against upstream isolates whether
+    // divergence is in (q_proj + qk_norm) vs in RoPE itself.
+    if (dump_layer0) {
+        q = dump_mark(ctx, q, "layer0_q_after_qknorm");
+        k = dump_mark(ctx, k, "layer0_k_after_qknorm");
+        v = dump_mark(ctx, v, "layer0_v_raw");
+    }
 
     // Reshape to 3D [hd, n_heads, T] before RoPE (ggml_rope_ext requires 3D)
     auto to_3d = [&](ggml_tensor* t, int n_h) {
@@ -152,6 +189,13 @@ static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
     q = rope(q);
     k = rope(k);
 
+    // Upstream names the post-rope Q and K for layer 0. These are 3D [hd, nh, T]
+    // tensors; upstream dumps the first sample slice (= hd*nh elements).
+    if (dump_layer0) {
+        q = dump_mark(ctx, q, "layer0_q_after_rope");
+        k = dump_mark(ctx, k, "layer0_k_after_rope");
+    }
+
     // Permute for flash_attn_ext → [hd, T, n_heads]
     auto rsh = [&](ggml_tensor* t, int n_h) {
         return ggml_cont(ctx, ggml_permute(ctx, t, 0, 2, 1, 3));
@@ -162,10 +206,20 @@ static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
 
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
 
-    // Back to [T, nh*hd]
-    a = ggml_cont(ctx, ggml_permute(ctx, a, 0, 2, 1, 3));
+    // flash_attn_ext returns [hd, nh, T, 1] — reshape directly to [nh*hd, T].
+    // Do NOT permute first: that would scramble head/position mapping (the
+    // innermost hd varies faster than nh, which is exactly what reshape_2d
+    // expects to combine into nh*hd along ne[0]). Matches upstream's
+    // ggml_reshape_3d(attn, Nh*D, S, N).
     a = ggml_reshape_2d(ctx, a, nh * hd, T);
+
+    // Upstream names the raw attention output (pre-o_proj) for layer 0.
+    if (dump_layer0) {
+        a = dump_mark(ctx, a, "layer0_attn_out");
+    }
+
     if (o_w) a = ggml_mul_mat(ctx, o_w, a);
     return a;
 }
@@ -199,7 +253,10 @@ static ggml_tensor* cross_attn(ggml_context* ctx, ggml_tensor* x,
 
     float s = 1.0f / std::sqrt(static_cast<float>(hd));
     auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, s, 0.0f, 0.0f);
-    a = ggml_cont(ctx, ggml_permute(ctx, a, 0, 2, 1, 3));
+    ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
+
+    // flash_attn_ext returns [hd, nh, T, 1] — reshape directly to [nh*hd, T].
+    // NO permute (see self_attn comment): permute scrambles the head/T mapping.
     a = ggml_reshape_2d(ctx, a, nh * hd, T);
     a = ggml_mul_mat(ctx, ca_o, a);
     return a;
@@ -301,15 +358,15 @@ static void timestep_embed(float t, float* out, int dim) {
 
 // (struct DiTInputUpload defined earlier, before self_attn)
 
-// ── Timbre encoder: silence_latent [T, 64] → [1, 2048] CLS-pooled token ──────
+// ── Timbre encoder: refer_audio [T_refer, 64] → [1, 2048] CLS-pooled token ──
 // 4-layer pre-LN transformer with GQA + QK-norm + RoPE.
 // Matches encoder.timbre_encoder in ace_step/modeling_ace_step.py:325.
 // Bidirectional attention (NOT causal); layer_types alternate
 // [sliding, full, sliding, full]. Upstream cond-enc.h:266 applies a
 // sliding-window mask (|i-j| <= 128) on EVEN layers and full attention
-// on ODD layers. We match this — without the mask the CLS token sees all
-// 750 silence frames at every layer, which is OOD and produces
-// industrial/machinery DiT output.
+// on ODD layers. For text2music the caller passes T_refer=1 (a single
+// silence frame per upstream ops_encode_timbre), so the sliding mask
+// degenerates to a single unmasked token and attention is identity.
 static ggml_tensor* timbre_encode(ggml_context* ctx,
                                     ggml_context* ext_ctx,
                                     const float* refer_audio,
@@ -442,7 +499,8 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
         // Matches upstream cond-enc.h:266 layer_mask = (i % 2 == 0) ? slide : NULL.
         ggml_tensor* layer_mask = (slide_mask && (i % 2 == 0)) ? slide_mask : nullptr;
         auto a = ggml_flash_attn_ext(ctx, q, k, v, layer_mask, scale, 0.0f, 0.0f);
-        a = ggml_cont(ctx, ggml_permute(ctx, a, 0, 2, 1, 3));
+        ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
+        // flash_attn_ext returns [hd, nh, T, 1] — reshape directly (NO permute).
         a = ggml_reshape_2d(ctx, a, nh * hd, T_refer);
         a = ggml_mul_mat(ctx, o_w, a);
         hidden = ggml_add(ctx, hidden, a);   // residual
@@ -528,6 +586,7 @@ static bool run_one_forward(
     const int32_t n_layer = cfg.n_layers    > 0 ? cfg.n_layers    : 24;
     const float   eps     = cfg.rms_norm_eps > 0 ? cfg.rms_norm_eps : 1e-6f;
     const float   theta   = cfg.rope_theta  > 0 ? cfg.rope_theta  : 1000000.0f;
+    fprintf(stderr, "[dit] rope_theta=%g (cfg=%g)\n", theta, cfg.rope_theta);
 
     // ── Graph context (no_alloc=true: scheduler allocates intermediates) ──
     // For CPU fallback path (no GPU), we still need a memory pool because
@@ -570,7 +629,16 @@ static bool run_one_forward(
     auto build_time_mlp = [&](const char* prefix, const float* sin_buf,
                               int sin_dim) -> ggml_tensor* {
         ggml_tensor* t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sin_dim);
+        // Name input sinusoid tensors so we can verify they're uploaded
+        // correctly (debug aid for layer-by-layer comparison).
+        if (std::string(prefix) == "decoder.time_embed") {
+            ggml_set_name(t, "sinusoid_t_input");
+        } else if (std::string(prefix) == "decoder.time_embed_r") {
+            ggml_set_name(t, "sinusoid_r_input");
+        }
         ggml_set_input(t);
+        // Call set_output AFTER set_input — ggml_set_input resets flags.
+        if (std::getenv("ACE_STEP_DUMP_DIR")) ggml_set_output(t);
         inputs.push_back({t, sin_buf, static_cast<size_t>(sin_dim) * sizeof(float)});
         t = ggml_reshape_2d(ctx, t, sin_dim, 1);
 
@@ -585,6 +653,15 @@ static bool run_one_forward(
         ggml_tensor* l2b = ggml_get_tensor(ext_ctx, buf);
         t = ggml_mul_mat(ctx, l1w, t);
         if (l1b) t = ggml_add(ctx, t, ggml_repeat(ctx, l1b, t));
+        // Dump lin1 output (before silu) for upstream comparison.
+        // Upstream names these temb_lin1_t / temb_lin1_r.
+        if (std::string(prefix) == "decoder.time_embed") {
+            ggml_set_name(t, "temb_lin1_t");
+            if (std::getenv("ACE_STEP_DUMP_DIR")) ggml_set_output(t);
+        } else if (std::string(prefix) == "decoder.time_embed_r") {
+            ggml_set_name(t, "temb_lin1_r");
+            if (std::getenv("ACE_STEP_DUMP_DIR")) ggml_set_output(t);
+        }
         t = ggml_silu(ctx, t);
         t = ggml_mul_mat(ctx, l2w, t);
         if (l2b) t = ggml_add(ctx, t, ggml_repeat(ctx, l2b, t));
@@ -594,14 +671,20 @@ static bool run_one_forward(
     // t-branch sinusoid (caller-supplied, t * 1000 already applied).
     ggml_tensor* temb_t = build_time_mlp("decoder.time_embed",
                                           temb, temb_dim);
+    ggml_set_name(temb_t, "temb_t");
+    if (std::getenv("ACE_STEP_DUMP_DIR")) ggml_set_output(temb_t);
     // r-branch sinusoid: t-r=0 → cos(0)=1 (first half), sin(0)=0 (second half).
     std::vector<float> r_sin(temb_dim, 0.0f);
     for (int j = 0; j < temb_dim / 2; j++) r_sin[j] = 1.0f;
     ggml_tensor* temb_r = build_time_mlp("decoder.time_embed_r",
                                           r_sin.data(), temb_dim);
+    ggml_set_name(temb_r, "temb_r");
+    if (std::getenv("ACE_STEP_DUMP_DIR")) ggml_set_output(temb_r);
 
     // temb_combined = temb_t + temb_r — used for the FINAL norm_out modulation.
     ggml_tensor* temb_combined = ggml_add(ctx, temb_t, temb_r);
+    ggml_set_name(temb_combined, "temb");
+    if (std::getenv("ACE_STEP_DUMP_DIR")) ggml_set_output(temb_combined);
 
     // Per-layer timestep_proj = time_proj(silu(temb_t)) + time_proj_r(silu(temb_r)).
     // Each time_proj maps [H, 1] → [H*6, 1], then reshape to [H, 6].
@@ -620,6 +703,14 @@ static bool run_one_forward(
     auto proj_r = proj_time("decoder.time_embed_r",   temb_r);
     auto pj = ggml_add(ctx, proj_t, proj_r);
     ggml_tensor* time_mod = ggml_reshape_2d(ctx, pj, H, 6);   // ne0=H, ne1=6
+    // Wrap in cont for a unique buffer — without this, the scheduler can reuse
+    // time_mod's buffer for temb (they have overlapping lifetimes in the
+    // scheduler's view), and the tproj dump reads temb's data instead.
+    if (std::getenv("ACE_STEP_DUMP_DIR")) {
+        time_mod = dump_mark(ctx, time_mod, "tproj");
+    } else {
+        ggml_set_name(time_mod, "tproj");
+    }
 
     // ── Condition embedder ───────────────────────────────────────────────
     // Full upstream pipeline (modeling_ace_step.py:830):
@@ -685,6 +776,8 @@ static bool run_one_forward(
     // (D) condition_embedder: [2048, T_packed] → [H_dit, T_packed]
     ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, packed);
     ggml_tensor* cond_emb = ggml_add(ctx, ce_out, ggml_repeat(ctx, ceb, ce_out));
+    ggml_set_name(cond_emb, "enc_after_cond_emb");
+    if (std::getenv("ACE_STEP_DUMP_DIR")) ggml_set_output(cond_emb);
 
     // ── Diagnostic: input cond stats (raw, before projection) ──────────────
     // NOTE: The intermediate-tensor stats_of diagnostics that were here used
@@ -718,10 +811,20 @@ static bool run_one_forward(
             layer_time_mod = ggml_add(ctx, time_mod, sst);
         }
 
+        // Dump the per-layer time_mod (tptr + scale_shift_table) for layer 0
+        // to compare against upstream's effective modulation values.
+        if (i == 0 && std::getenv("ACE_STEP_DUMP_DIR")) {
+            layer_time_mod = dump_mark(ctx, layer_time_mod, "layer0_time_mod");
+        }
+
         // NOTE: A previous version of this block tried to log cur's RMS here,
         // but `cur->data` is unmaterialized until ggml_graph_compute below —
         // reading it produced misleading zeros. Post-compute diagnostics live
         // after the graph compute at the bottom of this function.
+
+        // Set when this is layer 0 and the dump-dir env var is set. The named
+        // intermediates below match upstream's layer0_* dumps in dit-graph.h.
+        const bool dump_l0 = (i == 0) && std::getenv("ACE_STEP_DUMP_DIR");
 
         // ── Self-attention block ─────────────────────────────────────────
         // Upstream (modeling_acestep_v15_turbo.py:494-514):
@@ -738,6 +841,11 @@ static bool run_one_forward(
             h = ggml_mul(ctx, h, ggml_repeat(ctx, san_w, h));
             // AdaLN modulation: h * (1 + scale[row1]) + shift[row0]
             h = adaln(ctx, h, layer_time_mod, 1, 0, H);  // row_s=1 (scale), row_h=0 (shift)
+
+            // Upstream: layer0_sa_input is norm_sa after adaln modulation.
+            if (dump_l0) {
+                h = dump_mark(ctx, h, "layer0_sa_input");
+            }
 
             // Self-attention with separate Q/K/V + QK-norm
             std::snprintf(buf, sizeof(buf),
@@ -763,7 +871,13 @@ static bool run_one_forward(
 
             h = self_attn(ctx, h, T, H, nh, nk, hd,
                           q_w, k_w, v_w, o_w,
-                          qn_w, kn_w, theta, inputs);
+                          qn_w, kn_w, theta, inputs, /*dump_layer0=*/dump_l0);
+
+            // Upstream: layer0_sa_output is the post-o_proj self-attn output.
+            if (dump_l0) {
+                h = dump_mark(ctx, h, "layer0_sa_output");
+            }
+
             // GATED residual: cur += h * gate[row2]
             auto gate = ggml_reshape_2d(ctx,
                 ggml_view_1d(ctx, layer_time_mod, H,
@@ -771,6 +885,11 @@ static bool run_one_forward(
                 H, 1);
             cur = ggml_add(ctx, cur,
                             ggml_mul(ctx, h, ggml_repeat(ctx, gate, h)));
+
+            // Upstream: layer0_after_self_attn = hidden after gated residual.
+            if (dump_l0) {
+                cur = dump_mark(ctx, cur, "layer0_after_self_attn");
+            }
         }
 
         // ── Cross-attention block (NO modulation, plain residual) ───────
@@ -813,6 +932,11 @@ static bool run_one_forward(
                            ca_q, ca_k, ca_v, ca_o,
                            ca_qn, ca_kn);
             cur = ggml_add(ctx, cur, h);   // plain residual
+
+            // Upstream: layer0_after_cross_attn = hidden after cross-attn add.
+            if (dump_l0) {
+                cur = dump_mark(ctx, cur, "layer0_after_cross_attn");
+            }
         }
 
         // ── MLP block ────────────────────────────────────────────────────
@@ -837,7 +961,13 @@ static bool run_one_forward(
                           "decoder.layers.%d.mlp.down_proj.weight", i);
             auto dw = ggml_get_tensor(ext_ctx, buf);
 
+            if (dump_l0) {
+                h = dump_mark(ctx, h, "layer0_mlp_input");
+            }
             h = swiglu_mlp(ctx, h, gw, uw, dw);
+            if (dump_l0) {
+                h = dump_mark(ctx, h, "layer0_mlp_output");
+            }
             // GATED residual: cur += h * c_gate[row5]
             auto c_gate = ggml_reshape_2d(ctx,
                 ggml_view_1d(ctx, layer_time_mod, H,
@@ -850,6 +980,22 @@ static bool run_one_forward(
         // NOTE: A previous version logged cur->data RMS here, but `cur` is
         // unmaterialized until the graph compute at the bottom of this
         // function. Reading the data here produced misleading zeros.
+
+        // Name hidden state after specific layers for upstream comparison.
+        // Upstream dumps hidden_after_layer{0,6,12,18,23}. We name the
+        // corresponding tensors so we can fetch them via ggml_graph_get_tensor
+        // and write matching dump files after compute.
+        // CRITICAL: wrap in ggml_cont (via dump_mark) so the scheduler does NOT
+        // reuse the tensor's memory for later layers (without this, all
+        // hidden_after_layerN tensors can end up sharing the same data pointer
+        // because their lifetimes don't overlap).
+        if (i == 0 || i == 6 || i == 12 || i == 18 || i == n_layer - 1) {
+            char nm[64];
+            std::snprintf(nm, sizeof(nm), "hidden_after_layer%d", i);
+            if (std::getenv("ACE_STEP_DUMP_DIR")) {
+                cur = dump_mark(ctx, cur, nm);
+            }
+        }
     }
 
     // ── Final norm + scale/shift ─────────────────────────────────────────
@@ -923,11 +1069,89 @@ static bool run_one_forward(
     }
 
     ggml_backend_sched_graph_compute(sched, gf);
-    ggml_backend_sched_reset(sched);
+
+    // Dump intermediate tensors by name (matches upstream's dump_named scheme)
+    // when ACE_STEP_DUMP_DIR is set. MUST run before sched_reset() — the
+    // reset frees the backend's intermediate buffers, leaving tensor data
+    // pointers dangling.
+    // Only dump on the FIRST call (step 0 of the diffusion loop) — upstream
+    // does the same, and subsequent steps would overwrite the dumps.
+    static thread_local int s_dump_call_count = 0;
+    const char* dir_env = std::getenv("ACE_STEP_DUMP_DIR");
+    const bool do_dump = (s_dump_call_count++ == 0) && dir_env;
+    if (do_dump) {
+        auto dump_named = [&](const char* name) {
+            ggml_tensor* t = ggml_graph_get_tensor(gf, name);
+            if (!t) return;
+            int ndims = ggml_n_dims(t);
+            // Cap at 3 written dims (we never need dim[3] since N=1 here).
+            if (ndims > 3) ndims = 3;
+            int64_t shape[3] = {1, 1, 1};
+            int64_t total = 1;
+            for (int i = 0; i < ndims; i++) {
+                shape[i] = t->ne[i];
+                total *= t->ne[i];
+            }
+            std::vector<float> buf(static_cast<size_t>(total));
+            ggml_backend_tensor_get(t, buf.data(), 0, total * sizeof(float));
+            fprintf(stderr, "[dump] %-32s data=%p ne=[%lld,%lld,%lld,%lld] writing=%lld floats\n",
+                    name, t->data, (long long)t->ne[0], (long long)t->ne[1],
+                    (long long)(ggml_n_dims(t) > 2 ? t->ne[2] : 0),
+                    (long long)(ggml_n_dims(t) > 3 ? t->ne[3] : 0),
+                    (long long)total);
+            std::string path = std::string(dir_env) + "/" + name + ".bin";
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                int32_t ndims_w = static_cast<int32_t>(ndims);
+                std::fwrite(&ndims_w, sizeof(int32_t), 1, f);
+                for (int i = 0; i < ndims; i++) {
+                    int32_t d = static_cast<int32_t>(shape[i]);
+                    std::fwrite(&d, sizeof(int32_t), 1, f);
+                }
+                std::fwrite(buf.data(), sizeof(float),
+                            static_cast<size_t>(total), f);
+                std::fclose(f);
+            }
+        };
+        dump_named("temb");
+        dump_named("temb_t");
+        dump_named("temb_r");
+        dump_named("temb_lin1_t");
+        dump_named("temb_lin1_r");
+        dump_named("sinusoid_t_input");
+        dump_named("sinusoid_r_input");
+        dump_named("tproj");
+        dump_named("layer0_time_mod");
+        dump_named("enc_after_cond_emb");
+        // Layer-0 sub-step dumps (matches upstream's layer0_* dump scheme).
+        // These pinpoint which operation inside layer 0 first diverges.
+        dump_named("layer0_sa_input");
+        dump_named("layer0_q_raw_after_proj");
+        dump_named("layer0_k_raw_after_proj");
+        dump_named("layer0_q_after_qknorm");
+        dump_named("layer0_k_after_qknorm");
+        dump_named("layer0_v_raw");
+        dump_named("layer0_q_after_rope");
+        dump_named("layer0_k_after_rope");
+        dump_named("layer0_attn_out");
+        dump_named("layer0_sa_output");
+        dump_named("layer0_after_self_attn");
+        dump_named("layer0_after_cross_attn");
+        dump_named("layer0_mlp_input");
+        dump_named("layer0_mlp_output");
+        char nm[64];
+        for (int idx : {0, 6, 12, 18}) {
+            std::snprintf(nm, sizeof(nm), "hidden_after_layer%d", idx);
+            dump_named(nm);
+        }
+        std::snprintf(nm, sizeof(nm), "hidden_after_layer%d", n_layer - 1);
+        dump_named(nm);
+    }
 
     // Download output to caller's buffer.
     ggml_backend_tensor_get(cur, result, 0,
                             static_cast<size_t>(T) * H * sizeof(float));
+
+    ggml_backend_sched_reset(sched);
 
     // Output RMS diagnostic
     {
@@ -973,6 +1197,22 @@ bool DiTRunner::forward(
     // the model's own TimestepEmbedding class applies scale=1000 internally
     // (line 247: t = t * self.scale) before computing the sinusoid.
     timestep_embed(t * 1000.0f, temb.data(), temb_dim);
+
+    // Debug: dump the CPU-side temb buffer (before any graph upload) so we
+    // can verify the sinusoid is computed correctly. This is independent of
+    // any scheduler memory reuse issues.
+    if (const char* dir_env = std::getenv("ACE_STEP_DUMP_DIR")) {
+        std::string path = std::string(dir_env) + "/cpu_sinusoid_t.bin";
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            int32_t ndims = 1, d0 = temb_dim;
+            std::fwrite(&ndims, sizeof(int32_t), 1, f);
+            std::fwrite(&d0, sizeof(int32_t), 1, f);
+            std::fwrite(temb.data(), sizeof(float), temb_dim, f);
+            std::fclose(f);
+        }
+        fprintf(stderr, "[forward] t=%f, temb[0]=%.4f temb[1]=%.4f temb[128]=%.4f\n",
+                t, temb[0], temb[1], temb[128]);
+    }
 
     if (guidance_scale == 1.0f) {
         return run_one_forward(cfg_, ext_ctx_, sched_, x_t, T, H,
