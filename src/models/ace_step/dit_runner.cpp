@@ -477,30 +477,67 @@ static bool run_one_forward(
     ggml_tensor* cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
     memcpy(cur->data, x_t, static_cast<size_t>(T) * H * sizeof(float));
 
-    // ── Time embedding → time_mod [H, 6] ─────────────────────────────────
-    ggml_tensor* tp = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, temb_dim);
-    memcpy(tp->data, temb, static_cast<size_t>(temb_dim) * sizeof(float));
-    tp = ggml_reshape_2d(ctx, tp, temb_dim, 1);   // [temb_dim, 1]
+    // ── Dual-timestep embedding (mean-flow two-branch) ───────────────────
+    // Upstream AceStepTransformer1DModel.forward (ace_step_transformer.py:560):
+    //   temb_t, timestep_proj_t = self.time_embed(timestep)
+    //   temb_r, timestep_proj_r = self.time_embed_r(timestep - timestep_r)
+    //   temb = temb_t + temb_r
+    //   timestep_proj = timestep_proj_t + timestep_proj_r
+    // For standard inference timestep_r == timestep, so the r-branch evaluates
+    // at t=0 (constant). Skipping it leaves both the per-layer AdaLN modulation
+    // AND the global scale_shift_table modulation off by a constant, producing
+    // audio that decodes to static. We compute both branches and sum.
+    auto build_time_mlp = [&](const char* prefix, const float* sin_buf,
+                              int sin_dim) -> ggml_tensor* {
+        ggml_tensor* t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sin_dim);
+        memcpy(t->data, sin_buf, static_cast<size_t>(sin_dim) * sizeof(float));
+        t = ggml_reshape_2d(ctx, t, sin_dim, 1);
 
-    // MLP 1: linear_1 → SiLU → linear_2. All three weights are validated
-    // at load time (loader.cpp must_have), so no null-check fallback here.
-    ggml_tensor* t1w = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_1.weight");
-    ggml_tensor* t1b = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_1.bias");
-    ggml_tensor* t2w = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_2.weight");
-    ggml_tensor* t2b = ggml_get_tensor(ext_ctx, "decoder.time_embed.linear_2.bias");
-    tp = ggml_mul_mat(ctx, t1w, tp);
-    if (t1b) tp = ggml_add(ctx, tp, ggml_repeat(ctx, t1b, tp));
-    tp = ggml_silu(ctx, tp);
-    tp = ggml_mul_mat(ctx, t2w, tp);
-    if (t2b) tp = ggml_add(ctx, tp, ggml_repeat(ctx, t2b, tp));
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s.linear_1.weight", prefix);
+        ggml_tensor* l1w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf), "%s.linear_1.bias", prefix);
+        ggml_tensor* l1b = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf), "%s.linear_2.weight", prefix);
+        ggml_tensor* l2w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf), "%s.linear_2.bias", prefix);
+        ggml_tensor* l2b = ggml_get_tensor(ext_ctx, buf);
+        t = ggml_mul_mat(ctx, l1w, t);
+        if (l1b) t = ggml_add(ctx, t, ggml_repeat(ctx, l1b, t));
+        t = ggml_silu(ctx, t);
+        t = ggml_mul_mat(ctx, l2w, t);
+        if (l2b) t = ggml_add(ctx, t, ggml_repeat(ctx, l2b, t));
+        return t;   // [H, 1] — this is temb (linear_2 output)
+    };
 
-    // Time projection → [H, 6] modulation
-    // HOT-Step dit-graph.h:144 applies SiLU before time_proj: h2 = silu(temb)
-    ggml_tensor* tpw = ggml_get_tensor(ext_ctx, "decoder.time_embed.time_proj.weight");
-    ggml_tensor* tpb = ggml_get_tensor(ext_ctx, "decoder.time_embed.time_proj.bias");
-    tp = ggml_silu(ctx, tp);  // SiLU before time_proj (HOT-Step dit-graph.h:144)
-    auto pj = ggml_mul_mat(ctx, tpw, tp);
-    if (tpb) pj = ggml_add(ctx, pj, ggml_repeat(ctx, tpb, pj));
+    // t-branch sinusoid (caller-supplied, t * 1000 already applied).
+    ggml_tensor* temb_t = build_time_mlp("decoder.time_embed",
+                                          temb, temb_dim);
+    // r-branch sinusoid: t-r=0 → cos(0)=1 (first half), sin(0)=0 (second half).
+    std::vector<float> r_sin(temb_dim, 0.0f);
+    for (int j = 0; j < temb_dim / 2; j++) r_sin[j] = 1.0f;
+    ggml_tensor* temb_r = build_time_mlp("decoder.time_embed_r",
+                                          r_sin.data(), temb_dim);
+
+    // temb_combined = temb_t + temb_r — used for the FINAL norm_out modulation.
+    ggml_tensor* temb_combined = ggml_add(ctx, temb_t, temb_r);
+
+    // Per-layer timestep_proj = time_proj(silu(temb_t)) + time_proj_r(silu(temb_r)).
+    // Each time_proj maps [H, 1] → [H*6, 1], then reshape to [H, 6].
+    auto proj_time = [&](const char* prefix, ggml_tensor* temb_branch) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s.time_proj.weight", prefix);
+        ggml_tensor* pw = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf), "%s.time_proj.bias", prefix);
+        ggml_tensor* pb = ggml_get_tensor(ext_ctx, buf);
+        ggml_tensor* h = ggml_silu(ctx, temb_branch);
+        h = ggml_mul_mat(ctx, pw, h);
+        if (pb) h = ggml_add(ctx, h, ggml_repeat(ctx, pb, h));
+        return h;   // [H*6, 1]
+    };
+    auto proj_t = proj_time("decoder.time_embed",     temb_t);
+    auto proj_r = proj_time("decoder.time_embed_r",   temb_r);
+    auto pj = ggml_add(ctx, proj_t, proj_r);
     ggml_tensor* time_mod = ggml_reshape_2d(ctx, pj, H, 6);   // ne0=H, ne1=6
 
     // ── Condition embedder ───────────────────────────────────────────────
@@ -567,6 +604,64 @@ static bool run_one_forward(
     ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, packed);
     ggml_tensor* cond_emb = ggml_add(ctx, ce_out, ggml_repeat(ctx, ceb, ce_out));
 
+    // ── Diagnostic: cond_emb stats (compute it eagerly to read real values) ──
+    if (std::getenv("ACE_STEP_DIT_DEBUG")) {
+        // Compute ct (raw TE hidden state) stats — this tells us whether the
+        // text encoder output magnitude is reasonable BEFORE any projection.
+        if (cond_data && ct_len > 0) {
+            int64_t te_hs = (cond_hidden > 0) ? cond_hidden : 1024;
+            const float* cdv = cond_data;
+            double sq = 0.0, sum = 0.0; float mn = 1e30f, mx = -1e30f;
+            int64_t n = static_cast<int64_t>(ct_len) * te_hs;
+            for (int64_t i = 0; i < n; i++) {
+                float v = cdv[i]; sq += (double)v*v; sum += v;
+                if (v < mn) mn = v; if (v > mx) mx = v;
+            }
+            fprintf(stderr, "[dit] te_cond: T=%d H=%ld mean=%.4f RMS=%.4f range=[%.4f,%.4f]\n",
+                    ct_len, (long)te_hs, sum/n, std::sqrt(sq/n), mn, mx);
+            fprintf(stderr, "[dit] te_cond[0..5]: ");
+            for (int i = 0; i < 6 && i < n; i++) fprintf(stderr, "%.3f ", cdv[i]);
+            fprintf(stderr, "\n");
+            // Per-token RMS to see if any token has wildly different magnitude
+            fprintf(stderr, "[dit] te_cond per-token RMS (all %d): ", ct_len);
+            for (int t = 0; t < ct_len; t++) {
+                double s = 0;
+                for (int64_t h = 0; h < te_hs; h++) s += (double)cdv[t*te_hs + h] * cdv[t*te_hs + h];
+                fprintf(stderr, "[t=%d]%.3f ", t, std::sqrt(s / te_hs));
+            }
+            fprintf(stderr, "\n");
+        }
+
+        auto stats_of = [&](const char* name, ggml_tensor* t) {
+            ggml_build_forward_expand(gf, t);
+            ggml_graph_compute_with_ctx(ctx, gf, 1);
+            double sq = 0.0, sum = 0.0; float mn = 1e30f, mx = -1e30f;
+            int64_t n = ggml_nelements(t);
+            const float* d = (const float*)t->data;
+            for (int64_t i = 0; i < n; i++) {
+                float v = d[i]; sq += (double)v*v; sum += v;
+                if (v < mn) mn = v; if (v > mx) mx = v;
+            }
+            fprintf(stderr, "[dit] %s: shape=[%ld,%ld] mean=%.4f RMS=%.4f range=[%.4f,%.4f]\n",
+                    name, (long)t->ne[0], (long)t->ne[1], sum/n, std::sqrt(sq/n), mn, mx);
+        };
+        stats_of("text_proj", text_proj);
+        stats_of("timbre_tok", timbre_tok);
+        stats_of("packed", packed);
+        stats_of("cond_emb", cond_emb);
+        // Also dump text_proj first few values
+        const float* td = (const float*)text_proj->data;
+        fprintf(stderr, "[dit] text_proj[0..5]: ");
+        for (int i = 0; i < 6; i++) fprintf(stderr, "%.3f ", td[i]);
+        fprintf(stderr, "\n");
+        // And timbre_tok first few values
+        const float* ttd = (const float*)timbre_tok->data;
+        fprintf(stderr, "[dit] timbre_tok[0..5]: ");
+        for (int i = 0; i < 6 && i < (int)(ggml_nelements(timbre_tok)); i++)
+            fprintf(stderr, "%.3f ", ttd[i]);
+        fprintf(stderr, "\n");
+    }
+
     // ── DiT layers ───────────────────────────────────────────────────────
     for (int i = 0; i < n_layer && i < 48; i++) {
         char buf[128];
@@ -580,14 +675,10 @@ static bool run_one_forward(
             layer_time_mod = ggml_add(ctx, time_mod, sst);
         }
 
-        // ── Diagnostic: pre-layer RMS (set ACE_STEP_DIT_DEBUG=1) ────────
-        if (std::getenv("ACE_STEP_DIT_DEBUG")) {
-            double sq = 0.0; int64_t nel = ggml_nelements(cur);
-            float* d = (float*)cur->data;
-            for (int64_t ii = 0; ii < nel; ii++) sq += (double)d[ii] * d[ii];
-            double rms = std::sqrt(sq / nel);
-            fprintf(stderr, "[dit] layer %d pre RMS=%.4f\n", i, rms);
-        }
+        // NOTE: A previous version of this block tried to log cur's RMS here,
+        // but `cur->data` is unmaterialized until ggml_graph_compute below —
+        // reading it produced misleading zeros. Post-compute diagnostics live
+        // after the graph compute at the bottom of this function.
 
         // ── Self-attention block ─────────────────────────────────────────
         // Upstream (modeling_acestep_v15_turbo.py:494-514):
@@ -713,20 +804,19 @@ static bool run_one_forward(
                             ggml_mul(ctx, h, ggml_repeat(ctx, c_gate, h)));
         }
 
-        // ── Diagnostic: post-layer RMS (set ACE_STEP_DIT_DEBUG=1) ───────
-        if (std::getenv("ACE_STEP_DIT_DEBUG")) {
-            double sq = 0.0; int64_t nel = ggml_nelements(cur);
-            float* d = (float*)cur->data;
-            for (int64_t ii = 0; ii < nel; ii++) sq += (double)d[ii] * d[ii];
-            double rms = std::sqrt(sq / nel);
-            fprintf(stderr, "[dit] layer %d post RMS=%.4f\n", i, rms);
-        }
+        // NOTE: A previous version logged cur->data RMS here, but `cur` is
+        // unmaterialized until the graph compute at the bottom of this
+        // function. Reading the data here produced misleading zeros.
     }
 
     // ── Final norm + scale/shift ─────────────────────────────────────────
-    // Upstream (modeling_acestep_v15_turbo.py:1494-1500):
-    //   shift, scale = (scale_shift_table + temb).chunk(2)  # 2 chunks: shift, scale
+    // Upstream (ace_step_transformer.py:616-619):
+    //   shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
     //   out = norm_out(x) * (1 + scale[row1]) + shift[row0]
+    // The temb addition is critical — without it the final norm_out modulation
+    // is constant across all timesteps, so the velocity field doesn't actually
+    // depend on `t` at the output projection. Combined with the dual-timestep
+    // embedding above, temb_combined = temb_t + temb_r matches upstream exactly.
     {
         // Learned output norm weight (validated at load time)
         ggml_tensor* norm_out_w = ggml_get_tensor(ext_ctx, "decoder.norm_out.weight");
@@ -734,16 +824,19 @@ static bool run_one_forward(
         n_out = ggml_mul(ctx, n_out, ggml_repeat(ctx, norm_out_w, n_out));
 
         // Global scale/shift: decoder.scale_shift_table [H, 2] → ne0=H, ne1=2
-        // Upstream: out = norm(x) * (1 + scale[row1]) + shift[row0]
+        // We need (scale_shift_table + temb) broadcast across the 2 rows.
         if (!global_ss_f32.empty()) {
             ggml_tensor* gss = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
             memcpy(gss->data, global_ss_f32.data(),
                    static_cast<size_t>(H) * 2 * sizeof(float));
-            // shift = row 0, scale = row 1
+            // temb_combined is [H, 1] — broadcast to [H, 2] via ggml_repeat.
+            auto temb_bc = ggml_repeat(ctx, temb_combined, gss);
+            auto gss_temb = ggml_add(ctx, gss, temb_bc);
+            // shift = row 0, scale = row 1 of (scale_shift_table + temb)
             auto shift = ggml_reshape_2d(ctx,
-                ggml_view_1d(ctx, gss, H, 0), H, 1);
+                ggml_view_1d(ctx, gss_temb, H, 0), H, 1);
             auto scale = ggml_reshape_2d(ctx,
-                ggml_view_1d(ctx, gss, H,
+                ggml_view_1d(ctx, gss_temb, H,
                              static_cast<size_t>(H) * sizeof(float)),
                 H, 1);
             // (1 + scale)
