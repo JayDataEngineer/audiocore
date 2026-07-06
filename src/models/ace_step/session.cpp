@@ -442,51 +442,26 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
         return false;
     }
 
-    // ── 1. Detokenize LM codes → 25 Hz structural source latent ────────────
-    // For cover mode this is replaced by cover_latent_cond_ which already
-    // holds VAE-encoded + temporally-smoothed source latents.
-    // For text_to_music: the LM codes (5 Hz, single int per frame) are run
-    // through the detokenizer transformer (embed_tokens → 5-patch expansion
-    // + special_tokens → 2× Qwen3-style encoder layers → proj_out) to
-    // produce the 25 Hz × 64-D src latent fed into the DiT context channels
-    // 0..63. Without this path the DiT has no musical-structure conditioning
-    // and produces temporally-incoherent noise output.
+    // ── 1. Source latent for DiT context (src channels 0..63) ──────────────
     //
-    // See docs/ACE-STEP-DETOKENIZER-GAP.md for the architecture reference.
-    std::vector<float> fsq_latent;
-    if (!is_cover_mode) {
-        const bool has_detokenizer =
-            (ggml_get_tensor(ext_ctx_, "detokenizer.embed_tokens.weight") != nullptr) &&
-            (ggml_get_tensor(ext_ctx_, "tokenizer.quantizer.project_out.weight") != nullptr);
-
-        if (has_detokenizer && detokenizer_runner_) {
-            // Primary path: 2-layer transformer detokenizer (matches upstream
-            // AudioTokenDetokenizer + ResidualFSQ.project_out).
-            if (!detokenizer_runner_->decode(music_codes.data(), n_codes_5,
-                                              &fsq_latent, error)) {
-                return false;
-            }
-            // detokenizer_runner_ emits [N * 5 * 64] (time-major at 25 Hz).
-            // n_frames is already N * 5 (set above from music_codes.size() * 5).
-            fprintf(stderr, "[ace_step] detokenizer produced %zu latent values "
-                    "(expected %d)\n", fsq_latent.size(), n_frames * out_ch);
-        } else {
-            // Legacy fallback: pad the 6-D FSQ values to 64-D and repeat 5×.
-            // Kept for checkpoints without the detokenizer.* tensors.
-            fsq_latent.assign(static_cast<size_t>(n_frames) * out_ch, 0.0f);
-            for (int32_t i = 0; i < n_codes_5; i++) {
-                float f6[6];
-                fsq_decode_one(music_codes[static_cast<size_t>(i)], f6);
-                float projected[64] = {0};
-                for (int d = 0; d < 6 && d < out_ch; d++)
-                    projected[d] = f6[d];
-                for (int j = 0; j < 5; j++) {
-                    std::memcpy(&fsq_latent[static_cast<size_t>(i * 5 + j) * out_ch],
-                                projected, static_cast<size_t>(out_ch) * sizeof(float));
-                }
-            }
-        }
-    }  // end if (!is_cover_mode)
+    // Upstream ACE-Step prepare_src_latents (pipeline_ace_step.py:626):
+    //   • cover from audio_codes  → detokenize residual-FSQ codes
+    //   • cover from src_audio    → VAE-encode (then tokenize+detokenize for cover)
+    //   • text_to_music (no src)  → silence_latent  ← THIS IS OUR CASE
+    //
+    // For text_to_music, src_latents = silence_latent (the learned "no music"
+    // reference), NOT the detokenized LM codes. The DiT learns: "given silence
+    // as src + text conditioning, generate music." The LM codes drive the
+    // generation only indirectly — they were already consumed by the LM to
+    // produce a musical token sequence that conditions the DiT via the text
+    // encoder path (not via src).
+    //
+    // The detokenizer_runner is kept wired (detokenizer_runner_ member) for
+    // future cover-mode support (residual-FSQ decode path), but is NOT invoked
+    // for text_to_music. See docs/ACE-STEP-DETOKENIZER-GAP.md.
+    //
+    // For cover mode the src is cover_latent_cond_ which already holds the
+    // VAE-encoded + temporally-smoothed source latents.
 
     // ── 2. Prepare conditioning for DiT ─────────────────────────────────────
     if (!is_cover_mode && (te_cond_.empty() || te_cond_len_ <= 0)) {
@@ -622,21 +597,11 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                 std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
                             static_cast<size_t>(out_ch) * sizeof(float));
         } else {
-            // text_to_music: FSQ-decoded LM latent is the structural source.
-            // The LM-generated music_codes carry the coarse musical structure
-            // (chord progression, rhythm sketch); fsq_latent is the learned
-            // projection of those codes into the 64-D latent space. This is
-            // the SOURCE the DiT refines — without it the DiT has no musical
-            // context and produces temporally-incoherent output.
-            //
-            // Fallback to silence latent only when fsq_latent isn't populated
-            // (e.g. very short generation, missing fsq_proj weights, or when
-            // t exceeds the fsq_latent's frame count).
-            if (t < n_frames && !fsq_latent.empty()) {
-                std::memcpy(row,
-                            &fsq_latent[static_cast<size_t>(t) * out_ch],
-                            static_cast<size_t>(out_ch) * sizeof(float));
-            } else if (silence_ptr && t < silence_T)
+            // text_to_music: src = silence_latent (the learned "no music"
+            // reference). Matches upstream prepare_src_latents for the no-source
+            // case. The silence_latent tensor (shape [64, 15000]) is cropped
+            // or tiled to the target latent length.
+            if (silence_ptr && t < silence_T)
                 std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
                             static_cast<size_t>(out_ch) * sizeof(float));
         }
