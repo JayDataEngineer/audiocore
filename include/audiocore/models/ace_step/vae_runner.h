@@ -58,7 +58,7 @@ public:
     // Lazily initialize GPU backend + scheduler on first call. Idempotent.
     bool ensure_backend();
 
-private:
+public:  // weight structs are public so graph builders can reference them
     // ── Per-layer pre-computed weight structs ────────────────────────────
     struct ResUnitWeights {
         std::vector<float> s1a_;   // snake1 alpha [C]
@@ -89,6 +89,12 @@ private:
 
     // Pre-compute all weights from GGUF bf16/WSConv format
     void precompute_weights(ggml_context* ext_ctx);
+
+    // Per-block sub-graph decode (fast CUDA path). Builds 7 sub-graphs
+    // (conv1, 5 decoder blocks, final snake+conv2) instead of 73 per-op
+    // calls, keeping data on the GPU within each block.
+    bool decode_blocks(const float* latents, int32_t n_frames,
+                       std::vector<float>* pcm, std::string* error);
 
     ggml_context* ext_ctx_;
 

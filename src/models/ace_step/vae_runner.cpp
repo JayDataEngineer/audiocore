@@ -285,6 +285,32 @@ static void nan_check(const char* tag, const float* p, size_t n) {
 // directly on the CUDA backend, computes there, and downloads the result.
 struct VaeInputUpload { ggml_tensor* t; const void* data; size_t nbytes; };
 
+// ── VAE profiling accumulator ─────────────────────────────────────────────
+struct VaeProfiler {
+    double t_alloc = 0, t_upload = 0, t_compute = 0, t_download = 0;
+    size_t bytes_up = 0, bytes_down = 0;
+    int n_calls = 0;
+    void acc(const std::vector<VaeInputUpload>& uploads, size_t out_nb,
+             double a, double u, double c, double d) {
+        t_alloc += a; t_upload += u; t_compute += c; t_download += d;
+        for (const auto& up : uploads) bytes_up += up.nbytes;
+        bytes_down += out_nb;
+        n_calls++;
+    }
+    void reset() { *this = {}; }
+    void print(const char* label) const {
+        if (n_calls == 0) return;
+        fprintf(stderr, "[vae-prof] %s: %d ops  alloc=%.0fms  upload=%.0fms"
+                "  compute=%.0fms  download=%.0fms  total=%.0fms"
+                "  up=%.1fMB  down=%.1fMB\n",
+                label, n_calls,
+                t_alloc, t_upload, t_compute, t_download,
+                t_alloc + t_upload + t_compute + t_download,
+                bytes_up / 1048576.0, bytes_down / 1048576.0);
+    }
+};
+static thread_local VaeProfiler vae_prof;
+
 static bool vae_cuda_compute(ggml_backend_t backend,
                                ggml_context* ctx, ggml_cgraph* gf,
                                ggml_tensor* out_tensor,
@@ -294,19 +320,26 @@ static bool vae_cuda_compute(ggml_backend_t backend,
     ggml_set_output(out_tensor);
     ggml_build_forward_expand(gf, out_tensor);
 
-    // Allocate ALL tensors directly on the backend (CUDA when available).
+    auto _t0 = ggml_time_us();
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buf) return false;
+    auto _t1 = ggml_time_us();
 
-    // Upload input data + weights
     for (const auto& u : uploads)
         ggml_backend_tensor_set(u.t, u.data, 0, u.nbytes);
+    auto _t2 = ggml_time_us();
 
-    // Compute directly on the backend — no scheduler, no CPU fallback.
     ggml_backend_graph_compute(backend, gf);
+    auto _t3 = ggml_time_us();
 
     if (out_data && out_nbytes)
         ggml_backend_tensor_get(out_tensor, out_data, 0, out_nbytes);
+    auto _t4 = ggml_time_us();
+
+    // Accumulate timing for profiling
+    vae_prof.acc(uploads, out_nbytes,
+                 (_t1-_t0)/1000.0, (_t2-_t1)/1000.0,
+                 (_t3-_t2)/1000.0, (_t4-_t3)/1000.0);
 
     ggml_backend_buffer_free(buf);
     return true;
@@ -1007,6 +1040,282 @@ void VAERunner::precompute_weights(ggml_context* ext_ctx) {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+//  Per-block sub-graph decode (fast CUDA path)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Instead of 73 separate op calls (each with alloc/upload/download/transpose),
+// we build 7 sub-graphs: conv1, 5 decoder blocks, final snake+conv2.
+// Data stays on the GPU within each block — no CPU transposes or copies.
+//
+// All builders use column-major layout: ne0=T, ne1=C.
+
+struct SubGraphIO {
+    std::vector<float> data;  // column-major [T, C]: data[t + c*T]
+    int T = 0, C = 0;
+};
+
+// ── Graph builders ──────────────────────────────────────────────────────────
+
+// Snake: x + sin²(α·x) · inv_β   (element-wise, layout [T, C])
+static ggml_tensor* gb_snake(ggml_context* ctx, ggml_tensor* x,
+                               const float* exp_a, const float* inv_b, int C,
+                               std::vector<VaeInputUpload>& uploads)
+{
+    ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+    ggml_set_input(a);
+    uploads.push_back({a, exp_a, static_cast<size_t>(C) * sizeof(float)});
+    ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+    ggml_set_input(b);
+    uploads.push_back({b, inv_b, static_cast<size_t>(C) * sizeof(float)});
+
+    ggml_tensor* a_2d = ggml_reshape_2d(ctx, a, 1, C);
+    ggml_tensor* b_2d = ggml_reshape_2d(ctx, b, 1, C);
+
+    ggml_tensor* ax   = ggml_mul(ctx, x, ggml_repeat(ctx, a_2d, x));
+    ggml_tensor* s    = ggml_sin(ctx, ax);
+    ggml_tensor* s2   = ggml_sqr(ctx, s);
+    ggml_tensor* term = ggml_mul(ctx, s2, ggml_repeat(ctx, b_2d, s2));
+    return ggml_add(ctx, x, term);
+}
+
+// Conv1d via ggml_conv_1d (decomposes to im2col + mul_mat, both CUDA-supported).
+// x: [T, IC] column-major → output: [T_out, OC] column-major
+static ggml_tensor* gb_conv1d(ggml_context* ctx, ggml_tensor* x,
+                                const float* w_f32, int K, int IC, int OC,
+                                const float* bias,
+                                int stride, int pad, int dilation,
+                                std::vector<VaeInputUpload>& uploads)
+{
+    // Weight [K, IC, OC] → F16
+    static thread_local std::vector<ggml_fp16_t> w16;
+    const size_t n_w = static_cast<size_t>(K) * IC * OC;
+    w16.resize(n_w);
+    for (size_t i = 0; i < n_w; i++) w16[i] = ggml_fp32_to_fp16(w_f32[i]);
+
+    ggml_tensor* w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, IC, OC);
+    ggml_set_input(w);
+    uploads.push_back({w, w16.data(), n_w * sizeof(ggml_fp16_t)});
+
+    ggml_tensor* r = ggml_conv_1d(ctx, w, x, stride, pad, dilation);
+
+    if (bias) {
+        ggml_tensor* bt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, OC);
+        ggml_set_input(bt);
+        uploads.push_back({bt, bias, static_cast<size_t>(OC) * sizeof(float)});
+        ggml_tensor* bt_2d = ggml_reshape_2d(ctx, bt, 1, OC);
+        r = ggml_add(ctx, r, ggml_repeat(ctx, bt_2d, r));
+    }
+    return r;
+}
+
+// ConvTranspose1d via mul_mat + col2im_1d (both CUDA-supported).
+// x: [T_in, IC] column-major → output: [T_out, OC] column-major
+static ggml_tensor* gb_conv_t1d(ggml_context* ctx, ggml_tensor* x,
+                                  const float* w_2d, int IC, int OC, int K,
+                                  int stride, int pad, const float* bias,
+                                  std::vector<VaeInputUpload>& uploads)
+{
+    ggml_tensor* x_t = ggml_cont(ctx, ggml_transpose(ctx, x));  // [IC, T_in]
+
+    ggml_tensor* w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, K * OC);
+    ggml_set_input(w);
+    uploads.push_back({w, w_2d,
+                       static_cast<size_t>(IC) * K * OC * sizeof(float)});
+
+    ggml_tensor* col = ggml_mul_mat(ctx, w, x_t);  // [K*OC, T_in]
+    ggml_tensor* r = ggml_col2im_1d(ctx, col, stride, OC, pad);  // [T_out, OC]
+
+    if (bias) {
+        ggml_tensor* bt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, OC);
+        ggml_set_input(bt);
+        uploads.push_back({bt, bias, static_cast<size_t>(OC) * sizeof(float)});
+        ggml_tensor* bt_2d = ggml_reshape_2d(ctx, bt, 1, OC);
+        r = ggml_add(ctx, r, ggml_repeat(ctx, bt_2d, r));
+    }
+    return r;
+}
+
+// ResUnit: snake1 → conv1(k=7,dilated) → snake2 → conv2(k=1) + skip
+static ggml_tensor* gb_resunit(ggml_context* ctx, ggml_tensor* x, int C,
+                                 const VAERunner::ResUnitWeights& ru,
+                                 int dilation,
+                                 std::vector<VaeInputUpload>& uploads)
+{
+    ggml_tensor* h1 = gb_snake(ctx, x, ru.s1a_.data(), ru.s1b_.data(), C, uploads);
+    ggml_tensor* h2 = gb_conv1d(ctx, h1, ru.c1w_.data(), ru.c1K_, C, C,
+                                  ru.c1b_.empty() ? nullptr : ru.c1b_.data(),
+                                  1, 3 * dilation, dilation, uploads);
+    ggml_tensor* h3 = gb_snake(ctx, h2, ru.s2a_.data(), ru.s2b_.data(), C, uploads);
+    ggml_tensor* h4 = gb_conv1d(ctx, h3, ru.c2w_.data(), ru.c2K_, C, C,
+                                  ru.c2b_.empty() ? nullptr : ru.c2b_.data(),
+                                  1, 0, 1, uploads);
+    return ggml_add(ctx, x, h4);  // skip connection
+}
+
+// Decoder block: snake → conv_t1d → 3×resunit
+static ggml_tensor* gb_block(ggml_context* ctx, ggml_tensor* x,
+                               int block_idx,
+                               const VAERunner::BlockWeights& bw,
+                               std::vector<VaeInputUpload>& uploads)
+{
+    const BlockCfg& bc = kBlocks[block_idx];
+    ggml_tensor* h1 = gb_snake(ctx, x, bw.snake_a_.data(), bw.snake_b_.data(),
+                                bc.in_ch, uploads);
+    ggml_tensor* h2 = gb_conv_t1d(ctx, h1, bw.ct1_w_.data(),
+                                   bc.in_ch, bc.out_ch, bw.ct1_K_,
+                                   bc.stride, bc.padding,
+                                   bw.ct1_b_.empty() ? nullptr : bw.ct1_b_.data(),
+                                   uploads);
+    ggml_tensor* cur = h2;
+    for (int r = 0; r < 3; r++)
+        cur = gb_resunit(ctx, cur, bc.out_ch, bw.res_[r],
+                          kResDilations[r], uploads);
+    return cur;
+}
+
+// ── Sub-graph executor (direct CUDA backend, no scheduler) ──────────────────
+template<typename Builder>
+static bool run_block_subgraph(
+    ggml_backend_t backend,
+    const float* input_col, int T_in, int C_in,
+    Builder builder,
+    SubGraphIO* output,
+    std::string* error, const char* label = "")
+{
+    // Scratch buffer for tensor metadata only (data lives on CUDA).
+    constexpr size_t META_BUF = 1 << 20;  // 1 MB
+    static thread_local std::vector<char> meta_buf;
+    meta_buf.assign(META_BUF, 0);
+
+    ggml_init_params gip = {meta_buf.size(), meta_buf.data(), /*no_alloc=*/true};
+    ggml_context* ctx = ggml_init(gip);
+    if (!ctx) { if (error) *error = std::string(label) + ": ggml_init failed"; return false; }
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx, 8192, false);
+
+    std::vector<VaeInputUpload> uploads;
+
+    ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_in, C_in);
+    ggml_set_input(in);
+    uploads.push_back({in, input_col,
+                       static_cast<size_t>(T_in) * C_in * sizeof(float)});
+
+    ggml_tensor* result = builder(ctx, in, uploads);
+    ggml_set_output(result);
+    ggml_build_forward_expand(gf, result);
+
+    auto _t0 = ggml_time_us();
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        if (error) *error = std::string(label) + ": CUDA alloc failed";
+        ggml_free(ctx);
+        return false;
+    }
+    auto _t1 = ggml_time_us();
+
+    for (const auto& u : uploads)
+        ggml_backend_tensor_set(u.t, u.data, 0, u.nbytes);
+    auto _t2 = ggml_time_us();
+
+    ggml_backend_graph_compute(backend, gf);
+    auto _t3 = ggml_time_us();
+
+    output->T = (int)result->ne[0];
+    output->C = (int)result->ne[1];
+    size_t n = static_cast<size_t>(output->T) * output->C;
+    output->data.resize(n);
+    ggml_backend_tensor_get(result, output->data.data(), 0, n * sizeof(float));
+    auto _t4 = ggml_time_us();
+
+    if (std::getenv("AUDIOCORE_VAE_PROFILE"))
+        fprintf(stderr, "[vae-blk] %-12s alloc=%dms upload=%dms compute=%dms"
+                " dl=%dms nodes=%zu → [%d, %d]\n",
+                label, (int)((_t1-_t0)/1000), (int)((_t2-_t1)/1000),
+                (int)((_t3-_t2)/1000), (int)((_t4-_t3)/1000),
+                (size_t)ggml_graph_n_nodes(gf), output->T, output->C);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
+}
+
+// ── Per-block decode (fast path) ────────────────────────────────────────────
+static const char* kBlkNames[5] = {"block0", "block1", "block2", "block3", "block4"};
+
+bool VAERunner::decode_blocks(const float* latents, int32_t n_frames,
+                                std::vector<float>* pcm, std::string* error)
+{
+    const int32_t T = n_frames;
+
+    // Transpose latents from time-major [T, 64] to column-major [T, 64]
+    SubGraphIO io;
+    io.T = T;
+    io.C = 64;
+    io.data.resize(static_cast<size_t>(T) * 64);
+    for (int32_t t = 0; t < T; t++)
+        for (int32_t c = 0; c < 64; c++)
+            io.data[t + c * T] = latents[t * 64 + c];
+
+    // ── Sub-graph 0: conv1 [T, 64] → [T, 2048] ────────────────────────────
+    {
+        SubGraphIO out;
+        if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                [&](ggml_context* ctx, ggml_tensor* in,
+                    std::vector<VaeInputUpload>& uploads) {
+                    return gb_conv1d(ctx, in,
+                        dec_conv1_w_.data(), dec_conv1_K_, 64, 2048,
+                        dec_conv1_b_.empty() ? nullptr : dec_conv1_b_.data(),
+                        1, 3, 1, uploads);
+                },
+                &out, error, "conv1"))
+            return false;
+        io = std::move(out);
+    }
+
+    // ── Sub-graphs 1-5: decoder blocks ────────────────────────────────────
+    for (int b = 0; b < 5; b++) {
+        SubGraphIO out;
+        const int bi = b;
+        if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                [&](ggml_context* ctx, ggml_tensor* in,
+                    std::vector<VaeInputUpload>& uploads) {
+                    return gb_block(ctx, in, bi, dec_blk_[bi], uploads);
+                },
+                &out, error, kBlkNames[b]))
+            return false;
+        io = std::move(out);
+    }
+
+    // ── Sub-graph 6: final snake + conv2 [T, 128] → [T, 2] ────────────────
+    {
+        SubGraphIO out;
+        if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                [&](ggml_context* ctx, ggml_tensor* in,
+                    std::vector<VaeInputUpload>& uploads) {
+                    ggml_tensor* h = gb_snake(ctx, in,
+                        dec_fn_exp_a_.data(), dec_fn_inv_b_.data(), 128, uploads);
+                    return gb_conv1d(ctx, h,
+                        dec_conv2_w_.data(), dec_conv2_K_, 128, 2,
+                        nullptr, 1, 3, 1, uploads);
+                },
+                &out, error, "final"))
+            return false;
+        io = std::move(out);
+    }
+
+    // ── Convert column-major [T, 2] → interleaved stereo [T*2] ────────────
+    pcm->resize(static_cast<size_t>(io.T) * 2);
+    for (int32_t t = 0; t < io.T; t++) {
+        (*pcm)[t * 2]     = io.data[t];              // L
+        (*pcm)[t * 2 + 1] = io.data[t + io.T];       // R
+    }
+
+    return true;
+}
+
+// (kBlkNames defined above, before decode_blocks)
+
 bool VAERunner::decode(const float* latents, int32_t n_frames,
                         std::vector<float>* pcm, std::string* error) {
     if (!ext_ctx_ || n_frames <= 0) {
@@ -1027,11 +1336,14 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
     // the overlapping PCM regions with a Hann window. This unlocks full
     // songs (2-3 minute output) with no model changes.
     //
-    // Tile geometry (tuned for ~10s tiles + 1s overlap):
-    //   TILE_FRAMES = 250 latent frames  = 10.0s audio
+    // Tile geometry (tuned for per-block VRAM budget):
+    //   TILE_FRAMES = 150 latent frames  = 6.0s audio
+    //     Block 4 peak VRAM at 150 frames ≈ 10 GB (snake + im2col + mul_mat
+    //     intermediates allocated simultaneously by alloc_ctx_tensors).
+    //     250 frames (10s) needs ~16 GB and OOMs on 24 GB GPUs with DiT loaded.
     //   OVERLAP_FRAMES = 25 latent frames = 1.0s audio crossfade
     // 1920 = total VAE upsampling factor (latent_frames → pcm_samples)
-    constexpr int32_t TILE_FRAMES    = 250;
+    constexpr int32_t TILE_FRAMES    = 150;
     constexpr int32_t OVERLAP_FRAMES = 25;
     constexpr int32_t UPSAMPLE       = 1920;
 
@@ -1096,10 +1408,22 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
         return true;
     }
 
-    // ── Shared scratch buffer ────────────────────────────────────────────
-    // Sized for the worst-case op (block 4 ResUnit conv1 @ 15s):
-    //   im2col F16: T*7*128*2 ≈ 1.4 GB, plus activations ≈ 0.8 GB
-    // 4 GB handles up to ~15s; longer durations need tiled decode.
+    // ── Fast path: per-block sub-graph decode (CUDA) ───────────────────────
+    // Builds 7 sub-graphs instead of 73 per-op calls, keeping data on GPU.
+    // If CUDA alloc fails (VRAM exhaustion on large tiles), falls back to
+    // the per-op path which has lower peak VRAM (one op at a time).
+    if (cuda_backend_) {
+        std::string blk_err;
+        if (decode_blocks(latents, n_frames, pcm, &blk_err)) {
+            return true;
+        }
+        fprintf(stderr, "[vae] per-block decode failed (%s), falling back to per-op\n",
+                blk_err.c_str());
+        if (error) error->clear();
+    }
+
+    // ── Fallback: per-op decode ───────────────────────────────────────────
+    // Each op builds its own small graph. Lower peak VRAM than per-block.
     const size_t buf_size = 4096ULL * 1024 * 1024;
     fprintf(stderr, "[vae] allocating %.0f MB scratch...\n", buf_size / 1048576.0);
     std::vector<char> buf(buf_size);
@@ -1222,11 +1546,11 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
 
     nan_check("conv2_out(pcm)", pcm->data(), pcm->size());
 
+    vae_prof.print("decode");
+    vae_prof.reset();
+
     return true;
 }
-
-// ═════════════════════════════════════════════════════════════════════════════
-//  VAE Encoder: stereo PCM [T, 2] → latent [T/1920, 64]
 // ═════════════════════════════════════════════════════════════════════════════
 
 bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
