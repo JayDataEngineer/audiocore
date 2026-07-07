@@ -31,11 +31,13 @@ using nlohmann::json;
 extern "C" void audiocore_register_moss_tts();
 extern "C" void audiocore_register_ace_step();
 extern "C" void audiocore_register_qwen3_tts();
+extern "C" void audiocore_register_moss_sfx_v2();
 
 void register_all_families() {
     audiocore_register_moss_tts();
     audiocore_register_ace_step();
     audiocore_register_qwen3_tts();
+    audiocore_register_moss_sfx_v2();
 }
 
 struct ConfigModel {
