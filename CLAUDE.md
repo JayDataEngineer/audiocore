@@ -199,7 +199,7 @@ output (modulo quantization noise).
 |-----------|--------|------|-------|
 | DiT GGUF converter | ✅ Phase 2 | `tools/convert_mse2.cpp` | Writes 825 tensors with `moss_sfx_v2.*` prefix |
 | DiT graph builder | ✅ Phase 5 | `src/models/moss_sfx_v2/dit_runner.cpp` | 30-layer DiT, QK-norm, RoPE, CFG |
-| VAE decoder | ✅ Phase 4 | `src/models/moss_sfx_v2/vae_runner.cpp` | DAC decoder: 4×DecoderBlock(strides=8,8,4,2), Snake, Tanh |
+| VAE decoder | ✅ Phase 4 (verified) | `src/models/moss_sfx_v2/vae_runner.cpp` | DAC decoder: 5×DecoderBlock(strides=8,5,4,3,2), Snake, Tanh. 40.3 dB SNR vs Python reference |
 | Loader | ✅ Phase 3 | `src/models/moss_sfx_v2/loader.cpp` | DiT + VAE + TE GGUF binding |
 | **Session (denoising loop)** | ✅ **New** | `src/models/moss_sfx_v2/session.cpp` | FlowMatch scheduler, CFG, Euler step, VAE decode, post-processing |
 
@@ -238,8 +238,9 @@ output (modulo quantization noise).
   alongside DiT tensors.
 
 ### Parity tests (`tests/test_mse2_parity`)
-- **Status**: ✅ All 30 blocks pass (TOL=10)
+- **Status**: ✅ All 30 DiT blocks + all 10 VAE layers pass (TOL=10 DiT, TOL=2.0 VAE)
 - **Test coverage**: Per-block tests for norm1, modulation, SA Q/K/V/QK-norm/RoPE, SA attention, SA O-proj, CA Q/K/V/QK-norm, CA full pipeline, norm3, FFN gate/gelu/out, VAE layers
+- **3D RoPE**: `run_ggml` mode 4 splits q/k head_dim=128 into 3 views [44,42,42] via `apply_rope_3d` helper, matching Python `precompute_freqs_cis_3d`. Three `ggml_rope_ext_inplace` calls on disjoint views produce the same output as Python's 44/42/42 split.
 - **Known gaps** (within BF16/F16 quantization envelope):
   - `ca_v`: BF16 weight precision, abs_err ~0.5-1.2
   - `ffn_out`: large output values (up to ±1016) amplify quantization noise, abs_err up to ~8
@@ -260,6 +261,100 @@ output (modulo quantization noise).
 - **Already correct** (no permute): `moss_tts/codec.cpp`,
   `ace_step/detokenizer_runner.cpp`.
 
+### Critical fix (2026-07-07): VAE decoder parity (SnakeOp memcpy, ResUnit residual bug)
+- **Bug 1**: `SnakeOp::run()` used `memcpy` to load time-major input into ggml's
+  column-major tensor. The input is time-major `[T, C]` at `t*C+c`, but ggml
+  `[T, C]` layout stores element (t,c) at `t + c*T`. Same on output read-back.
+  - **Fixed**: Explicit per-element conversion in `SnakeOp::run()` and
+    `op_tanh()` — swaps `memcpy` for row-by-row loops.
+  - Already correct: `Conv1dOp`, `ConvT1dOp` (had the conversion loops).
+- **Bug 2**: `ResUnit` residual add added `snake2` output instead of the
+  **original block input**. Python does `return self.block(x) + x`, but C++
+  reused `cur` for every intermediate and lost `x`. After the final `conv2`,
+  `h` held `snake2` output, not the original input.
+  - **Fixed**: `skip_in = cur` saved before entering the ResUnit; residual
+    add now uses `skip_in` instead of `h`.
+
+### Critical fix (2026-07-08): ConvT1d output_padding for odd strides
+- **Bug**: DAC VAE uses strides `[8,5,4,3,2]` — strides 5 and 3 are odd. The
+  standard transpose conv formula `T_out = (T_in-1)*stride + K - 2*pad` gives
+  wrong results (1 sample short) for odd strides. PyTorch's ConvTranspose1d
+  adds `output_padding = stride % 2` for these strides.
+- **Fix**: Added `output_padding` field to `ConvT1dOp`, set to `stride % 2` in
+  init, and updated `T_out` formula to: `(T_in-1)*stride + K - 2*pad + output_padding`.
+  Used separate `ggml_T` for buffer sizing to avoid buffer over-read.
+- **Impact**: All 5 VAE decoder blocks now produce correct output sizes
+  (e.g. block 1: 6000 instead of 5999), enabling full e2e pipeline to complete.
+
+### VAE parity verification (2026-07-08)
+- **All 10 layers pass** at `TOL=2.0` (0 failures).
+- **Full 3s decode (144000 samples)**: MSE 6.4e-5, **SNR 40.28 dB**, mean abs err 0.004, max abs err 0.091 on [-1,1] signal.
+- Half of all samples have error < 0.1%. Perceptibly near-identical to Python.
+- Block 1 sub-operation tracing confirms: Snake (0.026), ConvT1d (0.045),
+  ResUnit Snake1 (0.079), Conv1 (0.118), Snake2 (0.158), Conv2 (0.196),
+  residual→block output (0.198). Error compounds ~2× per ResUnit.
+
+### E2E inference status (2026-07-08)
+- **Full pipeline (DiT denoising loop 50 steps + VAE decode)** completes in ~25s.
+- Output: 480k samples @ 48kHz (10s). RMS=0.294, max=0.97, spectral centroid=4461 Hz.
+- Audio content is perceptually plausible (rain-on-tin-roof — expected for init seed + no TE).
+- Graph allocation noise (`ggml_gallocr_needs_realloc`) during VAE ops is cosmetic;
+  pre-allocation with worst-case sizes would silence it.
+
+### Cleanup / polish
+- **VAE log noise**: All `ggml_gallocr_needs_realloc` DEBUG messages suppressed via a custom
+  `ggml_log_set` callback in `decode_traced()` that filters out `GGML_LOG_LEVEL_DEBUG`.
+  Uses RAII guard (`GgmlLogGuard`) so the filter is only active during VAE decode.
+- **`num_steps`/`guidance_scale`**: Wired from `TtsRequest.n_diffusion_steps` /
+  `TtsRequest.guidance_scale` (added to `tasks.h`) instead of hardcoded. Falls back to
+  50 / 5.0 when value is 0.
+- **Debug dumps**: TE embedding file writes (`/tmp/cpp_cond_emb.f32`) gated behind
+  `AUDIOCORE_DEBUG_DUMP=1` environment variable.
+- **Manifest**: `moss_sfx_v2` added to `models/manifest.json` with variant `default`
+  (1.3B BF16, 3 GGUF files, DiT + VAE + optional TE). HF repo: `anomalyco/mse2-gguf`.
+- **cuBLAS**: Enabled `GGML_CUDA_FORCE_CUBLAS` — forces all matmuls through cuBLAS
+  instead of ggml's custom kernels. cuBLAS F32 on 4090 is ~2.4× faster per forward
+  pass. ggml's MMVQ/MMLA kernels are bandwidth-bound; cuBLAS uses tensor cores.
+
+### Performance (RTX 4090, 50 steps, 10s audio)
+| Metric | Python (PyTorch) | C++ (ggml+cuBLAS) | Speedup |
+|--------|-----------------|-------------------|---------|
+| Gen time | 69.84s | 9.91s | **7.0×** |
+| RTF | 6.98× | 0.99× | — |
+| Per step | ~1397ms | ~198ms | **7.1×** |
+| Peak VRAM | 12178 MB | ~5700 MB | **2.1×** |
+
+The C++ pipeline beats real-time (RTF < 1.0) while Python is ~7× slower than real-time.
+
+### ggml scheduler CPU fallback — CRITICAL (2026-07-07)
+`ggml_set_input()` sets `GGML_TENSOR_FLAG_INPUT` on a tensor. The ggml scheduler
+(`ggml-backend.cpp` line 902-906) forces ALL input-flagged tensors to
+`sched->n_backends - 1` (the last backend = CPU). This causes ALL ops depending
+on those inputs to run on CPU, even when CUDA is available.
+
+**Symptom**: `splits=1` and `has_gpu=1` in logs, but CUDA buffer = 0 MB and all
+data lives on CPU. VAE decode was 10x slower than expected.
+
+**Fix**: Bypass the scheduler entirely. Use `ggml_backend_alloc_ctx_tensors(ctx,
+cuda_backend)` to allocate ALL tensors on CUDA, then `ggml_backend_graph_compute(
+cuda_backend, gf)` to compute. No scheduler, no CPU fallback.
+
+### Per-block sub-graph VAE decode (2026-07-07)
+Both ACE-Step and MOSS-SFX-v2 VAE decoders now use per-block sub-graphs instead
+of per-op calls. Each sub-graph chains all operations within a decoder block
+into a single `ggml_cgraph`, keeping data on the GPU throughout.
+
+**ACE-Step VAE** (turbo, 8 DiT steps):
+| Duration | Per-op CUDA | Per-block CUDA | Speedup |
+|----------|-------------|----------------|---------|
+| 3s       | 3059ms      | 285ms          | 10.7x   |
+| 10s      | 7792ms      | 1009ms         | 7.7x    |
+
+**MOSS-SFX-v2 VAE** (10s audio): 7400ms -> 743ms (10x faster, 0 parity failures)
+
 ### Next steps
-- End-to-end inference test with a complete GGUF set (DiT + VAE + TE)
-- Resolve VAE architecture mismatch (decoder_dim=2048, 5 blocks)
+- ~~End-to-end inference test with a complete GGUF set (DiT + VAE + TE)~~ done
+- ~~Test coverage: add e2e generative test producing an actual WAV from random noise + CFG~~ done
+- ~~Suppress VAE graph allocation noise (cosmetic `ggml_gallocr_needs_realloc` messages)~~ done
+- ~~Bypass ggml scheduler for VAE decode (fix CPU fallback)~~ done
+- ~~Per-block sub-graph VAE decode for ACE-Step + MSE2~~ done
