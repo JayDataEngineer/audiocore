@@ -40,6 +40,7 @@
 #include "audiocore/framework/ggml/backend_helper.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"  // ggml_gallocr — lifecycle-based graph allocation
 #include "ggml-cpu.h"   // ggml_new_f32 (used by scheduler fallback paths)
 
 #include <cmath>
@@ -320,23 +321,24 @@ ggml_tensor* DiTRunner::weight(const char* name) const {
 }
 
 bool DiTRunner::ensure_backend() {
-    if (backend_ready_) return sched_ != nullptr;
+    if (backend_ready_) return cuda_backend_ != nullptr;
 
     namespace bu = audiocore::ggml_utils;
-    backend_pair_  = std::make_unique<bu::BackendPair>(bu::backend_init("DiT"));
-    sched_         = bu::backend_sched_new(*backend_pair_, 8192);
-    backend_ready_ = (sched_ != nullptr);
-
-    // Migrate weight tensors from GGUF mmap → backend buffer (GPU if available).
-    // After this, all weight tensors in ext_ctx_ have buffer set; the
-    // scheduler routes ops to GPU. Data pointers are updated in place.
-    if (backend_ready_ && backend_pair_->has_gpu) {
-        ggml_backend_buffer_t buf =
-            bu::migrate_ctx_to_backend(ext_ctx_, backend_pair_->backend, "DiT");
-        // buf is intentionally not freed — it owns the weight memory for the
-        // lifetime of ext_ctx_, which is freed by the Session.
+    backend_pair_ = std::make_unique<bu::BackendPair>(bu::backend_init("DiT"));
+    if (!backend_pair_ || !backend_pair_->backend) {
+        return false;
     }
-    return backend_ready_;
+    cuda_backend_ = backend_pair_->backend;
+    backend_ready_ = true;
+
+    // Migrate weight tensors from GGUF mmap → CUDA buffer.
+    // We bypass the scheduler (it forces INPUT-flagged tensors to CPU) and
+    // use ggml_gallocr for lifecycle-based allocation directly on CUDA.
+    if (backend_pair_->has_gpu) {
+        ggml_backend_buffer_t buf =
+            bu::migrate_ctx_to_backend(ext_ctx_, cuda_backend_, "DiT");
+    }
+    return true;
 }
 
 // ── Timestep sinusoidal embedding ────────────────────────────────────────────
@@ -548,7 +550,7 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
 // ── Single forward: build graph + compute ────────────────────────────────────
 static bool run_one_forward(
     const DitConfig& cfg, ggml_context* ext_ctx,
-    ggml_backend_sched_t sched,
+    ggml_backend_t cuda_backend,
     const float* x_t, int32_t T, int32_t H,
     const float* temb, int temb_dim,
     const float* cond_data, int ct_len, int cond_hidden,
@@ -588,12 +590,11 @@ static bool run_one_forward(
     const float   theta   = cfg.rope_theta  > 0 ? cfg.rope_theta  : 1000000.0f;
     fprintf(stderr, "[dit] rope_theta=%g (cfg=%g)\n", theta, cfg.rope_theta);
 
-    // ── Graph context (no_alloc=true: scheduler allocates intermediates) ──
-    // For CPU fallback path (no GPU), we still need a memory pool because
-    // ggml_graph_compute_with_ctx expects tensors to have data pointers.
-    // The scheduler path uses no_alloc=true and lets the scheduler manage
-    // all intermediate storage on the backend buffer.
-    const bool use_sched = (sched != nullptr);
+    // ── Graph context (no_alloc=true: gallocr allocates intermediates) ──
+    // We use ggml_gallocr for lifecycle-based allocation directly on CUDA.
+    // This avoids the scheduler's CPU fallback (INPUT-flagged → CPU) while
+    // keeping memory-efficient allocation (tensors with non-overlapping
+    // lifetimes share the same memory).
     size_t mem = ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(8192, false);
     char* ctx_buf = new (std::nothrow) char[mem];
     if (!ctx_buf) { if (error) *error = "DiT OOM (metadata)"; return false; }
@@ -1039,10 +1040,9 @@ static bool run_one_forward(
     }
 
     // ── Compute ──────────────────────────────────────────────────────────
-    // Mark output, build graph, allocate via scheduler, upload inputs,
-    // compute, download output. The scheduler places ops on GPU when their
-    // input tensors live on the GPU buffer (ext_ctx_ weights migrated in
-    // ensure_backend); CPU otherwise.
+    // Allocate graph tensors on CUDA via gallocr (lifecycle-based sharing),
+    // upload inputs, compute, download output. This bypasses the scheduler's
+    // CPU fallback while keeping memory-efficient allocation.
     ggml_set_name(cur, "dit_out");
     ggml_set_output(cur);
     ggml_build_forward_expand(gf, cur);
@@ -1053,14 +1053,16 @@ static bool run_one_forward(
                 ggml_graph_n_nodes(gf), (int)inputs.size());
     }
 
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        if (error) *error = "DiT: sched_alloc_graph failed";
+    // gallocr does lifecycle analysis: tensors with non-overlapping lifetimes
+    // share memory, keeping peak VRAM low (unlike alloc_ctx_tensors which
+    // allocates all simultaneously). Weight tensors in ext_ctx_ are skipped
+    // (they already have buffers from migrate_ctx_to_backend).
+    ggml_gallocr_t galloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(cuda_backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        if (error) *error = "DiT: gallocr_alloc_graph failed";
+        ggml_gallocr_free(galloc);
         ggml_free(ctx); delete[] ctx_buf; return false;
-    }
-
-    if (kDebugSched) {
-        int n_splits = ggml_backend_sched_get_n_splits(sched);
-        fprintf(stderr, "[dit] scheduler splits: %d (1=pure GPU or CPU, >1=mixed)\n", n_splits);
     }
 
     // Upload input tensor data (x_t, sinusoids, cond, ss_tables).
@@ -1068,11 +1070,11 @@ static bool run_one_forward(
         ggml_backend_tensor_set(in.t, in.data, 0, in.nbytes);
     }
 
-    ggml_backend_sched_graph_compute(sched, gf);
+    ggml_backend_graph_compute(cuda_backend, gf);
 
     // Dump intermediate tensors by name (matches upstream's dump_named scheme)
-    // when ACE_STEP_DUMP_DIR is set. MUST run before sched_reset() — the
-    // reset frees the backend's intermediate buffers, leaving tensor data
+    // when ACE_STEP_DUMP_DIR is set. MUST run before gallocr_free() — the
+    // free frees the backend's intermediate buffers, leaving tensor data
     // pointers dangling.
     // Only dump on the FIRST call (step 0 of the diffusion loop) — upstream
     // does the same, and subsequent steps would overwrite the dumps.
@@ -1151,7 +1153,9 @@ static bool run_one_forward(
     ggml_backend_tensor_get(cur, result, 0,
                             static_cast<size_t>(T) * H * sizeof(float));
 
-    ggml_backend_sched_reset(sched);
+    // Free the per-step gallocr buffer (intermediate tensors). Weight tensors
+    // in ext_ctx_ are on a separate buffer and are NOT freed here.
+    ggml_gallocr_free(galloc);
 
     // Output RMS diagnostic
     {
@@ -1215,7 +1219,7 @@ bool DiTRunner::forward(
     }
 
     if (guidance_scale == 1.0f) {
-        return run_one_forward(cfg_, ext_ctx_, sched_, x_t, T, H,
+        return run_one_forward(cfg_, ext_ctx_, cuda_backend_, x_t, T, H,
                                 temb.data(), temb_dim,
                                 cond, T_cond, cond_hidden,
                                 refer_audio, T_refer,
@@ -1227,7 +1231,7 @@ bool DiTRunner::forward(
     std::vector<float> c_out(static_cast<size_t>(T) * H);
     std::vector<float> u_out(static_cast<size_t>(T) * H);
 
-    if (!run_one_forward(cfg_, ext_ctx_, sched_, x_t, T, H,
+    if (!run_one_forward(cfg_, ext_ctx_, cuda_backend_, x_t, T, H,
                           temb.data(), temb_dim,
                           cond, T_cond, cond_hidden,
                           refer_audio, T_refer,
@@ -1239,7 +1243,7 @@ bool DiTRunner::forward(
 
     const float* uc = (cond_nc && T_cond_nc > 0) ? cond_nc : nullptr;
     int uc_len = (cond_nc && T_cond_nc > 0) ? T_cond_nc : 0;
-    if (!run_one_forward(cfg_, ext_ctx_, sched_, x_t, T, H,
+    if (!run_one_forward(cfg_, ext_ctx_, cuda_backend_, x_t, T, H,
                           temb.data(), temb_dim,
                           uc, uc_len, cond_hidden,
                           refer_audio, T_refer,

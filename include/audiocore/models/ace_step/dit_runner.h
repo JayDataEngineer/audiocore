@@ -59,7 +59,8 @@ public:
     //   cond_nc:[T_cond, encoder_hidden] float32 — null-text encoder (CFG uncond)
     //   refer_audio: [T_refer, 64] float32 — silence_latent slice (for timbre enc)
     //                If null, the timbre encoder is skipped (degraded mode).
-    //   T_refer: number of refer_audio frames (typically 750 = 30s @ 25Hz)
+    //   T_refer: number of refer_audio frames (1 for text2music per upstream
+    //            ops_encode_timbre; >1 only when a real ref_audio is supplied)
     //   output: [T_patches, hidden_size] float32 — predicted velocity v
     bool forward(const float* x_t, float t,
                  const float* cond, int32_t T_cond, int32_t cond_hidden,
@@ -87,11 +88,13 @@ private:
     std::vector<std::vector<float>> ss_table_f32_;   // [n_layers][H * 6]
     std::vector<float>              global_ss_f32_;  // [H * 2]
 
-    // Backend state — initialized lazily on first forward() call. Reused
-    // across all subsequent calls. Replaces ggml_graph_compute_with_ctx
-    // (CPU-only) with the ggml scheduler (GPU+CPU) for ~50x speedup.
+    // Backend state — initialized lazily on first forward() call.
+    // We bypass the scheduler entirely (it forces INPUT-flagged tensors to
+    // the last backend = CPU, preventing CUDA offload) and compute directly
+    // on the CUDA backend via ggml_backend_alloc_ctx_tensors + graph_compute.
     std::unique_ptr<ggml_utils::BackendPair> backend_pair_;
     ggml_backend_sched_t                     sched_     = nullptr;
+    ggml_backend_t                           cuda_backend_ = nullptr;
     bool                                     backend_ready_ = false;
 };
 
