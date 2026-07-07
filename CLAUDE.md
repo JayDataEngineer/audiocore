@@ -352,9 +352,38 @@ into a single `ggml_cgraph`, keeping data on the GPU throughout.
 
 **MOSS-SFX-v2 VAE** (10s audio): 7400ms -> 743ms (10x faster, 0 parity failures)
 
+### DiT scheduler bypass via ggml_gallocr (2026-07-07)
+Same CPU fallback bug affects the DiT runners: `ggml_set_input()` on input
+tensors forces them to CPU, cascading all downstream ops to CPU.
+
+**Approach**: Replace `ggml_backend_sched_*` with `ggml_gallocr_new(cuda_buft)` +
+`ggml_gallocr_alloc_graph(galloc, gf)` + `ggml_backend_graph_compute(cuda_backend, gf)`.
+gallocr does lifecycle-based allocation (tensors with non-overlapping lifetimes
+share memory) directly on CUDA — no CPU backend, no fallback.
+
+Why not `alloc_ctx_tensors`? It allocates ALL tensors simultaneously (no lifecycle
+sharing), causing OOM on large DiT graphs and per-step CUDA buffer overhead.
+gallocr matches the scheduler's memory efficiency.
+
+Why not CUDA-only scheduler? `ggml_backend_sched_new` asserts that the last
+backend must be CPU (`GGML_ASSERT(... == GGML_BACKEND_DEVICE_TYPE_CPU)`).
+
+**MSE2 DiT** (50 steps, CFG, 10s audio):
+| Metric | Scheduler (CPU fallback) | gallocr (CUDA) | Speedup |
+|--------|-------------------------|----------------|---------|
+| Per fwd | 198ms | 40ms | 5.0x |
+| Total DiT | ~9.9s | ~4.0s | 2.5x |
+| Total e2e | ~9.91s | ~5.2s | 1.9x |
+| RTF | ~1.0 | ~0.52 | — |
+
+**ACE-Step DiT** (turbo, 8 steps, 10s audio): 2.43s gen, RTF 0.24 — no regression.
+The ACE-Step DiT was already partially on GPU (flash_attn_ext forces CUDA); the
+gallocr approach matches the scheduler's buffer reuse for non-attention ops.
+
 ### Next steps
 - ~~End-to-end inference test with a complete GGUF set (DiT + VAE + TE)~~ done
 - ~~Test coverage: add e2e generative test producing an actual WAV from random noise + CFG~~ done
 - ~~Suppress VAE graph allocation noise (cosmetic `ggml_gallocr_needs_realloc` messages)~~ done
 - ~~Bypass ggml scheduler for VAE decode (fix CPU fallback)~~ done
 - ~~Per-block sub-graph VAE decode for ACE-Step + MSE2~~ done
+- ~~Bypass ggml scheduler for DiT forward (gallocr direct CUDA)~~ done
