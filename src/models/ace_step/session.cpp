@@ -10,6 +10,7 @@
 #include "audiocore/models/ace_step/family.h"
 
 #include "audiocore/framework/sampling/sampler.h"
+#include "audiocore/framework/sampling/philox.h"
 
 #include "ggml.h"
 
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <random>
 #include <vector>
 
@@ -564,9 +566,13 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
     //  proj_out every step so the Euler step happens in latent space and
     //  repaint injection can operate on xt directly.
     // ════════════════════════════════════════════════════════════════════════
-    std::mt19937_64 noise_rng(static_cast<uint64_t>(
-        req.seed != 0 ? req.seed : 42));
-    std::normal_distribution<float> ndist(0.0f, 1.0f);
+    // ── RNG ──
+    // Upstream uses Philox4x32-10 + Box-Muller with BF16 round-trip to match
+    // torch.randn(..., generator=cuda_manual_seed(seed), dtype=bfloat16).
+    // std::mt19937 + std::normal_distribution gives a *different* sequence
+    // for the same seed, which prevents layer-by-layer numerical comparison
+    // against the upstream reference. Use Philox to match exactly.
+    const int64_t noise_seed = static_cast<int64_t>(req.seed != 0 ? req.seed : 42);
     const int32_t P = (cfg_.dit.patch_size > 0) ? cfg_.dit.patch_size : 2;
     const bool is_repaint_mode = !repaint_latent_cond_.empty();
 
@@ -631,9 +637,14 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
     // ── Build context: [T_latent, 192] = src(64) | mask(64) | xt(64) ──
     std::vector<float> context(static_cast<size_t>(T_latent) * in_ch, 0.0f);
 
-    // Initialize noise latent [T_latent, out_ch]
+    // Initialize noise latent [T_latent, out_ch] using Philox4x32-10 to
+    // match torch.randn(..., generator=cuda_manual_seed(seed), dtype=bfloat16)
+    // exactly. bf16_round=true emulates the bf16 storage round-trip that
+    // PyTorch applies on CUDA.
     std::vector<float> noise_latent(static_cast<size_t>(T_latent) * out_ch);
-    for (auto& v : noise_latent) v = ndist(noise_rng);
+    sampler::philox_randn(noise_seed, noise_latent.data(),
+                          static_cast<int>(noise_latent.size()),
+                          /*bf16_round=*/true);
 
     const int32_t T_cover =
         is_cover_mode
@@ -803,11 +814,59 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                          proj_in_w_f32_.data(), proj_in_bias,
                          hidden.data());
 
+        // Dump context (proj_in input) and hidden_after_proj_in on step 0.
+        if (step == 0 && std::getenv("ACE_STEP_DUMP_DIR")) {
+            std::string dir = std::getenv("ACE_STEP_DUMP_DIR");
+            std::string p = dir + "/proj_in_input.bin";
+            if (FILE* f = std::fopen(p.c_str(), "wb")) {
+                int32_t ndims = 2, d0 = in_ch, d1 = T_latent;
+                std::fwrite(&ndims, sizeof(int32_t), 1, f);
+                std::fwrite(&d0, sizeof(int32_t), 1, f);
+                std::fwrite(&d1, sizeof(int32_t), 1, f);
+                // Upstream ggml layout: ne[0]=in_ch contiguous. Our context
+                // buffer IS row-major [T, in_ch] (in_ch contiguous), so write
+                // directly without transpose.
+                std::fwrite(context.data(), sizeof(float),
+                            static_cast<size_t>(in_ch) * T_latent, f);
+                std::fclose(f);
+            }
+        }
+
+        // Dump hidden_after_proj_in on step 0 for upstream comparison.
+        if (step == 0 && std::getenv("ACE_STEP_DUMP_DIR")) {
+            std::string p = std::getenv("ACE_STEP_DUMP_DIR");
+            p += "/hidden_after_proj_in.bin";
+            FILE* f = std::fopen(p.c_str(), "wb");
+            if (f) {
+                int32_t ndims = 2, d0 = H, d1 = S_patches;
+                std::fwrite(&ndims, sizeof(int32_t), 1, f);
+                std::fwrite(&d0, sizeof(int32_t), 1, f);
+                std::fwrite(&d1, sizeof(int32_t), 1, f);
+                // Upstream ggml layout: ne[0]=H contiguous, ne[1]=S.
+                // Our hidden buffer is row-major [S, H] (H contiguous) — matches.
+                std::fwrite(hidden.data(), sizeof(float),
+                            static_cast<size_t>(H) * S_patches, f);
+                std::fclose(f);
+                fprintf(stderr, "[ace_step] dumped hidden_after_proj_in [%d, %d] to %s\n",
+                        H, S_patches, p.c_str());
+            }
+        }
+
         // DiT forward: hidden [S, H] → v_hidden [S, H]
-        // Pass silence_latent slice for timbre conditioning.
-        // Upstream uses timbre_fix_frame = ceil(30 * 25) = 750 frames.
-        const int32_t T_refer = silence_ptr ?
-            std::min<int32_t>(750, silence_T) : 0;
+        //
+        // Timbre conditioning reference frame count.
+        // Upstream pipeline-synth-ops.cpp:386-390 (ops_encode_timbre):
+        //   text2music (no ref_audio): S_ref_timbre = 1, timbre_feats = silence_full[0:64]
+        //   ref_audio available:       S_ref_timbre = T_ref (VAE-encoded ref)
+        //   ref_latents available:     S_ref_timbre = ref_T_latent
+        // For text2music (our only currently supported mode), upstream passes
+        // exactly ONE silence frame to the timbre encoder, not 750. With 1
+        // frame, self-attention is trivially identity (single-token softmax=1),
+        // and the 4-layer transformer degenerates to a fixed nonlinear map of
+        // the silence frame. Passing 750 frames instead routes the CLS token
+        // through bidirectional attention over all 750 silence frames, which
+        // is OOD and produces industrial-machinery DiT output.
+        const int32_t T_refer = silence_ptr ? 1 : 0;
         const float* refer_audio = silence_ptr;
         if (!dit_runner_->forward(hidden.data(), t,
                                   cond_ptr, T_cond, enc_hs,
@@ -819,10 +878,46 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
             return false;
         fprintf(stderr, "[ace_step] dit: step %d forward done\n", step);
 
+        // Dump v_hidden (DiT output pre-unpatchify) for upstream comparison.
+        // Upstream doesn't dump this directly, but we keep it for diagnostics.
+        if (std::getenv("ACE_STEP_DUMP_DIR")) {
+            std::string p = std::getenv("ACE_STEP_DUMP_DIR");
+            p += "/dit_step" + std::to_string(step) + "_vhid.bin";
+            FILE* f = std::fopen(p.c_str(), "wb");
+            if (f) {
+                int32_t ndims = 2, d0 = H, d1 = S_patches;
+                std::fwrite(&ndims, sizeof(int32_t), 1, f);
+                std::fwrite(&d0, sizeof(int32_t), 1, f);
+                std::fwrite(&d1, sizeof(int32_t), 1, f);
+                // ggml layout: ne[0]=H contiguous. v_hidden is [S, H] row-major.
+                std::fwrite(v_hidden.data(), sizeof(float),
+                            static_cast<size_t>(H) * S_patches, f);
+                std::fclose(f);
+            }
+        }
+
         // proj_out: v_hidden [S, H] → v_latent [T, 64]  (un-patchify)
         unpatchify_proj_out(v_hidden.data(), S_patches, H, P, out_ch,
                             proj_out_w_f32_.data(), proj_out_bias,
                             v_latent.data());
+
+        // Dump v_latent (post-unpatchify) for comparison with upstream's
+        // dit_step{N}_vt.bin (dumped by upstream AFTER compute, BEFORE Euler).
+        if (std::getenv("ACE_STEP_DUMP_DIR")) {
+            std::string dir = std::getenv("ACE_STEP_DUMP_DIR");
+            std::string pv = dir + "/dit_step" + std::to_string(step) + "_vt.bin";
+            if (FILE* f = std::fopen(pv.c_str(), "wb")) {
+                // Upstream: debug_dump_2d(dbg, name, vt.data(), T, Oc).
+                // Shape (T, Oc), data is row-major [T, Oc] — flat C array.
+                int32_t ndims = 2, d0 = T_latent, d1 = out_ch;
+                std::fwrite(&ndims, sizeof(int32_t), 1, f);
+                std::fwrite(&d0, sizeof(int32_t), 1, f);
+                std::fwrite(&d1, sizeof(int32_t), 1, f);
+                std::fwrite(v_latent.data(), sizeof(float),
+                            static_cast<size_t>(T_latent) * out_ch, f);
+                std::fclose(f);
+            }
+        }
 
         // NaN check on v_latent (warn-only)
         {
@@ -858,6 +953,37 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
         }
         for (size_t i = 0; i < xt_current.size(); i++) {
             xt_current[i] -= dt * v_latent[i];
+        }
+
+        // Dump xt AFTER Euler step to match upstream's dit_step{N}_xt.bin
+        // (upstream dumps AFTER the step update). For the final step,
+        // upstream writes to a separate `output` buffer as `dit_x0`, but
+        // the value is identical (xt - dt*v == xt - t*v when dt==t for
+        // last step). We dump both names for the final step.
+        if (std::getenv("ACE_STEP_DUMP_DIR")) {
+            std::string dir = std::getenv("ACE_STEP_DUMP_DIR");
+            std::string px = dir + "/dit_step" + std::to_string(step) + "_xt.bin";
+            if (FILE* f = std::fopen(px.c_str(), "wb")) {
+                int32_t ndims = 2, d0 = T_latent, d1 = out_ch;
+                std::fwrite(&ndims, sizeof(int32_t), 1, f);
+                std::fwrite(&d0, sizeof(int32_t), 1, f);
+                std::fwrite(&d1, sizeof(int32_t), 1, f);
+                std::fwrite(xt_current.data(), sizeof(float),
+                            static_cast<size_t>(T_latent) * out_ch, f);
+                std::fclose(f);
+            }
+            if (step == sched.n_steps - 1) {
+                std::string p0 = dir + "/dit_x0.bin";
+                if (FILE* f = std::fopen(p0.c_str(), "wb")) {
+                    int32_t ndims = 2, d0 = T_latent, d1 = out_ch;
+                    std::fwrite(&ndims, sizeof(int32_t), 1, f);
+                    std::fwrite(&d0, sizeof(int32_t), 1, f);
+                    std::fwrite(&d1, sizeof(int32_t), 1, f);
+                    std::fwrite(xt_current.data(), sizeof(float),
+                                static_cast<size_t>(T_latent) * out_ch, f);
+                    std::fclose(f);
+                }
+            }
         }
         // ── Post-step diagnostic ──
         {
@@ -949,16 +1075,19 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
             }
         }
     }
-    if (!vae_runner_->decode(xt_current.data(), T_latent, pcm_stereo, error))
-        return false;
     {
+        auto t_vae0 = std::chrono::steady_clock::now();
+        if (!vae_runner_->decode(xt_current.data(), T_latent, pcm_stereo, error))
+            return false;
+        auto t_vae1 = std::chrono::steady_clock::now();
+        double vae_ms = std::chrono::duration<double, std::milli>(t_vae1 - t_vae0).count();
         int nan_pcm = 0; float mx = -1e30f, mn = 1e30f;
         for (size_t i = 0; i < pcm_stereo->size(); i++) {
             if (std::isnan((*pcm_stereo)[i])) nan_pcm++;
             else { if ((*pcm_stereo)[i] > mx) mx = (*pcm_stereo)[i]; if ((*pcm_stereo)[i] < mn) mn = (*pcm_stereo)[i]; }
         }
-        fprintf(stderr, "[ace_step] dit: VAE decode done (pcm=%zu NaN=%d range=[%.6f,%.6f])\n",
-                pcm_stereo->size(), nan_pcm, mn, mx);
+        fprintf(stderr, "[ace_step] dit: VAE decode: %.0fms (pcm=%zu NaN=%d range=[%.6f,%.6f])\n",
+                vae_ms, pcm_stereo->size(), nan_pcm, mn, mx);
     }
 
     return true;

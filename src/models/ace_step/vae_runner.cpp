@@ -278,28 +278,37 @@ static void nan_check(const char* tag, const float* p, size_t n) {
 //
 // Weights are always f32 pre-computed vectors.
 
-// ── Scheduler helper: run one VAE op graph via GPU scheduler ──────────────
+// ── Direct-backend helper: run one VAE op graph on the CUDA backend ──────
 // Each VAE op builds a small graph with input tensors marked ggml_set_input.
-// This helper allocates the graph, uploads inputs, computes, downloads output.
+// This helper bypasses the scheduler entirely (which forces INPUT-flagged
+// tensors to the last backend = CPU) and instead allocates ALL tensors
+// directly on the CUDA backend, computes there, and downloads the result.
 struct VaeInputUpload { ggml_tensor* t; const void* data; size_t nbytes; };
 
-static bool vae_sched_compute(ggml_backend_sched_t sched,
-                                ggml_context* ctx, ggml_cgraph* gf,
-                                ggml_tensor* out_tensor,
-                                const std::vector<VaeInputUpload>& uploads,
-                                float* out_data, size_t out_nbytes) {
-    if (!sched) return false;
+static bool vae_cuda_compute(ggml_backend_t backend,
+                               ggml_context* ctx, ggml_cgraph* gf,
+                               ggml_tensor* out_tensor,
+                               const std::vector<VaeInputUpload>& uploads,
+                               float* out_data, size_t out_nbytes) {
+    if (!backend) return false;
     ggml_set_output(out_tensor);
     ggml_build_forward_expand(gf, out_tensor);
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) return false;
-    for (const auto& u : uploads) {
+
+    // Allocate ALL tensors directly on the backend (CUDA when available).
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) return false;
+
+    // Upload input data + weights
+    for (const auto& u : uploads)
         ggml_backend_tensor_set(u.t, u.data, 0, u.nbytes);
-    }
-    ggml_backend_sched_graph_compute(sched, gf);
-    ggml_backend_sched_reset(sched);
-    if (out_data && out_nbytes) {
+
+    // Compute directly on the backend — no scheduler, no CPU fallback.
+    ggml_backend_graph_compute(backend, gf);
+
+    if (out_data && out_nbytes)
         ggml_backend_tensor_get(out_tensor, out_data, 0, out_nbytes);
-    }
+
+    ggml_backend_buffer_free(buf);
     return true;
 }
 
@@ -310,11 +319,11 @@ static bool op_conv1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
                       int32_t stride, int32_t pad, int32_t dilation,
                       std::vector<float>* out, int32_t* out_T,
                       char* buf, size_t buf_size,
-                      ggml_backend_sched_t sched = nullptr) {
-    // GPU path: no_alloc ctx, mark inputs, run via scheduler.
+                      ggml_backend_t backend = nullptr) {
+    // GPU path: no_alloc ctx, mark inputs, run via direct CUDA backend.
     // CPU path: no_alloc=false ctx, direct memcpy, ggml_graph_compute_with_ctx.
-    const bool use_sched = (sched != nullptr);
-    struct ggml_init_params gip = {buf_size, buf, use_sched};
+    const bool use_gpu = (backend != nullptr);
+    struct ggml_init_params gip = {buf_size, buf, use_gpu};
     ggml_context* ctx = ggml_init(gip);
     ggml_cgraph* gf  = ggml_new_graph(ctx);
 
@@ -325,7 +334,7 @@ static bool op_conv1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
     // has layout data[t + c*T], so we must transpose the copy.
     ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_in, IC);
     ggml_set_name(in, "conv1d_in");
-    if (use_sched) {
+    if (use_gpu) {
         // Build transposed buffer on CPU, then upload after alloc.
         static thread_local std::vector<float> x_t;
         x_t.resize(static_cast<size_t>(T_in) * IC);
@@ -347,7 +356,7 @@ static bool op_conv1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
     // Conv1d weights are stored in GGUF (and our compute_wsconv output) in
     // [K, IC, OC] layout, which matches ggml_conv_1d's expected ne=[K,IC,OC].
     ggml_tensor* w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, IC, OC);
-    if (use_sched) {
+    if (use_gpu) {
         static thread_local std::vector<ggml_fp16_t> w16;
         const size_t n_w = static_cast<size_t>(K) * IC * OC;
         w16.resize(n_w);
@@ -364,7 +373,7 @@ static bool op_conv1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
     ggml_tensor* r = ggml_conv_1d(ctx, w, in, stride, pad, dilation);
     if (bias) {
         ggml_tensor* bt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, OC);
-        if (use_sched) {
+        if (use_gpu) {
             ggml_set_input(bt);
             uploads.push_back({bt, bias, static_cast<size_t>(OC) * sizeof(float)});
         } else {
@@ -377,8 +386,8 @@ static bool op_conv1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
     int32_t T_out = *out_T;
     out->resize(static_cast<size_t>(T_out) * OC);
 
-    if (use_sched) {
-        if (!vae_sched_compute(sched, ctx, gf, r, uploads,
+    if (use_gpu) {
+        if (!vae_cuda_compute(backend, ctx, gf, r, uploads,
                                out->data(),
                                static_cast<size_t>(T_out) * OC * sizeof(float))) {
             ggml_free(ctx); return false;
@@ -410,9 +419,9 @@ static bool op_snake(const float* x, int32_t T, int32_t C,
                      const float* inv_b,  // [C] pre-computed
                      std::vector<float>* out,
                      char* buf, size_t buf_size,
-                     ggml_backend_sched_t sched = nullptr) {
-    const bool use_sched = (sched != nullptr);
-    struct ggml_init_params gip = {buf_size, buf, use_sched};
+                     ggml_backend_t backend = nullptr) {
+    const bool use_gpu = (backend != nullptr);
+    struct ggml_init_params gip = {buf_size, buf, use_gpu};
     ggml_context* ctx = ggml_init(gip);
     ggml_cgraph* gf  = ggml_new_graph(ctx);
 
@@ -421,7 +430,7 @@ static bool op_snake(const float* x, int32_t T, int32_t C,
     ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
     ggml_tensor* a_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
     ggml_tensor* b_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
-    if (use_sched) {
+    if (use_gpu) {
         ggml_set_input(in); uploads.push_back({in, x, static_cast<size_t>(T) * C * sizeof(float)});
         ggml_set_input(a_t); uploads.push_back({a_t, exp_a, C * sizeof(float)});
         ggml_set_input(b_t); uploads.push_back({b_t, inv_b, C * sizeof(float)});
@@ -439,8 +448,8 @@ static bool op_snake(const float* x, int32_t T, int32_t C,
     ggml_tensor* r    = ggml_add(ctx, in, term);
 
     out->resize(static_cast<size_t>(T) * C);
-    if (use_sched) {
-        if (!vae_sched_compute(sched, ctx, gf, r, uploads, out->data(),
+    if (use_gpu) {
+        if (!vae_cuda_compute(backend, ctx, gf, r, uploads, out->data(),
                                static_cast<size_t>(T) * C * sizeof(float))) {
             ggml_free(ctx); return false;
         }
@@ -463,9 +472,9 @@ static bool op_conv_t1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
                         const float* bias,
                         std::vector<float>* out, int32_t* out_T,
                         char* buf, size_t buf_size,
-                        ggml_backend_sched_t sched = nullptr) {
-    const bool use_sched = (sched != nullptr);
-    struct ggml_init_params gip = {buf_size, buf, use_sched};
+                        ggml_backend_t backend = nullptr) {
+    const bool use_gpu = (backend != nullptr);
+    struct ggml_init_params gip = {buf_size, buf, use_gpu};
     ggml_context* ctx = ggml_init(gip);
     ggml_cgraph* gf  = ggml_new_graph(ctx);
 
@@ -475,7 +484,7 @@ static bool op_conv_t1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
     ggml_tensor* in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, T_in);
     // Weight tensor [IC, K·OC] f32
     ggml_tensor* w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, IC, K * OC);
-    if (use_sched) {
+    if (use_gpu) {
         ggml_set_input(in);
         uploads.push_back({in, x, static_cast<size_t>(T_in) * IC * sizeof(float)});
         ggml_set_input(w);
@@ -493,7 +502,7 @@ static bool op_conv_t1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
     ggml_tensor* r = ggml_col2im_1d(ctx, col, stride, OC, pad);
     if (bias) {
         ggml_tensor* bt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, OC);
-        if (use_sched) {
+        if (use_gpu) {
             ggml_set_input(bt);
             uploads.push_back({bt, bias, static_cast<size_t>(OC) * sizeof(float)});
         } else {
@@ -506,8 +515,8 @@ static bool op_conv_t1d(const float* x, int32_t T_in, int32_t IC, int32_t OC,
     int32_t T_out = *out_T;
     out->resize(static_cast<size_t>(T_out) * OC);
 
-    if (use_sched) {
-        if (!vae_sched_compute(sched, ctx, gf, r, uploads, out->data(),
+    if (use_gpu) {
+        if (!vae_cuda_compute(backend, ctx, gf, r, uploads, out->data(),
                                static_cast<size_t>(T_out) * OC * sizeof(float))) {
             ggml_free(ctx); return false;
         }
@@ -544,33 +553,33 @@ static bool op_resunit(const float* x, int32_t T, int32_t C,
                        const float* c2b,
                        std::vector<float>* out,
                        char* buf, size_t buf_size,
-                       ggml_backend_sched_t sched = nullptr) {
+                       ggml_backend_t backend = nullptr) {
     // Save skip connection
     std::vector<float> skip(x, x + static_cast<size_t>(T) * C);
 
     // Snake 1
     std::vector<float> h1;
-    if (!op_snake(x, T, C, s1a, s1b, &h1, buf, buf_size, sched)) return false;
+    if (!op_snake(x, T, C, s1a, s1b, &h1, buf, buf_size, backend)) return false;
     nan_check("ru_snake1", h1.data(), h1.size());
 
     // Conv1 (k=7, dilated)
     std::vector<float> h2;
     int32_t T2 = 0;
     if (!op_conv1d(h1.data(), T, C, C, c1w, c1K, c1b,
-                   1, 3 * dilation, dilation, &h2, &T2, buf, buf_size, sched))
+                   1, 3 * dilation, dilation, &h2, &T2, buf, buf_size, backend))
         return false;
     nan_check("ru_conv1", h2.data(), h2.size());
 
     // Snake 2
     std::vector<float> h3;
-    if (!op_snake(h2.data(), T2, C, s2a, s2b, &h3, buf, buf_size, sched)) return false;
+    if (!op_snake(h2.data(), T2, C, s2a, s2b, &h3, buf, buf_size, backend)) return false;
     nan_check("ru_snake2", h3.data(), h3.size());
 
     // Conv2 (k=1)
     std::vector<float> h4;
     int32_t T4 = 0;
     if (!op_conv1d(h3.data(), T2, C, C, c2w, c2K, c2b,
-                   1, 0, 1, &h4, &T4, buf, buf_size, sched))
+                   1, 0, 1, &h4, &T4, buf, buf_size, backend))
         return false;
     nan_check("ru_conv2", h4.data(), h4.size());
 
@@ -724,20 +733,18 @@ VAERunner::VAERunner(ggml_context* ext_ctx) : ext_ctx_(ext_ctx) {
 }
 
 VAERunner::~VAERunner() {
-    if (sched_) {
-        ggml_backend_sched_free(sched_);
-        sched_ = nullptr;
-    }
+    // No scheduler to free — we compute directly on the backend.
+    cuda_backend_ = nullptr;
     backend_pair_.reset();
 }
 
 bool VAERunner::ensure_backend() {
-    if (backend_ready_) return sched_ != nullptr;
+    if (backend_ready_) return cuda_backend_ != nullptr;
 
     namespace bu = audiocore::ggml_utils;
     backend_pair_  = std::make_unique<bu::BackendPair>(bu::backend_init("VAE"));
-    sched_         = bu::backend_sched_new(*backend_pair_, 8192);
-    backend_ready_ = (sched_ != nullptr);
+    cuda_backend_  = backend_pair_->backend;  // CUDA when available, CPU otherwise
+    backend_ready_ = (cuda_backend_ != nullptr);
     // VAE weights are NOT in ext_ctx_ — they're pre-computed into per-op
     // f32 vectors at construction time. Each op builds its own small graph
     // with input tensors that get uploaded via ggml_backend_tensor_set.
@@ -752,7 +759,7 @@ bool VAERunner::ensure_backend() {
 //   3. Computes
 //   4. Downloads output to CPU
 // Returns true on success.
-// (VaeInputUpload struct + vae_sched_compute defined earlier, before op_* fns.)
+// (VaeInputUpload struct + vae_cuda_compute defined earlier, before op_* fns.)
 
 ggml_tensor* VAERunner::weight(const char* name) const {
     return ggml_get_tensor(ext_ctx_, name);
@@ -1112,7 +1119,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                        dec_conv1_w_.data(), dec_conv1_K_,
                        dec_conv1_b_.empty() ? nullptr : dec_conv1_b_.data(),
                        1, 3, 1,
-                       &out, &T_out, buf.data(), buf_size, sched_))
+                       &out, &T_out, buf.data(), buf_size, cuda_backend_))
             return false;
         cur = std::move(out);
         T = T_out;
@@ -1133,7 +1140,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
         std::vector<float> h1;
         if (!op_snake(cur.data(), T, bc.in_ch,
                       w.snake_a_.data(), w.snake_b_.data(),
-                      &h1, buf.data(), buf_size, sched_))
+                      &h1, buf.data(), buf_size, cuda_backend_))
             return false;
         { char t[48]; std::snprintf(t, sizeof(t), "blk%d_snake", b); nan_check(t, h1.data(), h1.size()); }
 
@@ -1144,7 +1151,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                          bc.stride, bc.padding,
                          w.ct1_w_.data(), w.ct1_K_,
                          w.ct1_b_.empty() ? nullptr : w.ct1_b_.data(),
-                         &h2, &T2, buf.data(), buf_size, sched_))
+                         &h2, &T2, buf.data(), buf_size, cuda_backend_))
             return false;
         fprintf(stderr, "[vae] block %d: conv_t1d done T2=%d\n", b, T2);
         { char t[48]; std::snprintf(t, sizeof(t), "blk%d_ct1d", b); nan_check(t, h2.data(), h2.size()); }
@@ -1167,7 +1174,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                             ru.s2a_.data(), ru.s2b_.data(),
                             ru.c2w_.data(), ru.c2K_,
                             ru.c2b_.empty() ? nullptr : ru.c2b_.data(),
-                            &h_ru, buf.data(), buf_size, sched_))
+                            &h_ru, buf.data(), buf_size, cuda_backend_))
                 return false;
             { char t[48]; std::snprintf(t, sizeof(t), "blk%d_res%d", b, r); nan_check(t, h_ru.data(), h_ru.size()); }
             h_prev = std::move(h_ru);
@@ -1194,7 +1201,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
     std::vector<float> after_fn;
     if (!op_snake(cur.data(), T, 128,
                   dec_fn_exp_a_.data(), dec_fn_inv_b_.data(),
-                  &after_fn, buf.data(), buf_size, sched_))
+                  &after_fn, buf.data(), buf_size, cuda_backend_))
         return false;
     nan_check("final_snake", after_fn.data(), after_fn.size());
 
@@ -1205,7 +1212,7 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                    dec_conv2_w_.data(), dec_conv2_K_,
                    nullptr,
                    1, 3, 1,
-                   &audio, &T_audio, buf.data(), buf_size, sched_))
+                   &audio, &T_audio, buf.data(), buf_size, cuda_backend_))
         return false;
     nan_check("final_conv2_out", audio.data(), audio.size());
 
@@ -1248,7 +1255,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
                        enc_conv1_w_.data(), enc_conv1_K_,
                        enc_conv1_b_.empty() ? nullptr : enc_conv1_b_.data(),
                        1, 3, 1,
-                       &out, &T_out, buf.data(), buf_size, sched_))
+                       &out, &T_out, buf.data(), buf_size, cuda_backend_))
             return false;
         cur = std::move(out);
         T = T_out;
@@ -1275,7 +1282,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
                             ru.s2a_.data(), ru.s2b_.data(),
                             ru.c2w_.data(), ru.c2K_,
                             ru.c2b_.empty() ? nullptr : ru.c2b_.data(),
-                            &h, buf.data(), buf_size, sched_))
+                            &h, buf.data(), buf_size, cuda_backend_))
                 return false;
             h_prev = std::move(h);
             in = h_prev.data();
@@ -1286,7 +1293,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
         std::vector<float> after_snake;
         if (!op_snake(in, T_in, bc.channel,
                        blk.snake_a_.data(), blk.snake_b_.data(),
-                       &after_snake, buf.data(), buf_size, sched_))
+                       &after_snake, buf.data(), buf_size, cuda_backend_))
             return false;
 
         // 2c. Strided conv1d: bc.channel → bc.out_ch
@@ -1296,7 +1303,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
                         blk.conv_w_.data(), blk.conv_K_,
                         blk.conv_b_.empty() ? nullptr : blk.conv_b_.data(),
                         bc.stride, bc.padding, 1,
-                        &after_conv, &T_conv, buf.data(), buf_size, sched_))
+                        &after_conv, &T_conv, buf.data(), buf_size, cuda_backend_))
             return false;
 
         // Copy block output
@@ -1313,7 +1320,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
         std::vector<float> after_fn;
         if (!op_snake(cur.data(), T, 2048,
                        enc_fn_exp_a_.data(), enc_fn_inv_b_.data(),
-                       &after_fn, buf.data(), buf_size, sched_))
+                       &after_fn, buf.data(), buf_size, cuda_backend_))
             return false;
         cur = std::move(after_fn);
     }
@@ -1325,7 +1332,7 @@ bool VAERunner::encode(const float* pcm_stereo, int32_t n_samples,
                     enc_conv2_w_.data(), enc_conv2_K_,
                     enc_conv2_b_.empty() ? nullptr : enc_conv2_b_.data(),
                     1, 1, 1,
-                    &encoded_128, &T_128, buf.data(), buf_size, sched_))
+                    &encoded_128, &T_128, buf.data(), buf_size, cuda_backend_))
         return false;
 
     // ── Extract mean: channels 0..63 → [T, 64] time-major ────────────────

@@ -114,8 +114,11 @@ private:
     BlockWeights       enc_blk_[5];     // 5 encoder blocks
 
     // Backend state — lazily initialized on first decode/encode call.
+    // We bypass the scheduler entirely (it forces INPUT-flagged tensors to
+    // the last backend = CPU, preventing CUDA offload) and compute directly
+    // on the CUDA backend via ggml_backend_alloc_ctx_tensors + graph_compute.
     std::unique_ptr<ggml_utils::BackendPair> backend_pair_;
-    ggml_backend_sched_t                     sched_        = nullptr;
+    ggml_backend_t                           cuda_backend_  = nullptr;
     bool                                     backend_ready_ = false;
 };
 
