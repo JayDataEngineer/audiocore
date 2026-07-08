@@ -316,28 +316,43 @@ static constexpr int32_t FSQ_CODE_COUNT  = 64000;     // valid FSQ codes (levels
 static constexpr const char* LM_INSTRUCTION =
     "Generate audio semantic tokens based on the given conditions:";
 
-// DIT_INSTR_TEXT2MUSIC — matches ref-acestep/src/task-types.h:70
-// This is the instruction the TE encodes for the DiT cross-attention in
-// text2music mode (the common case). COVER mode ("Generate audio semantic
-// tokens...") is only used when the USER provides audio_codes for style
-// reinterpretation — NOT when the LM generates codes internally.
-//   ref: pipeline-synth.cpp:321-325
-//     s.use_source_context = !reqs[0].audio_codes.empty();  ← USER codes
-//     s.instruction_str = use_source_context ? DIT_INSTR_COVER : DIT_INSTR_TEXT2MUSIC;
-// The LM-generated codes ALWAYS feed the DiT src via the FSQ detokenizer
-// regardless of the instruction (pipeline-synth-ops.cpp:675-722).
+// DIT_INSTR_COVER — matches ref-acestep/src/task-types.h:73
+// This is the instruction the TE encodes for the DiT cross-attention when
+// audio codes are present (text2music, cover, etc). The reference always
+// uses COVER when the LM has generated codes (pipeline-synth.cpp:324-325):
+//   s.use_source_context = !reqs[0].audio_codes.empty();  ← LM codes present
+//   s.instruction_str = use_source_context ? DIT_INSTR_COVER : DIT_INSTR_TEXT2MUSIC;
+// Since text2music ALWAYS generates codes via the LM, use_source_context is
+// ALWAYS true, so the instruction is ALWAYS DIT_INSTR_COVER.
+// Using TEXT2MUSIC ("Fill the audio semantic mask") instead of COVER
+// ("Generate audio semantic tokens") tells the DiT the wrong task — it
+// treats the src latent as a mask to fill rather than musical content to
+// render, producing ambient/drone output instead of the caption-driven genre.
+static constexpr const char* DIT_INSTR_COVER =
+    "Generate audio semantic tokens based on the given conditions:";
 static constexpr const char* DIT_INSTR_TEXT2MUSIC =
     "Fill the audio semantic mask based on the given conditions:";
 
 // Text-encoder prompt (for TE/DiT cross-attention). This is the
 // "instruction + caption + metas" format used by the text encoder.
-// Matches ref-acestep/src/pipeline-synth-ops.cpp:422-430 (build_prompt_strings).
+// Matches ref-acestep/src/pipeline-synth-ops.cpp:406-425 (build_prompt_strings).
+// Uses enriched metadata (bpm, key, timesig) from Phase 1 — NOT hardcoded
+// "N/A". The reference populates these from the LM-enriched AceRequest.
+// Seeing "N/A" for all metadata fields is OOD and degrades DiT conditioning.
 static std::string format_te_prompt(const std::string& caption,
                                     const std::string& lyrics,
-                                    float audio_duration) {
-    const std::string& instruction = DIT_INSTR_TEXT2MUSIC;
+                                    float audio_duration,
+                                    int bpm = 0,
+                                    const std::string& keyscale = "",
+                                    const std::string& timesignature = "") {
+    const std::string& instruction = DIT_INSTR_COVER;
     int dur_int = (audio_duration > 0.0f) ? static_cast<int>(audio_duration) : 30;
-    std::string metas = "- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n"
+    std::string bpm_str = (bpm > 0) ? std::to_string(bpm) : "N/A";
+    std::string ts_str  = timesignature.empty() ? "N/A" : timesignature;
+    std::string ks_str  = keyscale.empty() ? "N/A" : keyscale;
+    std::string metas = "- bpm: " + bpm_str + "\n"
+                        "- timesignature: " + ts_str + "\n"
+                        "- keyscale: " + ks_str + "\n"
                         "- duration: " + std::to_string(dur_int) + " seconds\n";
     return std::string("# Instruction\n") + instruction + "\n\n"
            "# Caption\n" + caption + "\n\n"
@@ -700,33 +715,12 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     if (lm_) lm_->clear_kv_cache();
     if (te_) te_->clear_kv_cache();
 
-    // (1) Build SEPARATE prompts for TE and LM.
-    //     The TE gets the instruction+caption+metas format (for DiT
-    //     cross-attention). The LM gets the Qwen3 chat template format
-    //     (<|im_start|>system/user/assistant turns) that it was trained with.
-    //     Using the TE prompt for the LM produces OOD input → garbage codes.
-    std::string te_prompt = format_te_prompt(req.caption, req.lyrics, req.duration);
-
-    // (1b) Generate the lyric string. Upstream ALWAYS generates a lyric string,
-    //      even for text2music without lyrics — the default is
-    //      "# Languages\nunknown\n\n# Lyric\n<|endoftext|>". This is tokenized
-    //      separately and embedded via raw token-embedding lookup (NOT a full
-    //      TE forward pass) for the DiT's lyric encoder (8-layer transformer).
-    //      Without the lyric conditioning path, the DiT cross-attention has
-    //      the wrong sequence length and produces degraded "frantic clicking"
-    //      output (verified: divergence at layer0_after_cross_attn).
-    std::string lyrics_str = req.lyrics.empty()
-        ? format_lyrics("", "unknown")
-        : format_lyrics(req.lyrics);
-
+    // (1) Build LM prompt (TE encoding is deferred to after Phase 1 so it
+    //     can use the enriched metadata — bpm, key, timesig from the LM's
+    //     reasoning. The reference builds the TE prompt from the LM-enriched
+    //     AceRequest, not the raw user request.)
     fprintf(stderr, "[ace_step] run_lm: tokenizing (caption='%s', dur=%.1f)...\n",
             req.caption.c_str(), req.duration);
-    // Tokenize the TE prompt (add_special=true for BOS; parse_special=true
-    // so <|endoftext|> becomes its single-token ID).
-    std::vector<int32_t> te_tokens;
-    if (!te_->tokenize(te_prompt, /*add_special=*/true, /*parse_special=*/true,
-                       &te_tokens, nullptr, error))
-        return false;
 
     // Build the LM prompt as RAW TOKEN IDs (not string→tokenize).
     // The chat-template special tokens (<|im_start|>, <|im_end|>, <think>,
@@ -757,75 +751,9 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                         "%d (TOKEN_IM_START)\n", lm_prompt[0], TOKEN_IM_START);
     }
 
-    if (te_tokens.empty() || lm_prompt.empty()) {
+    if (lm_prompt.empty()) {
         if (error) *error = "ACE-Step: tokenization produced empty result";
         return false;
-    }
-
-    // (3) TE encode → hidden states cached for run_dit_and_vae
-    fprintf(stderr, "[ace_step] run_lm: TE forward_get_embeddings (n_tok=%zu)...\n", te_tokens.size());
-    const int32_t te_hs = cfg_.encoder_hidden_size;
-    te_cond_len_ = static_cast<int32_t>(te_tokens.size());
-    te_cond_.resize(static_cast<size_t>(te_cond_len_) * te_hs);
-    if (!te_->forward_get_embeddings(te_tokens.data(), te_cond_len_, 0,
-                                     te_cond_.data(), error))
-        return false;
-    fprintf(stderr, "[ace_step] run_lm: TE forward_get_embeddings done\n");
-
-    // (3b) Lyric encoding: tokenize the lyric string and get raw token
-    //      embeddings (NOT a full forward pass — just the embedding table
-    //      lookup). The DiT's lyric encoder (8-layer transformer) processes
-    //      these raw embeddings. Matches upstream qwen3_embed_lookup.
-    {
-        fprintf(stderr, "[ace_step] run_lm: lyric tokenize+embed_lookup...\n");
-        std::vector<int32_t> lyric_tok;
-        if (!te_->tokenize(lyrics_str, /*add_special=*/true, /*parse_special=*/true,
-                           &lyric_tok, nullptr, error))
-            return false;
-        lyric_cond_len_ = static_cast<int32_t>(lyric_tok.size());
-        lyric_cond_.resize(static_cast<size_t>(lyric_cond_len_) * te_hs);
-        if (lyric_cond_len_ > 0) {
-            if (!te_->embed_lookup(lyric_tok.data(), lyric_cond_len_,
-                                   lyric_cond_.data(), error))
-                return false;
-        }
-        fprintf(stderr, "[ace_step] run_lm: lyric embed_lookup done (n_tok=%d)\n",
-                lyric_cond_len_);
-
-        // Null lyric for CFG: use empty lyric tokens. The raw embedding of
-        // the BOS/EOS tokens serves as the unconditional lyric path. When
-        // lyric_cond_ is empty, the DiT skips the lyric encoder entirely for
-        // CFG uncond (matching upstream: null_condition_emb broadcast).
-        std::vector<int32_t> null_lyric_tok;
-        if (!te_->tokenize("", true, true, &null_lyric_tok, nullptr, error))
-            return false;
-        const int32_t n_null_lyric = static_cast<int32_t>(null_lyric_tok.size());
-        if (n_null_lyric > 0) {
-            lyric_uncond_.resize(static_cast<size_t>(n_null_lyric) * te_hs);
-            if (!te_->embed_lookup(null_lyric_tok.data(), n_null_lyric,
-                                   lyric_uncond_.data(), error))
-                return false;
-        } else {
-            lyric_uncond_.clear();
-        }
-    }
-
-    // (4) Null-text TE embedding for CFG (DiT side)
-    {
-        fprintf(stderr, "[ace_step] run_lm: null-text TE...\n");
-        std::vector<int32_t> null_tok;
-        if (!te_->tokenize("", true, true, &null_tok, nullptr, error))
-            return false;
-        const int32_t n_null = static_cast<int32_t>(null_tok.size());
-        if (n_null > 0) {
-            te_uncond_.resize(static_cast<size_t>(n_null) * te_hs);
-            if (!te_->forward_get_embeddings(null_tok.data(), n_null, 0,
-                                             te_uncond_.data(), error))
-                return false;
-        } else {
-            te_uncond_.clear();  // triggers null_condition_emb fallback in DiT
-        }
-        fprintf(stderr, "[ace_step] run_lm: null-text TE done\n");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1001,6 +929,28 @@ bool AceStepSession::run_lm(const MusicRequest& req,
         if (meta.lyrics.empty() && !parsed.lyrics.empty())
             meta.lyrics = parsed.lyrics;
 
+        // ── Caption enrichment (use_cot_caption=true, reference default) ──
+        // The reference (request.cpp:36) defaults use_cot_caption=true, meaning
+        // the LM's Phase 1 enriched caption REPLACES the user's original for
+        // Phase 2 code generation and the TE prompt. This is critical for
+        // short captions like "ROCK" — the Phase 1 reasoning expands it to a
+        // detailed description ("An energetic and raw instrumental rock track
+        // driven by a dual electric guitar attack...") which the LM uses to
+        // generate genre-appropriate codes. Without this, "ROCK" produces
+        // generic/ambient codes because the short caption lacks the detail
+        // the model needs to map to specific audio patterns.
+        //
+        // The reference's caption preservation (pipeline-lm.cpp:779-785):
+        // the LM may enrich the caption but never silently delete it. If
+        // the enriched caption is empty, keep the original.
+        if (!parsed.caption.empty()) {
+            fprintf(stderr, "[ace_step] run_lm: caption enrichment:\n"
+                            "  original: '%s'\n"
+                            "  enriched: '%s'\n",
+                    meta.caption.c_str(), parsed.caption.c_str());
+            meta.caption = parsed.caption;
+        }
+
         fprintf(stderr, "[ace_step] run_lm: Phase 1 parsed: bpm=%d duration=%.0f "
                         "keyscale='%s' timesig='%s' lang='%s'\n",
                 parsed.bpm, parsed.duration, parsed.keyscale.c_str(),
@@ -1018,6 +968,83 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                     "keyscale='%s' timesig='%s' lang='%s'\n",
             meta.bpm, meta.duration, meta.keyscale.c_str(),
             meta.timesignature.c_str(), meta.vocal_language.c_str());
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  TE Encoding (DEFERRED from above — now uses enriched metadata)
+    // ════════════════════════════════════════════════════════════════════════
+    // The TE prompt must use the Phase 1 enriched metadata (bpm, key, timesig),
+    // NOT hardcoded "N/A". The reference builds the TE prompt from the
+    // LM-enriched AceRequest (pipeline-synth-ops.cpp:470). Seeing "N/A" for
+    // all metadata fields is OOD and degrades DiT cross-attention conditioning.
+    {
+        const int32_t te_hs = cfg_.encoder_hidden_size;
+        std::string te_prompt = format_te_prompt(
+            meta.caption, meta.lyrics, meta.duration,
+            meta.bpm, meta.keyscale, meta.timesignature);
+        fprintf(stderr, "[ace_step] run_lm: TE prompt (enriched):\n%s\n", te_prompt.c_str());
+
+        std::vector<int32_t> te_tokens;
+        if (!te_->tokenize(te_prompt, /*add_special=*/true, /*parse_special=*/true,
+                           &te_tokens, nullptr, error))
+            return false;
+
+        // TE text encoding → hidden states cached for run_dit_and_vae
+        fprintf(stderr, "[ace_step] run_lm: TE forward_get_embeddings (n_tok=%zu)...\n", te_tokens.size());
+        te_cond_len_ = static_cast<int32_t>(te_tokens.size());
+        te_cond_.resize(static_cast<size_t>(te_cond_len_) * te_hs);
+        if (!te_->forward_get_embeddings(te_tokens.data(), te_cond_len_, 0,
+                                         te_cond_.data(), error))
+            return false;
+        fprintf(stderr, "[ace_step] run_lm: TE forward_get_embeddings done\n");
+
+        // Lyric encoding: tokenize the lyric string and get raw token embeddings.
+        // Uses enriched lyrics/language from Phase 1, not the raw request.
+        std::string lyrics_str = format_lyrics(meta.lyrics, meta.vocal_language);
+        fprintf(stderr, "[ace_step] run_lm: lyric tokenize+embed_lookup...\n");
+        std::vector<int32_t> lyric_tok;
+        if (!te_->tokenize(lyrics_str, /*add_special=*/true, /*parse_special=*/true,
+                           &lyric_tok, nullptr, error))
+            return false;
+        lyric_cond_len_ = static_cast<int32_t>(lyric_tok.size());
+        lyric_cond_.resize(static_cast<size_t>(lyric_cond_len_) * te_hs);
+        if (lyric_cond_len_ > 0) {
+            if (!te_->embed_lookup(lyric_tok.data(), lyric_cond_len_,
+                                   lyric_cond_.data(), error))
+                return false;
+        }
+        fprintf(stderr, "[ace_step] run_lm: lyric embed_lookup done (n_tok=%d)\n",
+                lyric_cond_len_);
+
+        // Null lyric for CFG
+        std::vector<int32_t> null_lyric_tok;
+        if (!te_->tokenize("", true, true, &null_lyric_tok, nullptr, error))
+            return false;
+        const int32_t n_null_lyric = static_cast<int32_t>(null_lyric_tok.size());
+        if (n_null_lyric > 0) {
+            lyric_uncond_.resize(static_cast<size_t>(n_null_lyric) * te_hs);
+            if (!te_->embed_lookup(null_lyric_tok.data(), n_null_lyric,
+                                   lyric_uncond_.data(), error))
+                return false;
+        } else {
+            lyric_uncond_.clear();
+        }
+
+        // Null-text TE embedding for CFG (DiT side)
+        fprintf(stderr, "[ace_step] run_lm: null-text TE...\n");
+        std::vector<int32_t> null_tok;
+        if (!te_->tokenize("", true, true, &null_tok, nullptr, error))
+            return false;
+        const int32_t n_null = static_cast<int32_t>(null_tok.size());
+        if (n_null > 0) {
+            te_uncond_.resize(static_cast<size_t>(n_null) * te_hs);
+            if (!te_->forward_get_embeddings(null_tok.data(), n_null, 0,
+                                             te_uncond_.data(), error))
+                return false;
+        } else {
+            te_uncond_.clear();
+        }
+        fprintf(stderr, "[ace_step] run_lm: null-text TE done\n");
+    }
 
     // ════════════════════════════════════════════════════════════════════════
     //  Phase 2: Code Generation with Injected CoT
@@ -1136,6 +1163,7 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     }
 
     // Generate remaining codes
+    static const bool ACE_DEBUG = std::getenv("ACE_STEP_DEBUG");
     while (static_cast<int32_t>(music_codes->size()) < n_codes) {
         std::vector<float> logits(static_cast<size_t>(vs));
         if (!lm_->forward_tokens(&prev_token, 1, n_pos, logits.data(), error))
@@ -1149,14 +1177,31 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                                                uncond_logits.data(), error))
                 return false;
             uncond_n_pos++;
+
+            // Diagnostic: cond vs uncond for code 452 and top code (verbose)
+            if (ACE_DEBUG && music_codes->size() < 16) {
+                float cond_452 = logits[AUDIO_CODE_BASE + 452];
+                float uncond_452 = uncond_logits[AUDIO_CODE_BASE + 452];
+                float cond_eos = logits[TOKEN_IM_END];
+                float uncond_eos = uncond_logits[TOKEN_IM_END];
+                // Find top cond code
+                int top_c = 0; float top_l = logits[AUDIO_CODE_BASE];
+                for (int32_t c = 1; c < FSQ_CODE_COUNT; c++)
+                    if (logits[AUDIO_CODE_BASE + c] > top_l) { top_l = logits[AUDIO_CODE_BASE + c]; top_c = c; }
+                fprintf(stderr, "[ace_step] cfg[%zu]: cond452=%.2f uncond452=%.2f | "
+                                "condEOS=%.2f uncondEOS=%.2f | topC=%d(%.2f)\n",
+                        music_codes->size(), cond_452, uncond_452,
+                        cond_eos, uncond_eos, top_c, top_l);
+            }
+
             const float scale = req.lm_cfg_scale;
             for (int32_t v = 0; v < vs; v++)
                 logits[v] = uncond_logits[v] + scale * (logits[v] - uncond_logits[v]);
         }
 
-        // Diagnostic: top-5 code logits for first 12 codes
+        // Diagnostic: top-5 code logits for first 12 codes (verbose)
         size_t cur_idx = music_codes->size();
-        if (cur_idx < 12) {
+        if (ACE_DEBUG && cur_idx < 12) {
             std::vector<std::pair<float, int32_t>> code_logits;
             code_logits.reserve(FSQ_CODE_COUNT);
             for (int32_t c = 0; c < FSQ_CODE_COUNT; c++)
@@ -1172,6 +1217,39 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                         code_logits[k].first);
             }
             fprintf(stderr, "\n");
+        }
+
+        // ── Anti-collapse: count-based repetition penalty ───────────────
+        // The Q8_0 quantized LM has a tendency to collapse to a single
+        // "default" code after ~10 steps (verified: seeds 42/12345/777 all
+        // collapse to one code at 60-72% frequency). Standard divisor-based
+        // penalty (logit /= 1.1) is too aggressive at our logit scale (60-70):
+        // it drops the logit by ~6, which after softmax is a total ban.
+        //
+        // Instead, use COUNT-BASED FIXED SUBTRACTION. For each code in the
+        // last 8 positions, count how many times it appeared, then subtract
+        // 2.0 * count. This ramps up exponentially:
+        //   1 occurrence → subtract 2.0  (exp(2/0.85) ≈ 10x reduction)
+        //   2 occurrences → subtract 4.0 (exp(4/0.85) ≈ 107x reduction)
+        //   3 occurrences → subtract 6.0 (effectively banned)
+        // This prevents runaway collapse (verified: fixed 3.0 penalty still
+        // collapsed to code 35847 × 9) while allowing musical patterns where
+        // a code legitimately appears 1-2 times in the window.
+        {
+            const int32_t n_codes_so_far = static_cast<int32_t>(music_codes->size());
+            const int32_t window = std::min(8, n_codes_so_far);
+            // Count occurrences of each code in the window
+            std::unordered_map<int32_t, int> code_count;
+            for (int32_t k = 0; k < window; k++) {
+                int32_t recent_code = (*music_codes)[n_codes_so_far - 1 - k];
+                code_count[recent_code]++;
+            }
+            // Apply penalty proportional to occurrence count
+            for (auto& kv : code_count) {
+                int32_t idx = AUDIO_CODE_BASE + kv.first;
+                float penalty = 2.0f * static_cast<float>(kv.second);
+                logits[idx] -= penalty;
+            }
         }
 
         mask_to_codes(logits.data(), vs);
@@ -1209,6 +1287,13 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                 hist.size(), max_code,
                 100.0 * max_count / music_codes->size(),
                 max_count, music_codes->size());
+        // Dump full code sequence for debugging collapse patterns (verbose)
+        if (ACE_DEBUG) {
+            fprintf(stderr, "[ace_step] code_seq:");
+            for (size_t i = 0; i < music_codes->size(); i++)
+                fprintf(stderr, " %d", (*music_codes)[i]);
+            fprintf(stderr, "\n");
+        }
         // Dump all codes for offline analysis
         if (const char* p = std::getenv("ACE_STEP_DUMP_CODES")) {
             FILE* f = std::fopen(p, "wb");
