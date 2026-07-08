@@ -341,27 +341,68 @@ static std::string format_te_prompt(const std::string& caption,
 // Phase 1 (caption enrichment) but for text2music we derive it directly from
 // the request. The assistant turn ends with </think> so the LM immediately
 // enters codes_phase — matching reference Phase 2 (pipeline-lm.cpp:343).
-static std::string format_lm_prompt(const std::string& caption,
-                                    const std::string& lyrics,
-                                    float audio_duration) {
+//
+// CRITICAL: We build the token IDs DIRECTLY (pushing TOKEN_IM_START,
+// TOKEN_IM_END, TOKEN_THINK, TOKEN_THINK_END as raw IDs) instead of relying
+// on parse_special=true. The Qwen3 GGUF may not register <think>/</think>
+// as parseable special tokens, causing them to be BPE-tokenized as regular
+// text. This breaks the codes_phase transition. The reference does the same
+// (prompt.h:276-295 — ids.push_back(TOKEN_*)).
+
+static std::vector<int32_t> build_lm_prompt_tokens(const qwen3::Runner& lm,
+                                                   const std::string& caption,
+                                                   const std::string& lyrics,
+                                                   float audio_duration,
+                                                   std::string* error) {
+    std::vector<int32_t> ids;
+
     int dur_int = (audio_duration > 0.0f) ? static_cast<int>(audio_duration) : 30;
 
     // Build CoT YAML (matches ref build_cot_yaml — prompt.h:241-262)
     std::string cot;
     if (!caption.empty()) {
-        // YAML block scalar for caption
         cot += "caption: |\n  " + caption + "\n";
     }
     cot += "duration: " + std::to_string(dur_int) + "\n";
 
-    // Chat template with special tokens as TEXT — the tokenizer with
-    // parse_special=true will convert <|im_start|>, <|im_end|>, <think>,
-    // </think> to their single-token IDs.
-    std::string prompt;
-    prompt += "<|im_start|>system\n# Instruction\n" + std::string(LM_INSTRUCTION) + "\n\n<|im_end|>\n";
-    prompt += "<|im_start|>user\n# Caption\n" + caption + "\n\n# Lyric\n" + lyrics + "\n<|im_end|>\n";
-    prompt += "<|im_start|>assistant\n<think>\n" + cot + "</think>\n\n";
-    return prompt;
+    // Helper: tokenize a text segment and append to ids (no special tokens).
+    auto append_text = [&](const std::string& text) -> bool {
+        std::vector<int32_t> toks;
+        if (!lm.tokenize(text, /*add_special=*/false, /*parse_special=*/false,
+                         &toks, nullptr, error))
+            return false;
+        ids.insert(ids.end(), toks.begin(), toks.end());
+        return true;
+    };
+
+    // System turn
+    ids.push_back(TOKEN_IM_START);
+    if (!append_text("system\n# Instruction\n" + std::string(LM_INSTRUCTION) + "\n\n"))
+        return {};
+    ids.push_back(TOKEN_IM_END);
+    if (!append_text("\n"))
+        return {};
+
+    // User turn
+    ids.push_back(TOKEN_IM_START);
+    if (!append_text("user\n# Caption\n" + caption + "\n\n# Lyric\n" + lyrics + "\n"))
+        return {};
+    ids.push_back(TOKEN_IM_END);
+    if (!append_text("\n"))
+        return {};
+
+    // Assistant turn with CoT injected (codes_phase starts immediately)
+    ids.push_back(TOKEN_IM_START);
+    if (!append_text("assistant\n"))
+        return {};
+    ids.push_back(TOKEN_THINK);
+    if (!append_text("\n" + cot))
+        return {};
+    ids.push_back(TOKEN_THINK_END);
+    if (!append_text("\n\n"))
+        return {};
+
+    return ids;
 }
 
 // Lyrics formatting for the DiT lyric encoder. Matches upstream
@@ -387,7 +428,6 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     //     (<|im_start|>system/user/assistant turns) that it was trained with.
     //     Using the TE prompt for the LM produces OOD input → garbage codes.
     std::string te_prompt = format_te_prompt(req.caption, req.lyrics, req.duration);
-    std::string lm_prompt_str = format_lm_prompt(req.caption, req.lyrics, req.duration);
 
     // (1b) Generate the lyric string. Upstream ALWAYS generates a lyric string,
     //      even for text2music without lyrics — the default is
@@ -410,21 +450,34 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                        &te_tokens, nullptr, error))
         return false;
 
-    // Tokenize the LM prompt. parse_special=true is CRITICAL: <|im_start|>,
-    // <|im_end|>, <think>, </think> must become their single-token IDs
-    // (151644, 151645, 151667, 151668). add_special=false because the chat
-    // template already includes all needed markers — adding BOS would
-    // prepend an extra token the model doesn't expect.
-    std::vector<int32_t> lm_prompt;
-    if (!lm_->tokenize(lm_prompt_str, /*add_special=*/false, /*parse_special=*/true,
-                       &lm_prompt, nullptr, error))
+    // Build the LM prompt as RAW TOKEN IDs (not string→tokenize).
+    // The chat-template special tokens (<|im_start|>, <|im_end|>, <think>,
+    // </think>) must be exact single-token IDs. The Qwen3 GGUF tokenizer
+    // may not parse <think>/</think> from text, so we push raw IDs directly.
+    // Matches ref-acestep/src/prompt.h:270-296.
+    std::vector<int32_t> lm_prompt = build_lm_prompt_tokens(
+        *lm_, req.caption, req.lyrics, req.duration, error);
+    if (lm_prompt.empty()) {
+        if (error && error->empty())
+            *error = "ACE-Step: failed to build LM prompt tokens";
         return false;
+    }
 
-    fprintf(stderr, "[ace_step] run_lm: LM prompt (%zu tokens), last 5 toks:",
-            lm_prompt.size());
+    fprintf(stderr, "[ace_step] run_lm: LM prompt (%zu tokens), first 3: "
+                    "%d %d %d, last 5:",
+            lm_prompt.size(),
+            lm_prompt.size() > 0 ? lm_prompt[0] : -1,
+            lm_prompt.size() > 1 ? lm_prompt[1] : -1,
+            lm_prompt.size() > 2 ? lm_prompt[2] : -1);
     for (int i = std::max(0, (int)lm_prompt.size() - 5); i < (int)lm_prompt.size(); i++)
         fprintf(stderr, " %d", lm_prompt[i]);
     fprintf(stderr, "\n");
+
+    // Verify the first token is TOKEN_IM_START (sanity check).
+    if (lm_prompt[0] != TOKEN_IM_START) {
+        fprintf(stderr, "[ace_step] WARNING: LM prompt first token=%d, expected "
+                        "%d (TOKEN_IM_START)\n", lm_prompt[0], TOKEN_IM_START);
+    }
 
     if (te_tokens.empty() || lm_prompt.empty()) {
         if (error) *error = "ACE-Step: tokenization produced empty result";
