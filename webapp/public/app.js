@@ -202,7 +202,8 @@
         }
         if (f.indexOf("ace") >= 0 || id.indexOf("ace") >= 0) {
           MUSIC_MODELS.push(m.id);
-          if (ACTIVE_MUSIC == null)
+          // Only auto-select if this model is actually loaded.
+          if (ACTIVE_MUSIC == null && m.loaded !== false)
             ACTIVE_MUSIC = m.id;
         }
         if (f.indexOf("moss") >= 0 && ACTIVE_TTS == null)
@@ -217,7 +218,7 @@
       set_engine_dot("engine-tts",   ACTIVE_TTS   ? "ready" : "");
       set_engine_dot("engine-vd",    ACTIVE_VD    ? "ready" : "");
       set_engine_dot("engine-music", ACTIVE_MUSIC ? "ready" : "");
-      console.log({ ACTIVE_TTS, ACTIVE_VD, ACTIVE_MUSIC, MUSIC_MODELS, MODELS });
+      render_model_manager();
     } catch (e) {
       $("#model-badge").textContent = "offline";
       $("#model-badge").className = "badge err";
@@ -1294,6 +1295,80 @@
       else toast("Upload failed", "err");
     }
   }
+
+  // ── Model Manager (load/unload) ───────────────────────────────────
+  function render_model_manager() {
+    const list = $("#model-manager-list");
+    if (!list) return;
+    list.innerHTML = "";
+    for (const m of MODELS) {
+      const isLoaded = m.loaded !== false;
+      const isAce = (m.family || "").indexOf("ace") >= 0;
+      const el = document.createElement("div");
+      el.style.cssText = "display:flex;align-items:center;gap:1em;padding:0.75em 1em;border:1px solid var(--border);border-radius:8px";
+      el.innerHTML =
+        '<span style="font-size:1.3em">' + (isAce ? "🎵" : "🗣️") + "</span>" +
+        '<div style="flex:1">' +
+          '<div style="font-weight:600">' + esc(m.id) + "</div>" +
+          '<div class="hint">' + esc(m.family || "") + " · " +
+            (isLoaded
+              ? '<span style="color:var(--green)">● loaded</span>'
+              : '<span style="color:var(--red)">○ unloaded</span>') +
+          "</div>" +
+        "</div>" +
+        (isLoaded
+          ? '<button type="button" class="btn btn-danger" data-unload="' + esc(m.id) + '">Unload</button>'
+          : '<button type="button" class="btn" data-load="' + esc(m.id) + '">Load</button>');
+      list.appendChild(el);
+    }
+    // Wire up buttons
+    $$("[data-unload]").forEach((b) => b.addEventListener("click", async () => {
+      const id = b.dataset.unload;
+      b.disabled = true;
+      b.textContent = "Unloading…";
+      try {
+        await fetch("/v1/models/unload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id }),
+        });
+        toast("Unloaded " + id, "ok");
+        await load_models();
+      } catch (e) {
+        toast("Unload failed: " + e.message, "err");
+        b.disabled = false;
+        b.textContent = "Unload";
+      }
+    }));
+    $$("[data-load]").forEach((b) => b.addEventListener("click", async () => {
+      const id = b.dataset.load;
+      b.disabled = true;
+      b.textContent = "Loading…";
+      try {
+        const r = await fetch("/v1/models/load", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id }),
+        });
+        const j = await r.json();
+        if (r.ok) {
+          toast("Loaded " + id, "ok");
+          await load_models();
+        } else {
+          toast("Load failed: " + (j.error || r.status), "err");
+          b.disabled = false;
+          b.textContent = "Load";
+        }
+      } catch (e) {
+        toast("Load failed: " + e.message, "err");
+        b.disabled = false;
+        b.textContent = "Load";
+      }
+    }));
+  }
+
+  const _model_refresh = $("#model-refresh");
+  if (_model_refresh) _model_refresh.addEventListener("click", load_models);
 
   // ── Drag & drop upload anywhere ────────────────────────────────────
   const drop_overlay = $("#drop-overlay");

@@ -214,8 +214,19 @@ int main(int argc, char** argv) {
     }
 
     // ── Load models via ModelRegistry → ILoadedModel → IOfflineTaskSession ──
+    // ALL models are registered in the slots map. Only the first ACE-Step
+    // model + all non-ACE models are loaded eagerly. Additional ACE-Step
+    // variants are registered but NOT loaded — the webapp loads them on
+    // demand via /v1/models/load (after unloading the current one to free
+    // VRAM). This keeps only one ACE model in VRAM at a time while letting
+    // the user switch from the webapp without restarting the server.
     auto slots = std::make_shared<
         std::unordered_map<std::string, std::shared_ptr<ModelSlot>>>();
+    std::string first_ace_step_id;
+    for (const ConfigModel& m : cfg.models) {
+        if (m.family == "ace_step" && first_ace_step_id.empty())
+            first_ace_step_id = m.id;
+    }
 
     for (const ConfigModel& m : cfg.models) {
         audiocore::ModelLoadRequest req;
@@ -230,20 +241,34 @@ int main(int argc, char** argv) {
         req.options["backend"] = m.backend;
         req.options["device"] = std::to_string(cfg.device);
 
+        // Only load the first ACE-Step model + all non-ACE models eagerly.
+        // Other ACE models are registered for webapp load-on-demand.
+        const bool defer = (m.family == "ace_step" && m.id != first_ace_step_id);
+
         auto slot = std::make_shared<ModelSlot>();
-        try {
-            auto loaded = registry->load(req);
-            auto session = loaded->create_session(
-                {VoiceTaskKind::Tts}, {});
-            slot->model = std::move(loaded);
-            slot->session = std::move(session);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "load failed for '%s': %s\n",
-                         m.id.c_str(), e.what());
-            return 1;
+        slot->load_req = req;
+        slot->loaded = false;
+
+        if (!defer) {
+            try {
+                auto loaded = registry->load(req);
+                auto session = loaded->create_session(
+                    {VoiceTaskKind::Tts}, {});
+                slot->model = std::move(loaded);
+                slot->session = std::move(session);
+                slot->loaded = true;
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "load failed for '%s': %s\n",
+                             m.id.c_str(), e.what());
+                return 1;
+            }
+            std::fprintf(stderr, "audiocore_server: loaded '%s' (%s)\n",
+                         m.id.c_str(), m.family.c_str());
+        } else {
+            std::fprintf(stderr,
+                "audiocore_server: registered '%s' (%s) [load on demand]\n",
+                m.id.c_str(), m.family.c_str());
         }
-        std::fprintf(stderr, "audiocore_server: loaded '%s' (%s)\n",
-                     m.id.c_str(), m.family.c_str());
         (*slots)[m.id] = slot;
     }
 
@@ -253,7 +278,9 @@ int main(int argc, char** argv) {
             "Booting anyway; /v1/audio/* will return 404 until a model is loaded.\n");
     }
 
-    auto svr = audiocore::build_server(slots, cfg.clips_dir);
+    // Pass registry + model dir so the webapp can load/unload models at runtime.
+    // cfg.model_dir is the discovery scan root (may be empty in single-model mode).
+    auto svr = audiocore::build_server(slots, cfg.clips_dir, registry, cfg.model_dir);
     svr->set_logger([](const httplib::Request& req, const httplib::Response&) {
         std::fprintf(stderr, "%s %s\n", req.method.c_str(), req.path.c_str());
     });

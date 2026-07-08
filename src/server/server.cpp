@@ -96,6 +96,13 @@ std::optional<SlotGuard> resolve_slot(
     }
     auto& slot = it->second;
     auto lock = std::unique_lock<std::mutex>(slot->mtx);
+    if (!slot->loaded || !slot->session) {
+        res.status = 503;
+        json e = {{"error", "model not loaded — use /v1/models/load first"},
+                  {"model", model_id}};
+        res.set_content(e.dump(), "application/json");
+        return std::nullopt;
+    }
     return SlotGuard{std::move(body), slot, std::move(lock)};
 }
 
@@ -266,9 +273,12 @@ std::string_view asset_data(const std::string& name) {
 
 std::shared_ptr<httplib::Server> build_server(
         std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots,
-        const std::string& clips_dir) {
+        const std::string& clips_dir,
+        std::shared_ptr<ModelRegistry> registry,
+        const std::string& weights_dir) {
     auto svr = std::make_shared<httplib::Server>();
     auto slots_ref = slots;
+    auto registry_raw = registry.get();
 
     svr->Get("/health", [slots_ref](const httplib::Request&, httplib::Response& res) {
         json j = {{"status", "ok"}};
@@ -279,14 +289,118 @@ std::shared_ptr<httplib::Server> build_server(
         json arr = json::array();
         for (const auto& [id, slot] : *slots_ref) {
             std::lock_guard<std::mutex> g(slot->mtx);
-            std::string fam = slot->session ? slot->session->family() : "";
+            std::string fam = slot->session ? slot->session->family() : slot->load_req.family_hint;
             arr.push_back({
                 {"id", id},
                 {"family", fam},
+                {"loaded", slot->loaded},
             });
         }
         res.set_content(json{{"object", "list"}, {"data", arr}}.dump(),
                         "application/json");
+    });
+
+    // ── Model management: load / unload / list-available ────────────────
+    // The webapp uses these to swap models at runtime. Loading a model
+    // consumes VRAM; unloading frees it. The user controls which models
+    // are resident — no automatic eviction.
+
+    // Unload a model by id (frees VRAM immediately).
+    svr->Post("/v1/models/unload",
+              [slots_ref](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        std::string id = body.value("id", "");
+        auto it = slots_ref->find(id);
+        if (it == slots_ref->end()) {
+            res.status = 404;
+            res.set_content(R"({"error":"unknown model id"})", "application/json");
+            return;
+        }
+        auto& slot = it->second;
+        std::unique_lock<std::mutex> g(slot->mtx);
+        slot->session.reset();
+        slot->model.reset();
+        slot->loaded = false;
+        std::fprintf(stderr, "[server] model '%s' unloaded (VRAM freed)\n", id.c_str());
+        res.set_content(R"({"ok":true})", "application/json");
+    });
+
+    // Load a model by id (consumes VRAM). Uses the cached ModelLoadRequest
+    // from startup config. Allows the webapp to hot-swap models.
+    svr->Post("/v1/models/load",
+              [slots_ref, registry_raw](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        std::string id = body.value("id", "");
+        auto it = slots_ref->find(id);
+        if (it == slots_ref->end()) {
+            res.status = 404;
+            res.set_content(R"({"error":"unknown model id"})", "application/json");
+            return;
+        }
+        auto& slot = it->second;
+        std::unique_lock<std::mutex> g(slot->mtx);
+        if (slot->loaded && slot->session) {
+            res.set_content(R"({"ok":true,"already_loaded":true})", "application/json");
+            return;
+        }
+        if (!registry_raw) {
+            res.status = 500;
+            res.set_content(R"({"error":"no registry"})", "application/json");
+            return;
+        }
+        try {
+            std::fprintf(stderr, "[server] loading '%s'...\n", id.c_str());
+            auto loaded = registry_raw->load(slot->load_req);
+            auto session = loaded->create_session({VoiceTaskKind::Tts}, {});
+            slot->model = std::move(loaded);
+            slot->session = std::move(session);
+            slot->loaded = true;
+            std::fprintf(stderr, "[server] model '%s' loaded\n", id.c_str());
+            res.set_content(R"({"ok":true})", "application/json");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[server] load FAILED for '%s': %s\n",
+                         id.c_str(), e.what());
+            res.status = 500;
+            json err = {{"error", e.what()}};
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
+    // List available models on disk (scan weights directory).
+    svr->Get("/v1/models/available",
+              [weights_dir](const httplib::Request&, httplib::Response& res) {
+        json arr = json::array();
+        if (!weights_dir.empty() && fs::exists(weights_dir)) {
+            for (const auto& fam_dir : fs::directory_iterator(weights_dir)) {
+                if (!fam_dir.is_directory()) continue;
+                std::string fam = fam_dir.path().filename().string();
+                for (const auto& model_dir : fs::directory_iterator(fam_dir.path())) {
+                    if (!model_dir.is_directory()) continue;
+                    std::string mid = model_dir.path().filename().string();
+                    std::string family_hint;
+                    if (fam.find("ace_step") != std::string::npos) family_hint = "ace_step";
+                    else if (fam.find("qwen3") != std::string::npos) family_hint = "qwen3_tts";
+                    else if (fam.find("moss") != std::string::npos) family_hint = "moss_tts";
+                    else family_hint = fam;
+                    arr.push_back({
+                        {"id", mid},
+                        {"family", family_hint},
+                        {"path", model_dir.path().string()},
+                    });
+                }
+            }
+        }
+        res.set_content(json{{"data", arr}}.dump(), "application/json");
     });
 
     svr->Post("/v1/audio/speech",

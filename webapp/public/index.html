@@ -58,6 +58,7 @@
   <button class="tab"        data-tab="music"      role="tab"><span class="tab-emoji">🎵</span> Music<span class="tab-key">4</span></button>
   <button class="tab"        data-tab="voices"     role="tab"><span class="tab-emoji">🎭</span> Voices<span class="tab-key">5</span></button>
   <button class="tab"        data-tab="clips"      role="tab"><span class="tab-emoji">🎬</span> Clips<span class="tab-key">6</span></button>
+  <button class="tab"        data-tab="models"     role="tab"><span class="tab-emoji">📦</span> Models<span class="tab-key">7</span></button>
 </nav>
 
 <main class="shell">
@@ -525,6 +526,20 @@
       <div class="clips-grid" id="clips-list">
         <div class="empty"><div class="empty-icon">🎬</div><div class="empty-title">Loading clips…</div></div>
       </div>
+    </div>
+  </section>
+
+  <!-- ════════════════ MODELS ════════════════ -->
+  <section class="panel" id="tab-models">
+    <div class="card">
+      <div class="card-head">
+        <h2>Model Manager</h2>
+        <button type="button" class="btn" id="model-refresh">↻ Refresh</button>
+      </div>
+      <p class="hint" style="margin-bottom:1em">Load and unload models to control VRAM usage.
+         Only one ACE-Step model should be loaded at a time (~6 GB each).
+         Unload before loading a different variant.</p>
+      <div id="model-manager-list" style="display:flex;flex-direction:column;gap:0.75em"></div>
     </div>
   </section>
 
