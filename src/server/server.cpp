@@ -95,7 +95,8 @@ std::optional<SlotGuard> resolve_slot(
         return std::nullopt;
     }
     auto& slot = it->second;
-    return SlotGuard{std::move(body), slot, std::unique_lock<std::mutex>(slot->mtx)};
+    auto lock = std::unique_lock<std::mutex>(slot->mtx);
+    return SlotGuard{std::move(body), slot, std::move(lock)};
 }
 
 void fail_with(httplib::Response& res, const std::string& err) {
@@ -278,10 +279,10 @@ std::shared_ptr<httplib::Server> build_server(
         json arr = json::array();
         for (const auto& [id, slot] : *slots_ref) {
             std::lock_guard<std::mutex> g(slot->mtx);
+            std::string fam = slot->session ? slot->session->family() : "";
             arr.push_back({
                 {"id", id},
-                {"family", slot->session->family()},
-                {"loaded", true},
+                {"family", fam},
             });
         }
         res.set_content(json{{"object", "list"}, {"data", arr}}.dump(),

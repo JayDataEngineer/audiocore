@@ -235,7 +235,18 @@ static const EncBlockCfg kEncBlocks[5] = {
 static const int32_t kResDilations[3] = {1, 3, 9};
 
 // ── NaN diagnostic helper ───────────────────────────────────────────────────
+// Gated behind ACE_STEP_VAE_DEBUG: nan_check scans every element of tensors
+// that can hold millions of floats (block 4: T=120000 C=128 = 15.4M), and is
+// called ~20x per tile. Unconditionally that CPU scan + stderr I/O cost ~6.5s
+// per generation (measured: VAE reported 7876ms but actual CUDA compute was
+// only ~1350ms). Default off → VAE decode drops to ~1.4s.
+static bool vae_debug_enabled() {
+    static const bool v = std::getenv("ACE_STEP_VAE_DEBUG") != nullptr;
+    return v;
+}
+
 static void nan_check(const char* tag, const float* p, size_t n) {
+    if (!vae_debug_enabled()) return;
     int nan_cnt = 0;
     float mx = -1e30f, mn = 1e30f;
     double sum_sq = 0.0;
@@ -1454,19 +1465,30 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
     // songs (2-3 minute output) with no model changes.
     //
     // Tile geometry (tuned for per-block VRAM budget):
-    //   TILE_FRAMES = 150 latent frames  = 6.0s audio
-    //     Block 4 peak VRAM at 150 frames ≈ 10 GB (snake + im2col + mul_mat
-    //     intermediates allocated simultaneously by alloc_ctx_tensors).
-    //     250 frames (10s) needs ~16 GB and OOMs on 24 GB GPUs with DiT loaded.
-    //   OVERLAP_FRAMES = 25 latent frames = 1.0s audio crossfade
+    //   TILE_FRAMES = 100 latent frames  = 4.0s audio
+    //     At 100 frames, block 4 (the final ×2 upsampling stage, T_in=96000,
+    //     C=128) allocates ~7 GB for im2col + intermediates — fits alongside
+    //     resident DiT weights on a 24 GB GPU. At 150 frames block 4 needs
+    //     ~11.8 GB and OOMs, forcing the slow per-op fallback (73 individual
+    //     ops with per-op CPU overhead = ~6s/tile vs ~0.7s/tile for the
+    //     7-sub-graph fast path).
+    //   OVERLAP_FRAMES = 20 latent frames = 0.8s audio crossfade
     // 1920 = total VAE upsampling factor (latent_frames → pcm_samples)
-    constexpr int32_t TILE_FRAMES    = 150;
-    constexpr int32_t OVERLAP_FRAMES = 25;
+    constexpr int32_t TILE_FRAMES    = 100;
+    constexpr int32_t OVERLAP_FRAMES = 20;
     constexpr int32_t UPSAMPLE       = 1920;
 
     if (n_frames > TILE_FRAMES) {
         fprintf(stderr, "[vae] tiled decode: %d frames → tiles of %d (overlap %d)\n",
                 n_frames, TILE_FRAMES, OVERLAP_FRAMES);
+        // Reset the per-block fast-path failure flag for each new generation.
+        // Within a single tiled decode, tile 0's failure still prevents retries
+        // on tiles 1/2 (they face the same VRAM conditions). But across
+        // generations — especially after a model swap frees VRAM — the fast
+        // path MUST be retried. Without this reset, one OOM (e.g. transient
+        // fragmentation after model swap) permanently disables the fast path,
+        // turning every subsequent decode from ~1.1s into ~6.4s.
+        blocks_failed_once_ = false;
         const size_t pcm_total = static_cast<size_t>(n_frames) * UPSAMPLE * 2;
         pcm->assign(pcm_total, 0.0f);
         const size_t ov_pcm = static_cast<size_t>(OVERLAP_FRAMES) * UPSAMPLE;
@@ -1531,22 +1553,41 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
     // the per-op path which has lower peak VRAM (one op at a time).
     // Set ACE_STEP_VAE_SLOW=1 to force the per-op path (with diagnostics).
     const bool force_slow = std::getenv("ACE_STEP_VAE_SLOW") != nullptr;
-    if (cuda_backend_ && !force_slow) {
+    // blocks_failed_once_: if the per-block fast path has failed for a tile in
+    // THIS tiled decode, don't retry for subsequent tiles — they face the same
+    // VRAM conditions and will fail the same way, wasting ~200ms/tile. The flag
+    // is reset at the top of each tiled decode so a transient OOM doesn't
+    // permanently cripple the fast path for all future decodes.
+    if (cuda_backend_ && !force_slow && !blocks_failed_once_) {
         std::string blk_err;
         if (decode_blocks(latents, n_frames, pcm, &blk_err)) {
             return true;
         }
-        fprintf(stderr, "[vae] per-block decode failed (%s), falling back to per-op\n",
+        fprintf(stderr, "[vae] per-block decode failed (%s), falling back to per-op"
+                        " (will skip fast-path for remaining tiles in this decode)\n",
                 blk_err.c_str());
+        blocks_failed_once_ = true;
         if (error) error->clear();
     }
 
     // ── Fallback: per-op decode ───────────────────────────────────────────
     // Each op builds its own small graph. Lower peak VRAM than per-block.
-    const size_t buf_size = 4096ULL * 1024 * 1024;
-    fprintf(stderr, "[vae] allocating %.0f MB scratch...\n", buf_size / 1048576.0);
-    std::vector<char> buf(buf_size);
-    fprintf(stderr, "[vae] scratch allocated, phase 1: conv1\n");
+    //
+    // Scratch buffer: with use_gpu=true (no_alloc=true) this pool holds ONLY
+    // tensor metadata (~KB per op), not compute data — the actual compute
+    // happens in CUDA scratch. 256MB is vast overkill for metadata but safe.
+    // STATIC + thread_local so the buffer is allocated ONCE and reused across
+    // all tiles + all decode() calls. Previously this was a 4GB vector<char>
+    // value-initialized (zero-filled) and destroyed per tile — that memset +
+    // munmap cost ~2-4s/tile, dominating the VAE decode time (was 9.5s for a
+    // 10s clip; ~8s of that was this allocation, not compute).
+    const size_t buf_size = 256ULL * 1024 * 1024;
+    static thread_local std::vector<char> buf;
+    if (buf.size() < buf_size) {
+        fprintf(stderr, "[vae] allocating %.0f MB scratch (once)...\n", buf_size / 1048576.0);
+        buf.resize(buf_size);  // no zero-fill needed — ggml_init doesn't read it
+        fprintf(stderr, "[vae] scratch ready, phase 1: conv1\n");
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     //  Phase 1: conv1  [T, 64] → [T, 2048]

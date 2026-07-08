@@ -757,7 +757,9 @@ static bool run_one_forward(
     const int32_t n_layer = cfg.n_layers    > 0 ? cfg.n_layers    : 24;
     const float   eps     = cfg.rms_norm_eps > 0 ? cfg.rms_norm_eps : 1e-6f;
     const float   theta   = cfg.rope_theta  > 0 ? cfg.rope_theta  : 1000000.0f;
-    fprintf(stderr, "[dit] rope_theta=%g (cfg=%g)\n", theta, cfg.rope_theta);
+    if (std::getenv("ACE_STEP_DIT_DEBUG")) {
+        fprintf(stderr, "[dit] rope_theta=%g (cfg=%g)\n", theta, cfg.rope_theta);
+    }
 
     // ── Graph context (no_alloc=true: gallocr allocates intermediates) ──
     // We use ggml_gallocr for lifecycle-based allocation directly on CUDA.
@@ -886,8 +888,11 @@ static bool run_one_forward(
     // Full upstream pipeline (modeling_ace_step.py:830):
     //   1. text_projector(TE_text_hs)         : [T_text, 1024] → [T_text, 2048]
     //   2. timbre_encoder(silence_latent[:750]) : [750, 64] → [1, 2048] (CLS pool)
-    //   3. (lyric_encoder(TE_lyric_hs))        : [T_lyric, 2048]  (skipped — no lyrics)
-    //   4. pack [timbre | text] (lyrics go in between when present)
+    //   3. lyric_encoder(TE_lyric_hs)          : [T_lyric, 1024] → [T_lyric, 2048]
+    //      (ALWAYS runs — upstream encodes "# Languages\nunknown..." by default
+    //       when no lyrics are provided, producing ~11 conditioning tokens.
+    //       Caller passes lyric_data for cond branch, null for CFG uncond.)
+    //   4. pack [lyric | timbre | text]  (cond-enc.h:354 order)
     //   5. condition_embedder(packed)          : [T_packed, 2048] → [T_packed, H]
     //
     // Without timbre, the DiT produces white noise (verified: the silence_latent
@@ -1353,8 +1358,8 @@ static bool run_one_forward(
     // in ext_ctx_ are on a separate buffer and are NOT freed here.
     ggml_gallocr_free(galloc);
 
-    // Output RMS diagnostic
-    {
+    // Output RMS diagnostic (gated — scans T*H floats per step)
+    if (std::getenv("ACE_STEP_DIT_DEBUG")) {
         double sq = 0.0;
         for (int64_t ii = 0; ii < static_cast<int64_t>(T) * H; ii++)
             sq += (double)result[ii] * result[ii];
@@ -1457,19 +1462,21 @@ bool DiTRunner::forward(
     }
 
     int64_t n_el = static_cast<int64_t>(T) * H;
-    // ── CFG diagnostics ────────────────────────────────────────────────
-    double c_rms = 0.0, u_rms = 0.0, diff_rms = 0.0;
-    for (int64_t i = 0; i < n_el; i++) {
-        c_rms += (double)c_out[i] * c_out[i];
-        u_rms += (double)u_out[i] * u_out[i];
-        double d = (double)c_out[i] - (double)u_out[i];
-        diff_rms += d * d;
+    // ── CFG diagnostics (gated — scans 3×T*H floats per step) ──────────
+    if (std::getenv("ACE_STEP_DIT_DEBUG")) {
+        double c_rms = 0.0, u_rms = 0.0, diff_rms = 0.0;
+        for (int64_t i = 0; i < n_el; i++) {
+            c_rms += (double)c_out[i] * c_out[i];
+            u_rms += (double)u_out[i] * u_out[i];
+            double d = (double)c_out[i] - (double)u_out[i];
+            diff_rms += d * d;
+        }
+        c_rms = std::sqrt(c_rms / n_el);
+        u_rms = std::sqrt(u_rms / n_el);
+        diff_rms = std::sqrt(diff_rms / n_el);
+        fprintf(stderr, "[dit] CFG: c_rms=%.4f u_rms=%.4f diff_rms=%.4f g=%.1f\n",
+                c_rms, u_rms, diff_rms, guidance_scale);
     }
-    c_rms = std::sqrt(c_rms / n_el);
-    u_rms = std::sqrt(u_rms / n_el);
-    diff_rms = std::sqrt(diff_rms / n_el);
-    fprintf(stderr, "[dit] CFG: c_rms=%.4f u_rms=%.4f diff_rms=%.4f g=%.1f\n",
-            c_rms, u_rms, diff_rms, guidance_scale);
 
     // ── Adaptive Projected Guidance (APG) ──────────────────────────────
     // Matches diffusers.guiders.adaptive_projected_guidance.normalized_guidance

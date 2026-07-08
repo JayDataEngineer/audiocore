@@ -216,6 +216,7 @@ int main(int argc, char** argv) {
     // ── Load models via ModelRegistry → ILoadedModel → IOfflineTaskSession ──
     auto slots = std::make_shared<
         std::unordered_map<std::string, std::shared_ptr<ModelSlot>>>();
+
     for (const ConfigModel& m : cfg.models) {
         audiocore::ModelLoadRequest req;
         req.model_path = m.path;
@@ -229,15 +230,13 @@ int main(int argc, char** argv) {
         req.options["backend"] = m.backend;
         req.options["device"] = std::to_string(cfg.device);
 
+        auto slot = std::make_shared<ModelSlot>();
         try {
             auto loaded = registry->load(req);
             auto session = loaded->create_session(
                 {VoiceTaskKind::Tts}, {});
-
-            auto slot = std::make_shared<ModelSlot>();
             slot->model = std::move(loaded);
             slot->session = std::move(session);
-            (*slots)[m.id] = slot;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "load failed for '%s': %s\n",
                          m.id.c_str(), e.what());
@@ -245,6 +244,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "audiocore_server: loaded '%s' (%s)\n",
                      m.id.c_str(), m.family.c_str());
+        (*slots)[m.id] = slot;
     }
 
     if (slots->empty()) {

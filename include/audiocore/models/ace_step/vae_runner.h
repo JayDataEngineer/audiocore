@@ -126,6 +126,13 @@ public:  // weight structs are public so graph builders can reference them
     std::unique_ptr<ggml_utils::BackendPair> backend_pair_;
     ggml_backend_t                           cuda_backend_  = nullptr;
     bool                                     backend_ready_ = false;
+    // Set true when decode_blocks() fails within the current tiled decode
+    // (e.g. block4 CUDA OOM on a large tile). Subsequent TILES in the same
+    // decode skip the fast-path and go straight to per-op fallback, saving
+    // ~200ms/tile of wasted alloc. Reset to false at the start of each new
+    // tiled decode() so transient OOM (e.g. right after a model swap) doesn't
+    // permanently cripple the fast path.
+    bool                                     blocks_failed_once_ = false;
 };
 
 }  // namespace audiocore::acestep
