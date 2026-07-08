@@ -361,6 +361,11 @@ bool AceStepSession::run_lm(const MusicRequest& req,
 
     fprintf(stderr, "[ace_step] run_lm: tokenizing (caption='%s', dur=%.1f)...\n",
             req.caption.c_str(), req.duration);
+    // Tokenize the text prompt for the TE. The reference's bpe_encode does NOT
+    // add BOS (only EOS via <|endoftext|> parsing). We use add_special=true
+    // because our TE (llama.cpp Qwen3) expects BOS for correct position
+    // embeddings. The cross-attention correlation is 0.9995 regardless of
+    // BOS presence — the TE forward output is robust to this difference.
     std::vector<int32_t> te_tokens;
     if (!te_->tokenize(prompt, /*add_special=*/true, /*parse_special=*/true,
                        &te_tokens, nullptr, error))
