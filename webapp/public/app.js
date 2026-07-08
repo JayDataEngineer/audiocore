@@ -145,13 +145,16 @@
     return "turbo";  // safe default — short horizon
   }
   function music_label_for(id) {
+    const lid = (id || "").toLowerCase();
     const v = music_variant_of(id);
+    // Tag Scrag VAE variants so users can distinguish them in the picker.
+    const scrag = lid.indexOf("scrag") >= 0 ? " · ScragVAE" : "";
     const map = {
       turbo: "⚡ Turbo",
       base:  "🎚️ Base",
       sft:   "🎯 SFT",
     };
-    return (map[v] || id) + "  ·  " + MUSIC_DEFAULTS[v].steps + " steps";
+    return (map[v] || id) + scrag + "  ·  " + MUSIC_DEFAULTS[v].steps + " steps";
   }
   function apply_music_defaults(id, { force = false } = {}) {
     const v = music_variant_of(id);
@@ -199,31 +202,15 @@
         }
         if (f.indexOf("ace") >= 0 || id.indexOf("ace") >= 0) {
           MUSIC_MODELS.push(m.id);
-          // Prefer turbo as the initial selection (faster iteration).
-          if (ACTIVE_MUSIC == null || id.indexOf("turbo") >= 0)
+          if (ACTIVE_MUSIC == null)
             ACTIVE_MUSIC = m.id;
         }
         if (f.indexOf("moss") >= 0 && ACTIVE_TTS == null)
           ACTIVE_TTS = m.id;
       }
 
-      // Populate the music model picker (turbo vs base, etc.).
-      const musSel = $("#mus-model");
-      if (musSel) {
-        musSel.innerHTML = "";
-        if (!MUSIC_MODELS.length) {
-          musSel.innerHTML = '<option value="">— no music model loaded —</option>';
-        } else {
-          for (const id of MUSIC_MODELS) {
-            const o = document.createElement("option");
-            o.value = id;
-            o.textContent = music_label_for(id);
-            musSel.appendChild(o);
-          }
-          musSel.value = ACTIVE_MUSIC;
-          apply_music_defaults(ACTIVE_MUSIC, { force: true });
-        }
-      }
+      // Apply default steps/guidance for whatever model is loaded.
+      if (ACTIVE_MUSIC) apply_music_defaults(ACTIVE_MUSIC, { force: true });
 
       badge.textContent = MODELS.length + " model" + (MODELS.length === 1 ? "" : "s");
       badge.className = "badge";
@@ -822,15 +809,6 @@
   $("#mus-mode").addEventListener("change", sync_music_mode_rows);
   sync_music_mode_rows();
 
-  // Model picker: update ACTIVE_MUSIC and adapt steps/guidance defaults to
-  // the chosen variant (turbo=8 steps, base=50 steps). User-set values are
-  // preserved across switches — only untouched fields auto-adjust.
-  $("#mus-model").addEventListener("change", (e) => {
-    ACTIVE_MUSIC = e.target.value;
-    apply_music_defaults(ACTIVE_MUSIC, { force: false });
-    console.log("music model →", ACTIVE_MUSIC);
-  });
-
   // Caption preset chips: one-click genre/mood fill.
   $$("#mus-presets .chip").forEach((chip) => {
     chip.addEventListener("click", () => {
@@ -1225,6 +1203,7 @@
     for (const c of clips) {
       const el = document.createElement("div");
       el.className = "clip";
+      const ts = c.mtime ? new Date(c.mtime * 1000).toLocaleString() : "";
       el.innerHTML =
         '<audio controls preload="metadata" src="/v1/clips/raw/' + encodeURIComponent(c.name) + '"></audio>' +
         '<div class="clip-info">' +
@@ -1232,6 +1211,7 @@
           '<div class="clip-meta">' +
             (c.duration ? '<span class="tag">' + fmt_dur(c.duration) + '</span>' : '') +
             '<span class="tag">' + fmt_size(c.size) + '</span>' +
+            (ts ? '<span class="tag">📅 ' + ts + '</span>' : '') +
           '</div>' +
         '</div>' +
         '<button class="btn btn-danger" data-del-clip="' + esc(c.name) + '">Delete</button>';
