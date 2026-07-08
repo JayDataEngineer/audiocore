@@ -572,7 +572,7 @@ bool MossSession::load(const std::string& model_path,
     if (be && (codec_dec_root_ ||
                ggml_get_tensor(ext_ctx_, "moss.codec.quantizer.q.0.codebook.weight"))) {
         std::string codec_err;
-        if (codec_graphs_.bind(ext_ctx_, be, &codec_err)) {
+        if (codec_graphs_.bind(ext_ctx_, be, cfg_.n_vq, &codec_err)) {
             cfg_.codec_present = true;
         } else {
             std::fprintf(stderr, "moss_tts: codec tensors present but bind failed "
@@ -599,7 +599,7 @@ bool MossSession::load(const std::string& model_path,
                     ggml_get_tensor(fallback_gguf->meta_ctx(),
                         "moss.codec.quantizer.q.0.codebook.weight")) {
                     std::string fb_err;
-                    if (codec_graphs_.bind(fallback_gguf->meta_ctx(), be, &fb_err)) {
+                    if (codec_graphs_.bind(fallback_gguf->meta_ctx(), be, cfg_.n_vq, &fb_err)) {
                         cfg_.codec_present = true;
                         extra_loaders_.push_back(std::move(fallback_loader));
                         std::fprintf(stderr, "moss_tts: codec fallback OK\n");

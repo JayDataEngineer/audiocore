@@ -48,15 +48,18 @@ static bool contains(const int32_t* arr, int32_t n, int32_t val) {
 }
 
 // ── init_delay_state ──────────────────────────────────────────────────────
-DelayState init_delay_state(const std::vector<std::vector<int32_t>>& prompt) {
+DelayState init_delay_state(const std::vector<std::vector<int32_t>>& prompt,
+                            int32_t n_vq) {
     if (prompt.empty()) {
         DelayState s;
+        s.n_vq = n_vq;
         s.audio_buf.reserve(256);
         return s;
     }
 
     int32_t seq_len = static_cast<int32_t>(prompt.size());
     DelayState state;
+    state.n_vq = n_vq;
 
     // Extract text channel (column 0)
     std::vector<int32_t> text_channel(seq_len);
@@ -80,9 +83,9 @@ DelayState init_delay_state(const std::vector<std::vector<int32_t>>& prompt) {
     // Copy audio channels from prompt
     state.audio_buf.reserve(std::max(seq_len + 1024, 256));
     for (int32_t i = 0; i < seq_len; ++i) {
-        std::vector<int32_t> frame(N_VQ);
-        for (int s = 0; s < N_VQ; ++s)
-            frame[s] = prompt[i][1 + s];
+        std::vector<int32_t> frame(static_cast<size_t>(n_vq));
+        for (int s = 0; s < n_vq; ++s)
+            frame[static_cast<size_t>(s)] = prompt[i][1 + s];
         state.audio_buf.push_back(std::move(frame));
     }
 
@@ -94,7 +97,7 @@ std::vector<int32_t> delay_step(DelayState& state,
                                 const float* text_logits, int32_t text_vocab,
                                 const float* audio_logits, int32_t audio_vocab,
                                 SamplingConfig& config) {
-    std::vector<int32_t> result(1 + N_VQ);
+    std::vector<int32_t> result(1 + state.n_vq);
 
     if (state.is_stopping) {
         std::fill(result.begin(), result.end(), AUDIO_PAD_CODE);
@@ -105,9 +108,9 @@ std::vector<int32_t> delay_step(DelayState& state,
     // ── Text token decision ───────────────────────────────────────────────
     int32_t next_text;
 
-    if (state.delayed_length < N_VQ) {
+    if (state.delayed_length < static_cast<int32_t>(state.n_vq)) {
         next_text = AUDIO_ASSISTANT_DELAY_SLOT_TOKEN_ID;
-    } else if (state.delayed_length == N_VQ) {
+    } else if (state.delayed_length == static_cast<int32_t>(state.n_vq)) {
         next_text = AUDIO_END_TOKEN_ID;
         state.is_audio = false;
     } else {
@@ -137,7 +140,7 @@ std::vector<int32_t> delay_step(DelayState& state,
         if (state.time_step == 0 && AUDIO_ASSISTANT_DELAY_SLOT_TOKEN_ID < text_vocab)
             scaled[AUDIO_ASSISTANT_DELAY_SLOT_TOKEN_ID] = -std::numeric_limits<float>::infinity();
 
-        if (state.time_step <= N_VQ && IM_END_TOKEN_ID < text_vocab)
+        if (state.time_step <= state.n_vq && IM_END_TOKEN_ID < text_vocab)
             scaled[IM_END_TOKEN_ID] = -std::numeric_limits<float>::infinity();
 
         // Sample
@@ -153,14 +156,14 @@ std::vector<int32_t> delay_step(DelayState& state,
         state.is_stopping = true;
 
     // ── Audio token decision ──────────────────────────────────────────────
-    std::vector<int32_t> next_audio(N_VQ, AUDIO_PAD_CODE);
+    std::vector<int32_t> next_audio(state.n_vq, AUDIO_PAD_CODE);
 
     // pre_audio_mask: streams with index < state.audio_length
     // post_audio_mask: streams with index > (delayed_length - 1) or all if delayed_length == MAX
     bool post_all = (state.delayed_length == std::numeric_limits<int32_t>::max());
 
     std::vector<int> sampling_streams;
-    for (int s = 0; s < N_VQ; ++s) {
+    for (int s = 0; s < state.n_vq; ++s) {
         bool pre = (s < state.audio_length);
         bool post = post_all || (s > state.delayed_length - 1);
         if (pre && post)
@@ -228,7 +231,7 @@ std::vector<int32_t> delay_step(DelayState& state,
     if (state.delayed_length != std::numeric_limits<int32_t>::max()) {
         state.delayed_length++;
     }
-    if (state.delayed_length > N_VQ) {
+    if (state.delayed_length > static_cast<int32_t>(state.n_vq)) {
         state.delayed_length = std::numeric_limits<int32_t>::max();
     }
 
@@ -237,7 +240,7 @@ std::vector<int32_t> delay_step(DelayState& state,
     state.audio_buf.push_back(next_audio);
 
     result[0] = next_text;
-    for (int s = 0; s < N_VQ; ++s)
+    for (int s = 0; s < state.n_vq; ++s)
         result[1 + s] = next_audio[s];
 
     return result;
@@ -245,16 +248,17 @@ std::vector<int32_t> delay_step(DelayState& state,
 
 // ── apply_de_delay_pattern ────────────────────────────────────────────────
 std::vector<std::vector<int32_t>> apply_de_delay_pattern(
-    const std::vector<std::vector<int32_t>>& delay_codes) {
+    const std::vector<std::vector<int32_t>>& delay_codes,
+    int32_t n_vq) {
 
     if (delay_codes.empty()) return {};
 
     int32_t total_len = static_cast<int32_t>(delay_codes.size());
-    int32_t T = total_len - N_VQ + 1;
+    int32_t T = total_len - n_vq + 1;
     if (T <= 0) return {};
 
-    std::vector<std::vector<int32_t>> result(T, std::vector<int32_t>(N_VQ, 0));
-    for (int s = 0; s < N_VQ; ++s) {
+    std::vector<std::vector<int32_t>> result(T, std::vector<int32_t>(n_vq, 0));
+    for (int s = 0; s < n_vq; ++s) {
         for (int t = 0; t < T; ++t) {
             if (t + s < total_len)
                 result[t][s] = delay_codes[t + s][s];
@@ -265,19 +269,20 @@ std::vector<std::vector<int32_t>> apply_de_delay_pattern(
 
 // ── extract_audio_segments ────────────────────────────────────────────────
 std::vector<std::vector<int32_t>> extract_audio_segments(
-    const std::vector<std::vector<int32_t>>& codes) {
+    const std::vector<std::vector<int32_t>>& codes,
+    int32_t n_vq) {
 
     if (codes.empty()) return {};
 
     // De-delay first
-    auto delayed = apply_de_delay_pattern(codes);
+    auto delayed = apply_de_delay_pattern(codes, n_vq);
     if (delayed.empty()) return {};
 
     // Find non-padding rows
     std::vector<int> non_pad_indices;
     for (int32_t t = 0; t < static_cast<int32_t>(delayed.size()); ++t) {
         bool all_pad = true;
-        for (int s = 0; s < N_VQ; ++s) {
+        for (int s = 0; s < n_vq; ++s) {
             if (delayed[t][s] != AUDIO_PAD_CODE) {
                 all_pad = false;
                 break;

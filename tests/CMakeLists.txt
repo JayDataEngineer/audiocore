@@ -74,3 +74,29 @@ target_link_libraries(test_gguf_dump PRIVATE audiocore_framework)
 # silently degrading through system-prompt impersonation (GAP_TRACKER.md §1.2).
 add_executable(test_moss_modes test_moss_modes.cpp)
 target_link_libraries(test_moss_modes PRIVATE audiocore_framework)
+
+# MSE2 layer-by-layer parity test — loads DiT GGUF + reference tensors.
+# Run manually: ./test_mse2_parity <dit.gguf> <dump_mse2_tensors_dir>
+add_executable(test_mse2_parity test_mse2_parity.cpp)
+target_link_libraries(test_mse2_parity PRIVATE audiocore_framework)
+
+# Focused VAE-only parity test: compares decode() and decode_traced() with Python refs
+add_executable(test_vae_only test_vae_only.cpp)
+target_link_libraries(test_vae_only PRIVATE audiocore_framework)
+
+add_executable(test_full_dit test_full_dit.cpp)
+target_link_libraries(test_full_dit PRIVATE audiocore_framework)
+
+# MSE2 end-to-end test — loads DiT + VAE + (optional) TE, runs full pipeline.
+# Run manually: ./test_mse2_e2e
+# Set AUDIOCORE_MSE2_DIR env var to the directory holding the GGUFs.
+add_executable(test_mse2_e2e test_mse2_e2e.cpp)
+target_link_libraries(test_mse2_e2e PRIVATE audiocore_framework)
+
+# End-to-end Silero VAD test — loads silero_vad.gguf (~1.8MB), runs VAD on
+# a 16 kHz WAV. Soft-skips (return 77) if model/audio missing or if the
+# graph port hasn't landed yet (load returns "not implemented").
+# Run manually: ./test_silero_vad
+# Set SILERO_VAD_MODEL / SILERO_VAD_AUDIO env vars to configure.
+add_executable(test_silero_vad test_silero_vad.cpp)
+target_link_libraries(test_silero_vad PRIVATE audiocore_framework)

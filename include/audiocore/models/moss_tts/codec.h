@@ -54,17 +54,23 @@ public:
     // the ggml_gallocr used by decode(). On failure, returns false and
     // sets *error; is_present() stays false.
     //
+    // `n_vq` is the number of RVQ streams (e.g. 32 for MOSS-Audio-Tokenizer,
+    // 16 for MOSS-VoiceGenerator). Must match the quantizer weight count in
+    // the GGUF.
+    //
     // Idempotent: returns true without rebinding if already bound.
     bool bind(ggml_context* source_ctx,
               ggml_backend_t backend,
+              int32_t n_vq,
               std::string* error);
 
     // True once bind() succeeded. decode() throws if you call it while
     // this is false.
     bool is_present() const { return present_; }
 
-    // Decode (n_vq, T_audio) codes (n_vq must be 32) → mono PCM float32
-    // at the codec's native 24 kHz. Output length = T_audio * 1920.
+    // Decode (n_vq, T_audio) codes → mono PCM float32 at the codec's native
+    // 24 kHz. Output length = T_audio * 1920. n_vq must match the value
+    // passed to bind().
     // Empty vector when T_audio <= 0.
     //
     // Throws std::runtime_error on shape / graph-compute failures, or if
@@ -108,7 +114,6 @@ public:
 
 private:
     // ── Constants (matching openmoss/src/codec.cpp) ─────────────────────
-    static constexpr int CODEC_NUM_VQ    = 32;
     static constexpr int CODEC_CB_DIM    = 8;
     static constexpr int CODEC_RVQ_DIM   = 512;
     static constexpr int CODEC_OUT_DIM   = 768;
@@ -155,9 +160,10 @@ private:
     struct TensorSrc { ggml_tensor** field_ptr; ggml_tensor* src; };
     std::vector<TensorSrc> tensor_srcs_;
 
-    std::array<ggml_tensor*, 32> codebook_     {};   // (will be updated to device copy)
-    std::array<ggml_tensor*, 32> q_oproj_w_    {};  // per-quantizer effective
-    std::array<ggml_tensor*, 32> q_oproj_b_    {};
+    int32_t                     n_vq_          = 32;
+    std::vector<ggml_tensor*>   codebook_;          // (will be updated to device copy)
+    std::vector<ggml_tensor*>   q_oproj_w_;         // per-quantizer effective
+    std::vector<ggml_tensor*>   q_oproj_b_;
     ggml_tensor*                quant_oproj_w_ = nullptr;
     ggml_tensor*                quant_oproj_b_ = nullptr;
     std::array<Stage, 4>        stages_        {};
@@ -166,11 +172,11 @@ private:
     // Per-quantizer iproj: 512 → 8 (Conv1d kernel=1, weight-normed).
     // Global quantizer iproj: 768 → 512.
     // Normalized codebooks: (8, 1024) L2-normalized rows for cosine-sim argmax.
-    std::array<ggml_tensor*, 32> q_iproj_w_        {};
-    std::array<ggml_tensor*, 32> q_iproj_b_        {};
+    std::vector<ggml_tensor*>   q_iproj_w_;
+    std::vector<ggml_tensor*>   q_iproj_b_;
     ggml_tensor*                quant_iproj_w_     = nullptr;
     ggml_tensor*                quant_iproj_b_     = nullptr;
-    std::array<ggml_tensor*, 32> codebook_normed_  {};
+    std::vector<ggml_tensor*>   codebook_normed_;
     std::array<Stage, 4>        enc_stages_        {};
 
     // ── Helpers ─────────────────────────────────────────────────────────

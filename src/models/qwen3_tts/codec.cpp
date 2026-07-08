@@ -253,16 +253,17 @@ ggml_tensor* Qwen3TtsCodecGraphs::causal_conv1d_(ggml_context* ctx,
         // ggml_conv_1d's internal im2col step sees a standard 2D input.
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
     }
-    // Decompose conv1d into im2col + mul_mat (F32 output avoids F16 conversion
-    // overhead in the CUDA backend vs ggml_conv_1d's hardcoded GGML_TYPE_F16).
+    // Decompose conv1d into im2col + mul_mat.
+    // mul_mat(w_2d[K*Cin,Cout], ci_2d[K*Cin,T]) → result ne=[Cout,T]
+    // which is already [channels, time] — the codec convention.
+    // (The previous code reshaped [Cout,T] to [T,Cout,1] then transposed
+    //  back, which scrambled the data whenever Cout ≠ T.)
     {
         auto ci = ggml_im2col(ctx, w, x, stride, 0, 0, 0, dilation, 0, false, GGML_TYPE_F32);
         auto ci_2d = ggml_reshape_2d(ctx, ci, ci->ne[0], ci->ne[2] * ci->ne[1]);
         auto w_2d = ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]);
-        x = ggml_mul_mat(ctx, w_2d, ci_2d);
-        x = ggml_reshape_3d(ctx, x, ci->ne[1], w->ne[2], ci->ne[2]);
+        x = ggml_mul_mat(ctx, w_2d, ci_2d);                          // [Cout, T]
     }
-    x = ggml_cont(ctx, ggml_transpose(ctx, x));                    // [C_out, T_out]
     if (b) x = ggml_add(ctx, x, b);
     return x;
 }
@@ -282,6 +283,13 @@ ggml_tensor* Qwen3TtsCodecGraphs::dw_causal_conv1d_(ggml_context* ctx,
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
     }
     // Decompose depthwise conv1d into im2col + mul_mat (F32 output).
+    // Dequantize w to F32: mul_mat(dw_ci, w) uses w as src1, and the CPU
+    // backend requires src1 to be F32. On CUDA, mixed F32×F16 produces
+    // silently-wrong results in some kernel paths.
+    if (w->type != GGML_TYPE_F32) {
+        const int nd = ggml_n_dims(w);
+        w = ggml_cpy(ctx, w, ggml_new_tensor(ctx, GGML_TYPE_F32, nd, w->ne));
+    }
     {
         auto dw_x4 = ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], 1);
         auto dw_ci = ggml_im2col(ctx, w, dw_x4, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
@@ -303,14 +311,15 @@ ggml_tensor* Qwen3TtsCodecGraphs::dw_causal_conv1d_(ggml_context* ctx,
 // matmul, and the existing col2im CUDA kernel which only visits the K/s
 // contributing positions per output element.
 //
-// Crops K−stride samples from the right tail so output time = T_in × stride.
+// HF's CausalTransConvNet crops ceil(K−stride) from BOTH left and right
+// (matching PyTorch ConvTranspose1d output_shape − 2*ceil(K−stride)).
 ggml_tensor* Qwen3TtsCodecGraphs::transposed_conv1d_(ggml_context* ctx,
                                                         ggml_tensor* x,
                                                         ggml_tensor* w,
                                                         ggml_tensor* b,
                                                         int stride) const {
     const int K = (int)w->ne[0];
-    const int crop_right = (K > stride) ? (K - stride) : 0;
+    const int crop = (K > stride) ? (K - stride) : 0;
     const int Cout = (int)w->ne[1];
     const int Cin  = (int)w->ne[2];
 
@@ -345,13 +354,16 @@ ggml_tensor* Qwen3TtsCodecGraphs::transposed_conv1d_(ggml_context* ctx,
     // ── Step 2: col2im_1d — scatter columns into output signal ──────────
     auto y = ggml_col2im_1d(ctx, columns, stride, Cout, /*p0=*/0);
 
-    // ── Step 3: crop right tail ─────────────────────────────────────────
+    // ── Step 3: crop both left and right (HF CausalTransConvNet) ────────
+    //   col2im output is [T_unpad, Cout] where T_unpad = (T_in-1)*stride+K.
+    //   HF crops ceil(K-stride) from each side → T_out = T_unpad - 2*crop.
     const int64_t T_unpad = y->ne[0];
-    const int64_t T_out   = T_unpad - crop_right;
-    if (crop_right > 0) {
+    const int64_t T_out   = T_unpad - 2 * crop;
+    if (crop > 0) {
+        // View with offset = crop elements (each element = sizeof(float))
         y = ggml_view_2d(ctx, y, T_out, Cout,
                          (size_t)T_unpad * sizeof(float),
-                         /*offset=*/0);
+                         /*offset=*/(size_t)crop * sizeof(float));
         y = ggml_cont(ctx, y);
     }
 
@@ -420,12 +432,21 @@ ggml_tensor* Qwen3TtsCodecGraphs::res_unit_(ggml_context* ctx,
 ggml_tensor* Qwen3TtsCodecGraphs::dec_block_(ggml_context* ctx,
                                                 ggml_tensor* x,
                                                 const DecBlock& blk,
-                                                int stride) const {
+                                                int stride,
+                                                int block_idx) const {
+    static const bool dbg = std::getenv("CODEC_DEBUG");
+    auto tag = [&](ggml_tensor* t, const char* name) {
+        if (dbg) { ggml_set_name(t, name); ggml_set_output(t); }
+        return t;
+    };
     x = snake_beta_(ctx, x, blk.snake_a, blk.snake_b);
+    { char nm[48]; snprintf(nm,sizeof(nm),"dbg_blk%d_snake",block_idx); tag(x,nm); }
     x = transposed_conv1d_(ctx, x, blk.tconv_w, blk.tconv_b, stride);
+    { char nm[48]; snprintf(nm,sizeof(nm),"dbg_blk%d_tconv",block_idx); tag(x,nm); }
     static const int dilations[3] = {1, 3, 9};
     for (int u = 0; u < 3; ++u) {
         x = res_unit_(ctx, x, blk.res[u], dilations[u]);
+        char nm[48]; snprintf(nm,sizeof(nm),"dbg_blk%d_res%d",block_idx,u); tag(x,nm);
     }
     return x;
 }
@@ -524,6 +545,13 @@ void Qwen3TtsCodecGraphs::register_weight(ggml_tensor* t,
     weight_srcs_.push_back({t, host_data, nbytes});
 }
 
+const void* Qwen3TtsCodecGraphs::weight_host_data_(const ggml_tensor* t) const {
+    for (const auto& ws : weight_srcs_) {
+        if (ws.tensor == t) return ws.data;
+    }
+    return nullptr;
+}
+
 void Qwen3TtsCodecGraphs::upload_weights_() {
     for (auto& ws : weight_srcs_) {
         if (!ws.tensor->data || !ws.data) continue;
@@ -579,7 +607,8 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
         }
     }
 
-    const int n_samples = T_codec * 1920;
+    const int n_samples = T_codec * 1920;  // approximate; actual may differ (see n_samples_actual)
+    (void)n_samples;
     auto codec_t0 = std::chrono::steady_clock::now();
 
     // ── Build graph ─────────────────────────────────────────────────────
@@ -628,11 +657,24 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
 
     ggml_tensor* h = ggml_add(ctx, emb_first, emb_rest);           // [512, T]
 
+    // ── Debug: tag intermediate tensors for dump ────────────────────────
+    bool dbg = std::getenv("CODEC_DEBUG");
+    auto tag_dbg = [&](ggml_tensor* t, const char* name) {
+        if (dbg) {
+            ggml_set_name(t, name);
+            ggml_set_output(t);
+        }
+        return t;
+    };
+    tag_dbg(h, "dbg_after_rvq");
+
     // ── Step 2: pre_conv (causal_conv1d k=3) ────────────────────────────
     h = causal_conv1d_(ctx, h, pre_conv_w_, pre_conv_b_, 1, 1);    // [1024, T]
+    tag_dbg(h, "dbg_after_preconv");
 
     // ── Step 3: transformer ─────────────────────────────────────────────
     h = ggml_add(ctx, ggml_mul_mat(ctx, xfmr_in_proj_w_, h), xfmr_in_proj_b_);
+    tag_dbg(h, "dbg_after_xfmr_inproj");
     for (size_t il = 0; il < xfmr_layers_.size(); ++il) {
         const XfmrLayer& L = xfmr_layers_[il];
         ggml_tensor* residual = h;
@@ -653,28 +695,44 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
     h = ggml_rms_norm(ctx, h, hp.rms_norm_eps);
     h = ggml_mul(ctx, h, xfmr_norm_w_);
     h = ggml_add(ctx, ggml_mul_mat(ctx, xfmr_out_proj_w_, h), xfmr_out_proj_b_);
+    tag_dbg(h, "dbg_after_xfmr");
 
     // ── Step 4: 2 ConvNeXt upsample stages (each stride 2) ──────────────
     for (int s = 0; s < 2; ++s) {
         h = transposed_conv1d_(ctx, h, up_[s].tconv_w, up_[s].tconv_b, 2);
         h = convnext_block_(ctx, h, up_[s]);
     }
+    tag_dbg(h, "dbg_after_upsample");
 
     // ── Step 5: in_conv (causal_conv1d k=3) → [1536, 4T] ───────────────
     h = causal_conv1d_(ctx, h, in_conv_w_, in_conv_b_, 1, 1);
+    tag_dbg(h, "dbg_after_inconv");
+
+    // Dump after_inconv for HF comparison
+    if (std::getenv("CODEC_DUMP_INCONV")) {
+        ggml_set_output(h);
+    }
 
     // ── Step 6: 4 decoder blocks (strides 8/5/4/3) ─────────────────────
     for (int b = 0; b < 4; ++b) {
-        h = dec_block_(ctx, h, blocks_[b], hp.upsample_rates[b]);
+        h = dec_block_(ctx, h, blocks_[b], hp.upsample_rates[b], b);
+        char nm[32]; snprintf(nm, sizeof(nm), "dbg_after_decblock%d", b);
+        tag_dbg(h, nm);
     }
 
     // ── Step 7: final snake + out_conv (causal_conv1d k=7) + clamp ─────
     h = snake_beta_(ctx, h, out_snake_a_, out_snake_b_);
+    tag_dbg(h, "dbg_after_outsnake");
     h = causal_conv1d_(ctx, h, out_conv_w_, out_conv_b_, 1, 1);
+    tag_dbg(h, "dbg_after_outconv");
     h = ggml_clamp(ctx, h, -1.0f, 1.0f);
 
-    // Reshape [1, 1920·T] → 1D [1920·T].
-    ggml_tensor* waveform = ggml_reshape_1d(ctx, h, n_samples);
+    // Actual output length (may differ from T_codec * 1920 due to per-block
+    // bilateral crop in transposed_conv1d_ matching HF CausalTransConvNet).
+    const int n_samples_actual = (int)h->ne[0] * (int)h->ne[1];
+
+    // Reshape [1, T_audio] → 1D [T_audio].
+    ggml_tensor* waveform = ggml_reshape_1d(ctx, h, n_samples_actual);
     ggml_set_name(waveform, "waveform");
     ggml_set_output(waveform);
 
@@ -710,6 +768,24 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
     // ── Upload inputs ───────────────────────────────────────────────────
     // codes is already (n_q, T_codec) row-major, which matches codes_inp's
     // flat layout (ne[0]=T innermost, ne[1]=n_q outer).
+    if (std::getenv("CODEC_DEBUG")) {
+        std::fprintf(stderr, "[CODEC_DEBUG] codes (n_q=%d, T=%d):\n", n_q, T_codec);
+        for (int q = 0; q < std::min(n_q, 4); ++q) {
+            std::fprintf(stderr, "  cb[%d]:", q);
+            for (int t = 0; t < std::min(T_codec, 20); ++t)
+                std::fprintf(stderr, " %d", codes[q * T_codec + t]);
+            std::fprintf(stderr, "\n");
+        }
+        // Dump codes to binary for HF comparison
+        char cpath[256]; snprintf(cpath, sizeof(cpath), "/tmp/cpp_codes.bin");
+        FILE* cf = std::fopen(cpath, "wb");
+        if (cf) {
+            std::fwrite(codes, sizeof(int32_t), size_t(n_q) * size_t(T_codec), cf);
+            std::fclose(cf);
+            std::fprintf(stderr, "[CODEC_DEBUG] Wrote %d codes to %s\n",
+                         n_q * T_codec, cpath);
+        }
+    }
     ggml_backend_tensor_set(codes_inp, codes, 0,
                              size_t(n_q) * size_t(T_codec) * sizeof(int32_t));
 
@@ -728,8 +804,79 @@ std::vector<float> Qwen3TtsCodecGraphs::decode(const int32_t* codes,
     }
     auto t_read = std::chrono::steady_clock::now();
 
+    // ── Debug: dump after_inconv to binary file for HF comparison ───────
+    if (std::getenv("CODEC_DUMP_INCONV")) {
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+            ggml_tensor* n = ggml_graph_node(graph, i);
+            if (!n || !n->name) continue;
+            if (strcmp(n->name, "dbg_after_inconv") != 0) continue;
+            int64_t n_elem = ggml_nelements(n);
+            std::vector<float> buf(n_elem);
+            ggml_backend_tensor_get(n, buf.data(), 0, n_elem * sizeof(float));
+            FILE* f = std::fopen("/tmp/cpp_after_inconv.bin", "wb");
+            std::fwrite(buf.data(), sizeof(float), n_elem, f);
+            std::fclose(f);
+            std::fprintf(stderr, "[CODEC_DUMP_INCONV] Wrote %lld floats to /tmp/cpp_after_inconv.bin (shape=[%lld,%lld])\n",
+                         (long long)n_elem, (long long)n->ne[0], (long long)n->ne[1]);
+            break;
+        }
+    }
+
+    // ── Debug: dump any tagged tensor to binary ─────────────────────────
+    if (const char* dn = std::getenv("CODEC_DUMP_TENSOR")) {
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+            ggml_tensor* n = ggml_graph_node(graph, i);
+            if (!n || !n->name) continue;
+            if (strcmp(n->name, dn) != 0) continue;
+            int64_t n_elem = ggml_nelements(n);
+            std::vector<float> buf(n_elem);
+            ggml_backend_tensor_get(n, buf.data(), 0, n_elem * sizeof(float));
+            char path[256]; snprintf(path, sizeof(path), "/tmp/cpp_%s.bin", dn);
+            FILE* f = std::fopen(path, "wb");
+            std::fwrite(buf.data(), sizeof(float), n_elem, f);
+            std::fclose(f);
+            std::fprintf(stderr, "[CODEC_DUMP] Wrote %lld floats to %s (shape=[%lld,%lld])\n",
+                         (long long)n_elem, path, (long long)n->ne[0], (long long)n->ne[1]);
+            break;
+        }
+    }
+
+    // ── Debug: dump intermediate tensors ────────────────────────────────
+    if (std::getenv("CODEC_DEBUG")) {
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+            ggml_tensor* n = ggml_graph_node(graph, i);
+            if (!n || !n->name) continue;
+            if (strncmp(n->name, "dbg_", 4) != 0) continue;
+            // Read data from backend
+            int64_t n_elem = ggml_nelements(n);
+            std::vector<float> dbg_buf(n_elem);
+            ggml_backend_tensor_get(n, dbg_buf.data(), 0, n_elem * sizeof(float));
+            // Stats
+            double sum = 0, sum_sq = 0, mn = dbg_buf[0], mx = dbg_buf[0];
+            int n_nan = 0;
+            for (float v : dbg_buf) {
+                if (std::isnan(v)) { n_nan++; continue; }
+                sum += v; sum_sq += (double)v * v;
+                mn = std::min(mn, (double)v); mx = std::max(mx, (double)v);
+            }
+            double mean = sum / n_elem;
+            double std_ = std::sqrt(std::max(0.0, sum_sq / n_elem - mean * mean));
+            // Print first few elements (column 0 = first hidden dim of first time step)
+            int ne0 = (int)n->ne[0];
+            int ne1 = (int)n->ne[1];
+            std::fprintf(stderr, "  [CODEC_DEBUG] %s: shape=[%d,%d] mean=%.6f std=%.6f min=%.6f max=%.6f nan=%d",
+                         n->name, ne0, ne1, mean, std_, mn, mx, n_nan);
+            // Print first 5 values (first dim, first time step)
+            std::fprintf(stderr, " [");
+            for (int j = 0; j < std::min(5, ne0); j++) {
+                std::fprintf(stderr, "%s%.6f", j ? "," : "", dbg_buf[j]);
+            }
+            std::fprintf(stderr, "...]\n");
+        }
+    }
+
     std::vector<float> wav;
-    wav.resize(size_t(n_samples));
+    wav.resize(size_t(n_samples_actual));
     ggml_backend_tensor_get(waveform, wav.data(), 0, wav.size() * sizeof(float));
     auto t_end = std::chrono::steady_clock::now();
 
@@ -770,8 +917,12 @@ void Qwen3TtsCodecGraphs::resolve_cenc_tensors_() {
         E.resblk[i].shortcut.b = tensor_or_null_(p + "short_b");
         E.resblk[i].expand.w   = tensor_or_null_(p + "exp_w");
         E.resblk[i].expand.b   = tensor_or_null_(p + "exp_b");
-        E.ds[i].w = tensor_or_null_(p + "ds." + std::to_string(i) + ".w");
-        E.ds[i].b = tensor_or_null_(p + "ds." + std::to_string(i) + ".b");
+        // Downsample weights live at the seanet root, not under blk.N —
+        // the GGUF stores them as codec.enc.seanet.ds.{i}.{w,b}. Previously
+        // resolved as blk.{i}.ds.{i}.w → null → segfault in causal_conv1d_
+        // (Gap K). Fixed 2026-07-03.
+        E.ds[i].w = tensor_or_null_("codec.enc.seanet.ds." + std::to_string(i) + ".w");
+        E.ds[i].b = tensor_or_null_("codec.enc.seanet.ds." + std::to_string(i) + ".b");
     }
     if (!E.init.w) { enc_present_ = false; return; }
 
@@ -828,12 +979,21 @@ ggml_tensor* Qwen3TtsCodecGraphs::build_cenc_seanet_(ggml_context* ctx,
     const EncSEANet& E = enc_seanet_;
     ggml_tensor* h = causal_conv1d_(ctx, pcm, E.init.w, E.init.b, 1, 1);
     h = ggml_elu(ctx, h);
+    // Each of the 4 blocks is a bottleneck residual:
+    //   h[C] → short(3-tap, C→C/2) → r[C/2] → exp(1-tap, C/2→C) → e[C] → h + e
+    // short_w ne=[3, C, C/2], exp_w ne=[1, C/2, C] (verified for all 4 blocks).
+    // Both convs must go through causal_conv1d_, which transposes codec [C,T]
+    // to ggml [T,C], left-pads by K-1, and adds the bias. The raw ggml_conv_1d
+    // previously used for `expand` (Gap K): (1) skipped the transpose so ggml
+    // read variable T as the channel count and tripped its ne[1] assertion, and
+    // (2) fed h (C channels) to a conv whose weight expects the halved C/2
+    // output of `short`. Fixed 2026-07-03.
     for (int i = 0; i < 4; ++i) {
         ggml_tensor* r = causal_conv1d_(ctx, h, E.resblk[i].shortcut.w,
                                          E.resblk[i].shortcut.b, 1, 1);
-        ggml_tensor* e = ggml_conv_1d(ctx, h, E.resblk[i].expand.w, 0, 1, 1);
-        if (E.resblk[i].expand.b) e = ggml_add(ctx, e, E.resblk[i].expand.b);
-        h = ggml_add(ctx, r, e);
+        ggml_tensor* e = causal_conv1d_(ctx, r, E.resblk[i].expand.w,
+                                         E.resblk[i].expand.b, 1, 1);
+        h = ggml_add(ctx, h, e);
         h = ggml_elu(ctx, h);
         const int s = (i == 0) ? 4 : (i == 1) ? 5 : (i == 2) ? 6 : 8;
         h = causal_conv1d_(ctx, h, E.ds[i].w, E.ds[i].b, s, 1);
@@ -858,8 +1018,8 @@ ggml_tensor* Qwen3TtsCodecGraphs::build_cenc_xfmr_(ggml_context* ctx,
     ggml_set_name(mask, "cenc_mask");
     ggml_set_input(mask);
 
-    const int hd = (int)hp.head_dim;
-    const int n_q = (int)hp.n_heads;
+    const int hd = (int)hp.enc_head_dim;
+    const int n_q = (int)hp.enc_n_heads;
     const int n_ctx_o = (int)hp.max_pos;
     const float theta = hp.rope_theta;
     const float scale = 1.0f / std::sqrt((float)hd);
@@ -909,11 +1069,17 @@ ggml_tensor* Qwen3TtsCodecGraphs::build_cenc_xfmr_(ggml_context* ctx,
     return x;
 }
 
-// ── build_cenc_downsample: stride-2 conv with replicate padding ────────────
+// ── build_cenc_downsample: causal stride-2 conv (K=4) ──────────────────────
+// Drops the post-transformer frame rate to the acoustic-codebook rate.
+// Uses causal_conv1d_ (left-pad K-1-(s-1)=2, output T/2) rather than the
+// previous cenc_conv1d_ext_, which allocated a replicate-padded input tensor
+// but never filled it — so the conv ran on uninitialized memory. causal_conv1d_
+// builds the pad as a real graph op (ggml_pad_ext), so it is computed, not a
+// dangling leaf.
 ggml_tensor* Qwen3TtsCodecGraphs::build_cenc_downsample_(ggml_context* ctx,
                                                            ggml_tensor* x) const {
     if (!enc_ds_.w) return x;
-    return cenc_conv1d_ext_(ctx, x, enc_ds_.w, nullptr, 2, true);
+    return causal_conv1d_(ctx, x, enc_ds_.w, nullptr, 2, 1);
 }
 
 // ── cenc_rvq_encode: CPU RVQ quantize ──────────────────────────────────────
@@ -940,19 +1106,6 @@ bool Qwen3TtsCodecGraphs::cenc_rvq_encode_(const float* emb, int32_t T_frames,
         return best;
     };
 
-    auto matmul = [](const float* x, const float* w, int C_in, int C_out,
-                     int T, float* out) {
-        for (int t = 0; t < T; ++t) {
-            for (int o = 0; o < C_out; ++o) {
-                float s = 0.0f;
-                for (int i = 0; i < C_in; ++i)
-                    s += x[size_t(t) * size_t(C_in) + i] *
-                         w[size_t(o) + size_t(i) * size_t(C_out)];
-                out[size_t(t) * size_t(C_out) + o] = s;
-            }
-        }
-    };
-
     // Transpose emb from [C, T] to [T, C] for CPU matmul
     std::vector<float> emb_T(size_t(T_frames) * C_emb);
     for (int t = 0; t < T_frames; ++t)
@@ -961,26 +1114,51 @@ bool Qwen3TtsCodecGraphs::cenc_rvq_encode_(const float* emb, int32_t T_frames,
 
     std::vector<float> z(size_t(T_frames) * d_half);
 
+    // RVQ weights live outside any compute graph (this function is pure CPU),
+    // so gallocr never assigns them a backend buffer and tensor->data is NULL.
+    // The loader registered their GGUF mmap host pointers in weight_srcs_;
+    // recover them here. in_w are pointwise-conv weights [K=1, C_in, C_out],
+    // so C_in = ne[1], C_out = ne[2]. Codebooks are [dim, count], so
+    // count = ne[1] (was ne[0] — only searched 256 of 2048 entries). The
+    // matmul indexing must match the conv-weight layout w[i + C_in*o].
+    auto getf = [this](const ggml_tensor* t) -> const float* {
+        return (const float*)weight_host_data_(t);
+    };
+    // matmul: out[t,o] = Σ_i x[t,i] · w[i + C_in·o]   (conv-weight [1,Cin,Cout])
+    auto matmul_conv = [](const float* x, const float* w, int C_in, int C_out,
+                          int T, float* out) {
+        for (int t = 0; t < T; ++t) {
+            const float* xt = x + size_t(t) * size_t(C_in);
+            float* ot = out + size_t(t) * size_t(C_out);
+            for (int o = 0; o < C_out; ++o) {
+                const float* wo = w + size_t(o) * size_t(C_in);
+                float s = 0.0f;
+                for (int i = 0; i < C_in; ++i) s += xt[i] * wo[i];
+                ot[o] = s;
+            }
+        }
+    };
+
     // Semantic book (codebook 0): project 512->256, NN search
-    const float* siw = (const float*)enc_rvq_.sem_in_w->data;
-    const int sid = (int)enc_rvq_.sem_in_w->ne[1];
-    const int sod = (int)enc_rvq_.sem_in_w->ne[0];
-    matmul(emb_T.data(), siw, sid, sod, T_frames, z.data());
-    const float* scb = (const float*)enc_rvq_.sem_cb->data;
-    const int scs = (int)enc_rvq_.sem_cb->ne[0];
+    const float* siw = getf(enc_rvq_.sem_in_w);
+    const int   sid  = (int)enc_rvq_.sem_in_w->ne[1];   // C_in  = 512
+    const int   sod  = (int)enc_rvq_.sem_in_w->ne[2];   // C_out = 256
+    matmul_conv(emb_T.data(), siw, sid, sod, T_frames, z.data());
+    const float* scb = getf(enc_rvq_.sem_cb);
+    const int    scs = (int)enc_rvq_.sem_cb->ne[1];     // count = 2048
     for (int t = 0; t < T_frames; ++t)
         (*codes_out)[t] = rvq_nn(&z[size_t(t) * d_half], scb, scs, d_half);
 
     // Acoustic books (1..15): project 512->256, residual NN search
-    const float* aiw = (const float*)enc_rvq_.ac_in_w->data;
-    const int aid = (int)enc_rvq_.ac_in_w->ne[1];
-    const int aod = (int)enc_rvq_.ac_in_w->ne[0];
-    matmul(emb_T.data(), aiw, aid, aod, T_frames, z.data());
+    const float* aiw = getf(enc_rvq_.ac_in_w);
+    const int   aid  = (int)enc_rvq_.ac_in_w->ne[1];    // C_in  = 512
+    const int   aod  = (int)enc_rvq_.ac_in_w->ne[2];    // C_out = 256
+    matmul_conv(emb_T.data(), aiw, aid, aod, T_frames, z.data());
 
     for (int q = 1; q < 16; ++q) {
         const int q_idx = q - 1;
-        const float* cb = (const float*)enc_rvq_.ac_cb[q_idx]->data;
-        const int cbs = (int)enc_rvq_.ac_cb[q_idx]->ne[0];
+        const float* cb  = getf(enc_rvq_.ac_cb[q_idx]);
+        const int    cbs = (int)enc_rvq_.ac_cb[q_idx]->ne[1];  // count = 2048
         for (int t = 0; t < T_frames; ++t) {
             int code = rvq_nn(&z[size_t(t) * d_half], cb, cbs, d_half);
             (*codes_out)[size_t(q) * T_frames + t] = code;
@@ -1011,7 +1189,12 @@ std::vector<int32_t> Qwen3TtsCodecGraphs::encode(const float* pcm,
     ctx = ggml_init(params);
     if (!ctx) throw std::runtime_error("Qwen3TtsCodecGraphs::encode: ggml_init failed");
 
-    struct ggml_tensor* pcm_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_pad, 1);
+    // PCM input: codec convention ne=[C, T] → ne[0]=1 (mono), ne[1]=T_pad.
+    // Previously created as (T_pad, 1) which swapped C and T, causing
+    // causal_conv1d_ to feed im2col a [1, T_pad] transposed view where
+    // ne[1]=T_pad was read as the channel count and tripped the assertion
+    // against init_w's C_in=1. Fixed 2026-07-03 (Gap K).
+    struct ggml_tensor* pcm_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, T_pad);
     ggml_set_name(pcm_t, "cenc_pcm");
     ggml_set_input(pcm_t);
 

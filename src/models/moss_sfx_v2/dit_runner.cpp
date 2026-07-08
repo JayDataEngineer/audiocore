@@ -69,6 +69,9 @@ static void timestep_sinusoidal(const float* t, float* out,
 }
 
 // ── GELU (tanh approximation) ────────────────────────────────────────────
+// 0.5 * x * (1 + tanh(inner)) = 0.5 * (x + x * tanh(inner))
+// Reformulated algebraically to avoid needing a constant 1.0 tensor
+// (ggml_new_tensor without ggml_set_input has UNINITIALIZED data → bug).
 static ggml_tensor* gelu_tanh(ggml_context* ctx, ggml_tensor* x) {
     const float s = std::sqrt(2.0f / (float)M_PI);
     const float c = 0.044715f;
@@ -76,18 +79,21 @@ static ggml_tensor* gelu_tanh(ggml_context* ctx, ggml_tensor* x) {
     ggml_tensor* inner = ggml_scale(ctx,
         ggml_add(ctx, x, ggml_scale(ctx, x3, c)), s);
     ggml_tensor* th = ggml_tanh(ctx, inner);
-    return ggml_mul(ctx,
-        ggml_scale(ctx, x, 0.5f),
-        ggml_add(ctx, th, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1)));
+    return ggml_scale(ctx,
+        ggml_add(ctx, x, ggml_mul(ctx, x, th)), 0.5f);
 }
 
 // ── FFN: Linear(dim, 2*ffn_dim) → GELU_tanh → Linear(2*ffn_dim, dim) ────
 static ggml_tensor* ffn_gelu(ggml_context* ctx, ggml_tensor* x,
-                               ggml_tensor* w0, ggml_tensor* w2) {
+                               ggml_tensor* w0, ggml_tensor* w2,
+                               ggml_tensor* b0 = nullptr, ggml_tensor* b2 = nullptr) {
     if (!w0 || !w2) return nullptr;
     auto h = ggml_mul_mat(ctx, w0, x);
+    if (b0) h = ggml_add(ctx, h, ggml_repeat(ctx, b0, h));
     h = gelu_tanh(ctx, h);
-    return ggml_mul_mat(ctx, w2, h);
+    auto out = ggml_mul_mat(ctx, w2, h);
+    if (b2) out = ggml_add(ctx, out, ggml_repeat(ctx, b2, out));
+    return out;
 }
 
 // ── Zero-context fallback buffer (shared across all callers) ───────────
@@ -96,59 +102,59 @@ static std::vector<float>& get_zero_ctx() {
     return z;
 }
 
-// ── QK-norm (RMS norm per-head + learned scale) ───────────────────────────
+// ── QK-norm (RMS norm over FULL channel dim + learned scale) ──────────────
+// Python RMSNorm(dim=nh*hd) normalizes over the full channel dim, NOT per-head.
+// Using 2D reshape [nh*hd, T] so ggml_rms_norm normalizes over ne[0]=nh*hd.
 static ggml_tensor* apply_qk_norm(ggml_context* ctx, ggml_tensor* t,
                                     int hd, int nh, ggml_tensor* norm_w) {
     if (!norm_w) return t;
     int64_t T = ggml_nelements(t) / (static_cast<int64_t>(hd) * nh);
-    ggml_tensor* t3d = ggml_reshape_3d(ctx, t, hd, nh, T);
-    t3d = ggml_rms_norm(ctx, t3d, 1e-6f);
-    ggml_tensor* nw = ggml_reshape_3d(ctx, norm_w, hd, nh, 1);
-    nw = ggml_repeat(ctx, nw, t3d);
-    t3d = ggml_mul(ctx, t3d, nw);
-    return ggml_reshape_2d(ctx, t3d, nh * hd, T);
+    // 2D: [nh*hd, T] — rms_norm over ne[0]=nh*hd (full dim, matching Python).
+    ggml_tensor* t2d = ggml_view_2d(ctx, t, nh * hd, (int32_t)T,
+                                     nh * hd * sizeof(float), 0);
+    t2d = ggml_rms_norm(ctx, t2d, 1e-6f);
+    // norm_w is [nh*hd] — reshape to [nh*hd, 1] and repeat across T.
+    ggml_tensor* nw = ggml_view_1d(ctx, norm_w, nh * hd, 0);
+    nw = ggml_reshape_2d(ctx, nw, nh * hd, 1);
+    nw = ggml_repeat(ctx, nw, t2d);
+    t2d = ggml_mul(ctx, t2d, nw);
+    return t2d;
 }
 
-// ── 3D RoPE in-place (Python precompute_freqs_cis_3d matching) ──────────
-//    Splits head_dim=128 into 3 groups (44+42+42) with dim=44/42/42
-//    frequency schedules. Applies ggml_rope_ext_inplace on each group's
-//    view and expands the nodes into the graph for correct CUDA ordering.
+// ── 1D RoPE for audio (matches Python precompute_freqs_cis_1d exactly) ──
+//    Python (wan_audio_dit.py:WanAudioModel) uses vae_type="dac":
+//      freqs = precompute_freqs_cis(head_dim=128, end, theta=10000)
+//      freqs_cis_0, freqs_cis_1, freqs_cis_2 = freqs.chunk(3, dim=-1)
+//    In forward, all 3 chunks use position indices [0..f-1] and are
+//    concatenated back → identical to applying the full 128-dim RoPE
+//    with theta^(-2j/128).  ggml_rope_ext with n_dims=hd reproduces this.
 static void apply_rope_3d(ggml_context* ctx, ggml_tensor* t,
                            ggml_tensor* pos, int hd, int nh, int T,
                            ggml_cgraph* gf) {
     if (!t) return;
-    auto rope = [&](ggml_tensor* v, int nd) {
-        return ggml_rope_ext_inplace(ctx, v, pos, nullptr,
-            nd, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    };
-    auto mkview = [&](int off, int nd) {
-        return ggml_view_3d(ctx, t, nd, nh, T,
-            static_cast<int64_t>(hd) * 4,
-            static_cast<int64_t>(hd) * nh * 4,
-            static_cast<size_t>(off) * 4);
-    };
-    auto r0 = rope(mkview(0, 44), 44);
-    auto r1 = rope(mkview(44, 42), 42);
-    auto r2 = rope(mkview(86, 42), 42);
-    if (gf) {
-        ggml_build_forward_expand(gf, r0);
-        ggml_build_forward_expand(gf, r1);
-        ggml_build_forward_expand(gf, r2);
-    }
+    auto r = ggml_rope_ext_inplace(ctx, t, pos, nullptr,
+        hd,  // n_dims = full head_dim (128): theta^(-2j/128)
+        0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    if (gf) ggml_build_forward_expand(gf, r);
 }
 
-// ── Self-attention (QK-norm + 3D RoPE) ───────────────────────────────────
+// ── Self-attention (QK-norm + 1D RoPE) ───────────────────────────────────
 static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
                                 int T, int H, int nh, int hd,
                                 ggml_tensor* q_w, ggml_tensor* k_w,
                                 ggml_tensor* v_w, ggml_tensor* o_w,
+                                ggml_tensor* q_b, ggml_tensor* k_b,
+                                ggml_tensor* v_b, ggml_tensor* o_b,
                                 ggml_tensor* q_norm_w, ggml_tensor* k_norm_w,
                                 ggml_tensor* pos, ggml_cgraph* gf) {
     if (!q_w || !k_w || !v_w) return nullptr;
 
     auto q = ggml_mul_mat(ctx, q_w, x);
+    if (q_b) q = ggml_add(ctx, q, ggml_repeat(ctx, q_b, q));
     auto k = ggml_mul_mat(ctx, k_w, x);
+    if (k_b) k = ggml_add(ctx, k, ggml_repeat(ctx, k_b, k));
     auto v = ggml_mul_mat(ctx, v_w, x);
+    if (v_b) v = ggml_add(ctx, v, ggml_repeat(ctx, v_b, v));
 
     q = apply_qk_norm(ctx, q, hd, nh, q_norm_w);
     k = apply_qk_norm(ctx, k, hd, nh, k_norm_w);
@@ -174,20 +180,30 @@ static ggml_tensor* self_attn(ggml_context* ctx, ggml_tensor* x,
     auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(a, GGML_PREC_DEFAULT);
 
+    // ggml_flash_attn_ext returns [hd, nh, T, 1] (verified in ggml.c:5391):
+    //   ne = {v->ne[0], q->ne[2], q->ne[1], q->ne[3]}
+    // Data is contiguous, ordered (d, h, t) — reshape_2d(nh*hd, T) correctly
+    // maps c=h*hd+d for each timestep. Do NOT permute (would scramble heads/T).
     a = ggml_reshape_2d(ctx, a, nh * hd, T);
-    if (o_w) a = ggml_mul_mat(ctx, o_w, a);
+    if (o_w) {
+        a = ggml_mul_mat(ctx, o_w, a);
+        if (o_b) a = ggml_add(ctx, a, ggml_repeat(ctx, o_b, a));
+    }
     return a;
 }
 
-// ── Cross-attention (QK-norm + RoPE on Q from x, K from context) ────────
+// ── Cross-attention (QK-norm, NO RoPE — matches Python CrossAttention) ───
+// Python wan_video_dit.py:CrossAttention.forward does NOT call rope_apply.
 static ggml_tensor* cross_attn(ggml_context* ctx, ggml_tensor* x,
                                  ggml_tensor* cond, int T, int T_cond,
                                  int H, int nh, int hd,
                                  ggml_tensor* ca_q, ggml_tensor* ca_k,
                                  ggml_tensor* ca_v, ggml_tensor* ca_o,
+                                 ggml_tensor* ca_qb, ggml_tensor* ca_kb,
+                                 ggml_tensor* ca_vb, ggml_tensor* ca_ob,
                                  ggml_tensor* q_norm_w, ggml_tensor* k_norm_w,
-                                 ggml_tensor* pos_q, ggml_tensor* pos_k,
-                                 ggml_cgraph* gf) {
+                                 ggml_tensor* /*pos_q*/, ggml_tensor* /*pos_k*/,
+                                 ggml_cgraph* /*gf*/) {
     if (!ca_q || !ca_k || !ca_v || !ca_o || !cond) return nullptr;
 
     auto rsh = [&](ggml_tensor* t, int n_h, int len) {
@@ -196,24 +212,16 @@ static ggml_tensor* cross_attn(ggml_context* ctx, ggml_tensor* x,
     };
 
     auto q_lin = ggml_mul_mat(ctx, ca_q, x);
+    if (ca_qb) q_lin = ggml_add(ctx, q_lin, ggml_repeat(ctx, ca_qb, q_lin));
     auto k_lin = ggml_mul_mat(ctx, ca_k, cond);
+    if (ca_kb) k_lin = ggml_add(ctx, k_lin, ggml_repeat(ctx, ca_kb, k_lin));
     auto v_lin = ggml_mul_mat(ctx, ca_v, cond);
+    if (ca_vb) v_lin = ggml_add(ctx, v_lin, ggml_repeat(ctx, ca_vb, v_lin));
 
     q_lin = apply_qk_norm(ctx, q_lin, hd, nh, q_norm_w);
     k_lin = apply_qk_norm(ctx, k_lin, hd, nh, k_norm_w);
 
-    // 3D RoPE on Q (using pos_q)
-    {
-        auto q_3d = ggml_reshape_3d(ctx, q_lin, hd, nh, T);
-        apply_rope_3d(ctx, q_3d, pos_q, hd, nh, T, gf);
-        q_lin = ggml_reshape_2d(ctx, q_3d, nh * hd, T);
-    }
-    // 3D RoPE on K (using pos_k)
-    if (T_cond > 0) {
-        auto k_3d = ggml_reshape_3d(ctx, k_lin, hd, nh, T_cond);
-        apply_rope_3d(ctx, k_3d, pos_k, hd, nh, T_cond, gf);
-        k_lin = ggml_reshape_2d(ctx, k_3d, nh * hd, T_cond);
-    }
+    // NO RoPE on cross-attention — Python CrossAttention.forward skips it.
 
     auto q = rsh(q_lin, nh, T);
     auto k = rsh(k_lin, nh, T_cond);
@@ -222,8 +230,11 @@ static ggml_tensor* cross_attn(ggml_context* ctx, ggml_tensor* x,
     float s = 1.0f / std::sqrt(static_cast<float>(hd));
     auto a = ggml_flash_attn_ext(ctx, q, k, v, nullptr, s, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(a, GGML_PREC_DEFAULT);
+    // flash_attn returns [hd, nh, T, 1] — reshape directly (NO permute).
+    // See self_attn comment for the shape contract proof.
     a = ggml_reshape_2d(ctx, a, nh * hd, T);
     a = ggml_mul_mat(ctx, ca_o, a);
+    if (ca_ob) a = ggml_add(ctx, a, ggml_repeat(ctx, ca_ob, a));
     return a;
 }
 
@@ -233,6 +244,22 @@ static ggml_tensor* cross_attn(ggml_context* ctx, ggml_tensor* x,
 
 DiTRunner::DiTRunner(ggml_context* ext_ctx, const DitConfig& cfg)
     : ext_ctx_(ext_ctx), cfg_(cfg) {
+    // Helper: convert any ggml tensor to F32 vector
+    auto tensor_to_f32 = [](ggml_tensor* t, std::vector<float>& out) {
+        if (!t) return;
+        int n = static_cast<int>(ggml_nelements(t));
+        out.resize(n);
+        if (t->type == GGML_TYPE_F32) {
+            std::memcpy(out.data(), t->data, n * sizeof(float));
+        } else if (t->type == GGML_TYPE_BF16) {
+            bf16_buf_to_f32(t->data, out.data(), n);
+        } else if (t->type == GGML_TYPE_F16) {
+            const ggml_fp16_t* src = (const ggml_fp16_t*) t->data;
+            for (int i = 0; i < n; i++)
+                out[i] = ggml_fp16_to_fp32(src[i]);
+        }
+    };
+
     if (cfg_.n_layers > 0) {
         modulation_f32_.resize(cfg_.n_layers);
         for (int i = 0; i < cfg_.n_layers; i++) {
@@ -240,21 +267,15 @@ DiTRunner::DiTRunner(ggml_context* ext_ctx, const DitConfig& cfg)
             std::snprintf(buf, sizeof(buf),
                           "moss_sfx_v2.blocks.%d.modulation", i);
             ggml_tensor* mod = ggml_get_tensor(ext_ctx_, buf);
-            if (mod && mod->type == GGML_TYPE_BF16) {
-                int n = static_cast<int>(ggml_nelements(mod));
-                modulation_f32_[i].resize(n);
-                bf16_buf_to_f32(mod->data, modulation_f32_[i].data(), n);
-            }
+            tensor_to_f32(mod, modulation_f32_[i]);
         }
     }
     {
         ggml_tensor* hmod = ggml_get_tensor(ext_ctx_,
             "moss_sfx_v2.head.modulation");
-        if (hmod && hmod->type == GGML_TYPE_BF16) {
-            int n = static_cast<int>(ggml_nelements(hmod));
-            head_modulation_f32_.resize(n);
-            bf16_buf_to_f32(hmod->data, head_modulation_f32_.data(), n);
-        }
+        tensor_to_f32(hmod, head_mod_param_f32_);
+        if (!head_mod_param_f32_.empty())
+            head_modulation_f32_.resize(head_mod_param_f32_.size());
     }
 }
 
@@ -308,30 +329,48 @@ void DiTRunner::compute_modulation(const float* temb, int temb_dim,
         }
     }
 
-    // time_embedding.2: Linear(dim, dim) → SiLU
-    std::vector<float> buf1(static_cast<size_t>(H));
+    // time_embedding.2: Linear(dim, dim) — NO SiLU after this!
+    // Python: time_embedding = Linear→SiLU→Linear (no final SiLU)
+    // The SiLU is in time_projection: SiLU→Linear
+    // temb (buf1_raw) is used DIRECTLY by the head: head.modulation + temb
+    std::vector<float> buf1_raw(static_cast<size_t>(H));
     if (cpu_te2_w_.empty()) {
-        for (int j = 0; j < H; j++) buf1[(size_t)j] = 0.0f;
+        for (int j = 0; j < H; j++) buf1_raw[(size_t)j] = 0.0f;
     } else {
         for (int j = 0; j < H; j++) {
             float sum = 0.0f;
             for (int i = 0; i < H; i++)
                 sum += cpu_te2_w_[(size_t)j * H + i] * buf0[(size_t)i];
             if (!cpu_te2_b_.empty()) sum += cpu_te2_b_[(size_t)j];
-            buf1[(size_t)j] = sum / (1.0f + std::exp(-sum));
+            buf1_raw[(size_t)j] = sum;  // NO SiLU — this is temb
         }
     }
 
-    // time_projection.1: Linear(dim, dim*6)
+    // time_projection: SiLU(temb) → Linear(dim, dim*6)
+    // Python: time_projection = Sequential(SiLU, Linear)
+    std::vector<float> buf1_silu(static_cast<size_t>(H));
+    for (int j = 0; j < H; j++) {
+        float v = buf1_raw[(size_t)j];
+        buf1_silu[(size_t)j] = v / (1.0f + std::exp(-v));  // SiLU(temb)
+    }
     if (cpu_tp_w_.empty()) {
         for (int j = 0; j < H * 6; j++) mod_buf[j] = 0.0f;
     } else {
         for (int j = 0; j < H * 6; j++) {
             float sum = 0.0f;
             for (int i = 0; i < H; i++)
-                sum += cpu_tp_w_[(size_t)j * H + i] * buf1[(size_t)i];
+                sum += cpu_tp_w_[(size_t)j * H + i] * buf1_silu[(size_t)i];
             if (!cpu_tp_b_.empty()) sum += cpu_tp_b_[(size_t)j];
             mod_buf[j] = sum;
+        }
+    }
+
+    // Compute head modulation: head.modulation[2*H] + temb[H] (NOT SiLU(temb))
+    // Python: shift, scale = (head.modulation + temb).chunk(2, dim=1)
+    if (!head_modulation_f32_.empty() && head_modulation_f32_.size() >= static_cast<size_t>(H) * 2) {
+        for (int j = 0; j < H; j++) {
+            head_modulation_f32_[j]          = head_mod_param_f32_[j]          + buf1_raw[(size_t)j];
+            head_modulation_f32_[H + j]      = head_mod_param_f32_[H + j]      + buf1_raw[(size_t)j];
         }
     }
 }
@@ -477,7 +516,7 @@ bool DiTRunner::run_one_forward(
                 ctx_emb = ggml_mul_mat(ctx, w, ctx_emb);
                 if (b) ctx_emb = ggml_add(ctx, ctx_emb, ggml_repeat(ctx, b, ctx_emb));
             }
-            ctx_emb = ggml_gelu(ctx, ctx_emb);
+            ctx_emb = gelu_tanh(ctx, ctx_emb);  // Python uses nn.GELU(approximate='tanh')
 
             w = weight("moss_sfx_v2.text_embedding.2.weight");
             b = weight("moss_sfx_v2.text_embedding.2.bias");
@@ -506,12 +545,9 @@ bool DiTRunner::run_one_forward(
             }
         }
 
-        // ── 3. RoPE position arrays ───────────────────────────────────
+        // ── 3. RoPE position array (self-attn only; cross-attn has NO RoPE) ──
         cg_.pos_q = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_latent);
         ggml_set_input(cg_.pos_q);
-
-        cg_.pos_k = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ct_effective);
-        ggml_set_input(cg_.pos_k);
 
         // ── 4. DiT layers ─────────────────────────────────────────────
         cg_.mod_tensors.resize(static_cast<size_t>(n_lyr) * 6);
@@ -546,18 +582,18 @@ bool DiTRunner::run_one_forward(
             auto gate2  = cg_.mod_tensors[mbase + 5];
 
             // ── 4a. Self-attention ────────────────────────────────────
+            // Python: modulate(self.norm1(x), shift_msa, scale_msa)
+            // norm1 is LayerNorm WITHOUT affine (elementwise_affine=False).
             {
-                auto h = ggml_rms_norm(ctx, cur, eps);
-                std::snprintf(buf, sizeof(buf),
-                              "moss_sfx_v2.blocks.%d.norm1.weight", i);
-                auto nw = ggml_get_tensor(ext_ctx, buf);
-                if (nw) h = ggml_mul(ctx, h, ggml_repeat(ctx, nw, h));
+                auto h = ggml_norm(ctx, cur, eps);  // LayerNorm (mean-subtracted)
+                // norm1 has no weight (affine=False), skip multiplication
 
-                h = ggml_add(ctx,
-                    ggml_mul(ctx, h, ggml_add(ctx,
-                        ggml_repeat(ctx, scale1, h),
-                        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1))),
-                    ggml_repeat(ctx, shift1, h));
+                // modulate: h * (1 + scale1) + shift1 = h + (h * scale1 + shift1)
+                // Algebraic reformulation avoids uninitialized constant 1.0 tensor.
+                h = ggml_add(ctx, h,
+                    ggml_add(ctx,
+                        ggml_mul(ctx, h, ggml_repeat(ctx, scale1, h)),
+                        ggml_repeat(ctx, shift1, h)));
 
                 std::snprintf(buf, sizeof(buf),
                               "moss_sfx_v2.blocks.%d.self_attn.q.weight", i);
@@ -572,6 +608,18 @@ bool DiTRunner::run_one_forward(
                               "moss_sfx_v2.blocks.%d.self_attn.o.weight", i);
                 auto o_w = ggml_get_tensor(ext_ctx, buf);
                 std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.self_attn.q.bias", i);
+                auto q_b = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.self_attn.k.bias", i);
+                auto k_b = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.self_attn.v.bias", i);
+                auto v_b = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.self_attn.o.bias", i);
+                auto o_b = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
                               "moss_sfx_v2.blocks.%d.self_attn.norm_q.weight", i);
                 auto qn_w = ggml_get_tensor(ext_ctx, buf);
                 std::snprintf(buf, sizeof(buf),
@@ -579,7 +627,9 @@ bool DiTRunner::run_one_forward(
                 auto kn_w = ggml_get_tensor(ext_ctx, buf);
 
                 auto sa = self_attn(ctx, h, T_latent, H, nh, hd,
-                                    q_w, k_w, v_w, o_w, qn_w, kn_w,
+                                    q_w, k_w, v_w, o_w,
+                                    q_b, k_b, v_b, o_b,
+                                    qn_w, kn_w,
                                     cg_.pos_q, cg_.gf);
                 if (sa)
                     cur = ggml_add(ctx, cur,
@@ -587,8 +637,22 @@ bool DiTRunner::run_one_forward(
             }
 
             // ── 4b. Cross-attention ──────────────────────────────────
+            // Python: x = x + self.cross_attn(self.norm3(x), context)
+            // norm3 is LayerNorm WITH affine (weight+bias). NO gate on cross-attn.
             {
                 int c_len = static_cast<int>(ctx_emb->ne[1]);
+
+                // Apply norm3 (LayerNorm with weight + bias) before cross-attn
+                auto cn = ggml_norm(ctx, cur, eps);  // LayerNorm (mean-subtracted)
+                std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.norm3.weight", i);
+                auto cnw = ggml_get_tensor(ext_ctx, buf);
+                if (cnw) cn = ggml_mul(ctx, cn, ggml_repeat(ctx, cnw, cn));
+                std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.norm3.bias", i);
+                auto cnb = ggml_get_tensor(ext_ctx, buf);
+                if (cnb) cn = ggml_add(ctx, cn, ggml_repeat(ctx, cnb, cn));
+
                 std::snprintf(buf, sizeof(buf),
                               "moss_sfx_v2.blocks.%d.cross_attn.q.weight", i);
                 auto ca_q = ggml_get_tensor(ext_ctx, buf);
@@ -602,45 +666,62 @@ bool DiTRunner::run_one_forward(
                               "moss_sfx_v2.blocks.%d.cross_attn.o.weight", i);
                 auto ca_o = ggml_get_tensor(ext_ctx, buf);
                 std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.cross_attn.q.bias", i);
+                auto ca_qb = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.cross_attn.k.bias", i);
+                auto ca_kb = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.cross_attn.v.bias", i);
+                auto ca_vb = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.cross_attn.o.bias", i);
+                auto ca_ob = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
                               "moss_sfx_v2.blocks.%d.cross_attn.norm_q.weight", i);
                 auto ca_qn = ggml_get_tensor(ext_ctx, buf);
                 std::snprintf(buf, sizeof(buf),
                               "moss_sfx_v2.blocks.%d.cross_attn.norm_k.weight", i);
                 auto ca_kn = ggml_get_tensor(ext_ctx, buf);
 
-                auto ca = cross_attn(ctx, cur, ctx_emb,
+                auto ca = cross_attn(ctx, cn, ctx_emb,
                                       T_latent, c_len, H, nh, hd,
                                       ca_q, ca_k, ca_v, ca_o,
+                                      ca_qb, ca_kb, ca_vb, ca_ob,
                                       ca_qn, ca_kn,
-                                      cg_.pos_q, cg_.pos_k,
+                                      nullptr, nullptr,
                                       cg_.gf);
+                // NO gate on cross-attention (Python: x = x + cross_attn_out)
                 if (ca)
-                    cur = ggml_add(ctx, cur,
-                        ggml_mul(ctx, ca, ggml_repeat(ctx, gate1, ca)));
+                    cur = ggml_add(ctx, cur, ca);
             }
 
             // ── 4c. FFN ──────────────────────────────────────────────
+            // Python: modulate(self.norm2(x), shift_mlp, scale_mlp)
+            // norm2 is LayerNorm WITHOUT affine (no weight/bias).
             {
-                auto h = ggml_rms_norm(ctx, cur, eps);
-                std::snprintf(buf, sizeof(buf),
-                              "moss_sfx_v2.blocks.%d.norm3.weight", i);
-                auto nw = ggml_get_tensor(ext_ctx, buf);
-                if (nw) h = ggml_mul(ctx, h, ggml_repeat(ctx, nw, h));
+                auto h = ggml_norm(ctx, cur, eps);  // LayerNorm (no affine)
 
-                h = ggml_add(ctx,
-                    ggml_mul(ctx, h, ggml_add(ctx,
-                        ggml_repeat(ctx, scale2, h),
-                        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1))),
-                    ggml_repeat(ctx, shift2, h));
+                // modulate: h * (1 + scale2) + shift2 = h + (h * scale2 + shift2)
+                h = ggml_add(ctx, h,
+                    ggml_add(ctx,
+                        ggml_mul(ctx, h, ggml_repeat(ctx, scale2, h)),
+                        ggml_repeat(ctx, shift2, h)));
 
                 std::snprintf(buf, sizeof(buf),
                               "moss_sfx_v2.blocks.%d.ffn.0.weight", i);
                 auto ffn_w0 = ggml_get_tensor(ext_ctx, buf);
                 std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.ffn.0.bias", i);
+                auto ffn_b0 = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
                               "moss_sfx_v2.blocks.%d.ffn.2.weight", i);
                 auto ffn_w2 = ggml_get_tensor(ext_ctx, buf);
+                std::snprintf(buf, sizeof(buf),
+                              "moss_sfx_v2.blocks.%d.ffn.2.bias", i);
+                auto ffn_b2 = ggml_get_tensor(ext_ctx, buf);
 
-                auto ff = ffn_gelu(ctx, h, ffn_w0, ffn_w2);
+                auto ff = ffn_gelu(ctx, h, ffn_w0, ffn_w2, ffn_b0, ffn_b2);
                 if (ff)
                     cur = ggml_add(ctx, cur,
                         ggml_mul(ctx, ff, ggml_repeat(ctx, gate2, ff)));
@@ -648,24 +729,29 @@ bool DiTRunner::run_one_forward(
         }
 
         // ── 5. Head ──────────────────────────────────────────────────
+        // Python Head.forward:
+        //   shift, scale = (self.modulation + temb).chunk(2, dim=1)
+        //   x = self.head(self.norm(x) * (1 + scale) + shift)
+        // head.norm is LayerNorm(affine=False) → no weight/bias.
         {
-            auto n_out = ggml_rms_norm(ctx, cur, eps);
-            auto nw = weight("moss_sfx_v2.head.norm.weight");
-            if (nw) n_out = ggml_mul(ctx, n_out, ggml_repeat(ctx, nw, n_out));
+            auto n_out = ggml_norm(ctx, cur, eps);  // LayerNorm (mean-subtracted)
 
             if (!head_modulation_f32_.empty()) {
                 auto hmod = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
                 ggml_set_input(hmod);
                 cg_.mod_tensors.push_back(hmod);
-                auto os = ggml_reshape_2d(ctx,
+                // Row 0 = shift, Row 1 = scale (Python chunk order)
+                auto shift = ggml_reshape_2d(ctx,
                     ggml_view_1d(ctx, hmod, H, 0), H, 1);
-                auto oh = ggml_reshape_2d(ctx,
+                auto scale = ggml_reshape_2d(ctx,
                     ggml_view_1d(ctx, hmod, H,
                                   static_cast<size_t>(H) * sizeof(float)),
                     H, 1);
-                n_out = ggml_add(ctx,
-                    ggml_mul(ctx, n_out, ggml_repeat(ctx, os, n_out)),
-                    ggml_repeat(ctx, oh, n_out));
+                // n_out * (1 + scale) + shift = n_out + (n_out * scale + shift)
+                n_out = ggml_add(ctx, n_out,
+                    ggml_add(ctx,
+                        ggml_mul(ctx, n_out, ggml_repeat(ctx, scale, n_out)),
+                        ggml_repeat(ctx, shift, n_out)));
             }
 
             auto hw = weight("moss_sfx_v2.head.head.weight");
@@ -715,24 +801,43 @@ bool DiTRunner::run_one_forward(
         ggml_backend_tensor_set(cg_.ctx_emb, ctx_src, 0, cn);
     }
 
-    // Position arrays
+    // Position arrays (self-attn RoPE only — cross-attn has NO RoPE)
     {
-        pos_scratch_.resize(static_cast<size_t>(T_latent) +
-                            static_cast<size_t>(ct_effective));
+        pos_scratch_.resize(static_cast<size_t>(T_latent));
         for (int j = 0; j < T_latent; j++)
             pos_scratch_[static_cast<size_t>(j)] = static_cast<int32_t>(j);
         ggml_backend_tensor_set(cg_.pos_q, pos_scratch_.data(), 0,
                                 static_cast<size_t>(T_latent) * sizeof(int32_t));
-
-        for (int j = 0; j < ct_effective; j++)
-            pos_scratch_[static_cast<size_t>(T_latent) + j] = static_cast<int32_t>(j);
-        ggml_backend_tensor_set(cg_.pos_k,
-                                pos_scratch_.data() + T_latent, 0,
-                                static_cast<size_t>(ct_effective) * sizeof(int32_t));
     }
 
-    // Modulation tensors
+    // Modulation tensors (per-layer: scale_shift_table + time_projection output)
     update_mod_tensors(mod_buf, H, n_lyr);
+
+    // Head modulation (last entry in mod_tensors: head.modulation + temb)
+    if (!head_modulation_f32_.empty() &&
+        cg_.mod_tensors.size() > static_cast<size_t>(n_lyr) * 6) {
+        auto* hmod_tensor = cg_.mod_tensors.back();
+        if (hmod_tensor) {
+            ggml_backend_tensor_set(hmod_tensor, head_modulation_f32_.data(), 0,
+                                    head_modulation_f32_.size() * sizeof(float));
+            // Debug: verify head modulation is non-zero
+            if (std::getenv("AUDIOCORE_DEBUG_HEADMOD")) {
+                float hm_min = head_modulation_f32_[0], hm_max = head_modulation_f32_[0];
+                double hm_sum = 0;
+                for (size_t j = 0; j < head_modulation_f32_.size(); j++) {
+                    hm_sum += head_modulation_f32_[j];
+                    if (head_modulation_f32_[j] < hm_min) hm_min = head_modulation_f32_[j];
+                    if (head_modulation_f32_[j] > hm_max) hm_max = head_modulation_f32_[j];
+                }
+                std::fprintf(stderr, "[DEBUG] head_mod: size=%zu mean=%.6f min=%.6f max=%.6f first5=[%.6f %.6f %.6f %.6f %.6f]\n",
+                             head_modulation_f32_.size(), hm_sum / head_modulation_f32_.size(),
+                             hm_min, hm_max,
+                             head_modulation_f32_[0], head_modulation_f32_[1],
+                             head_modulation_f32_[2], head_modulation_f32_[3],
+                             head_modulation_f32_[4]);
+            }
+        }
+    }
 
     // ── 7. Compute ──────────────────────────────────────────────────────
     auto t0 = ggml_time_us();

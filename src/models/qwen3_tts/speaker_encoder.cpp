@@ -30,6 +30,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"   // ggml_backend_cpu_init (CPU fallback for scheduler)
 
 namespace audiocore::qwen3_tts {
 
@@ -173,41 +174,72 @@ static void fft_r2c(const float* in, int N, float* out) {
     }
 }
 
-// Slaney-style mel filterbank: n_mels triangular filters on the mel scale,
-// area-normalized. Returns (n_freqs, n_mels) row-major.
+// Slaney mel filterbank — matches librosa.filters.mel(htk=False) exactly.
+//
+// The Slaney mel scale is piecewise: linear below 1000 Hz (slope 200/3 Hz/mel)
+// and logarithmic above (logstep = ln(6.4)/27). This is DIFFERENT from the
+// HTK formula (2595*log10(1+f/700)) that was used here previously — the two
+// scales differ by up to 100× at low frequencies, which produced garbage
+// embeddings because the ECAPA-TDNN was trained on Slaney-mel inputs.
+//
+// Returns (n_freqs, n_mels) row-major, Slaney-normalized.
 static std::vector<float> build_slaney_fb(int sr, int n_fft, int n_mels,
                                            float fmin, float fmax) {
     const int n_freqs = n_fft / 2 + 1;
-    auto hz_to_mel = [](float h) { return 2595.0f * log10f(1.0f + h / 700.0f); };
-    auto mel_to_hz = [](float m) { return 700.0f * (powf(10.0f, m / 2595.0f) - 1.0f); };
 
+    // ── Slaney mel scale (forward + inverse) ────────────────────────────
+    constexpr float f_sp        = 200.0f / 3.0f;   // ≈ 66.667 Hz/mel
+    constexpr float min_log_hz  = 1000.0f;
+    constexpr float min_log_mel = 15.0f;            // = min_log_hz / f_sp
+    constexpr float logstep     = 0.06875177742094911f; // = ln(6.4) / 27
+
+    auto hz_to_mel = [&](float hz) -> float {
+        if (hz < min_log_hz)
+            return hz / f_sp;
+        return min_log_mel + logf(hz / min_log_hz) / logstep;
+    };
+    auto mel_to_hz = [&](float mel) -> float {
+        if (mel < min_log_mel)
+            return mel * f_sp;
+        return min_log_hz * expf(logstep * (mel - min_log_mel));
+    };
+
+    // ── Mel center frequencies ──────────────────────────────────────────
     float mel_min = hz_to_mel(fmin);
     float mel_max = hz_to_mel(fmax);
-    std::vector<float> mel_pts((size_t)n_mels + 2);
-    for (int i = 0; i < n_mels + 2; i++)
-        mel_pts[(size_t)i] = mel_min + (mel_max - mel_min) * i / (n_mels + 1);
+    std::vector<float> hz_pts((size_t)n_mels + 2);
+    for (int i = 0; i < n_mels + 2; i++) {
+        float mel = mel_min + (mel_max - mel_min) * i / (n_mels + 1);
+        hz_pts[(size_t)i] = mel_to_hz(mel);
+    }
 
+    // ── FFT bin frequencies ─────────────────────────────────────────────
+    // librosa uses: fft_freqs = np.arange(n_freqs) * sr / n_fft
+    std::vector<float> fft_freqs((size_t)n_freqs);
+    for (int k = 0; k < n_freqs; k++)
+        fft_freqs[(size_t)k] = (float)k * sr / n_fft;
+
+    // ── Triangular filters + Slaney normalization ───────────────────────
+    // librosa constructs: ramp_down = (f - left) / (center - left)
+    //                     ramp_up   = (right - f) / (right - center)
+    //                     weights   = max(0, min(ramp_down, ramp_up))
+    //                     enorm     = 2.0 / (hz_right - hz_left)
     std::vector<float> fb((size_t)n_freqs * n_mels, 0.0f);
     for (int m = 0; m < n_mels; m++) {
-        float hz_l = mel_to_hz(mel_pts[(size_t)m]);
-        float hz_c = mel_to_hz(mel_pts[(size_t)m + 1]);
-        float hz_r = mel_to_hz(mel_pts[(size_t)m + 2]);
-        int bin_l = (int)(hz_l * (n_fft + 1) / sr);
-        int bin_c = (int)(hz_c * (n_fft + 1) / sr);
-        int bin_r = (int)(hz_r * (n_fft + 1) / sr);
-        for (int k = bin_l; k <= bin_c && k < n_freqs; k++) {
-            fb[(size_t)k * n_mels + m] = (float)(k - bin_l) / (bin_c - bin_l + 1);
-        }
-        for (int k = bin_c; k <= bin_r && k < n_freqs; k++) {
-            fb[(size_t)k * n_mels + m] = (float)(bin_r - k) / (bin_r - bin_c + 1);
-        }
-        // Area normalization: each triangular filter sums to 1.0.
-        float area = 0.0f;
-        for (int k = 0; k < n_freqs; k++) area += fb[(size_t)k * n_mels + m];
-        if (area > 0) {
-            float inv = 1.0f / area;
-            for (int k = 0; k < n_freqs; k++)
-                fb[(size_t)k * n_mels + m] *= inv;
+        float hz_l = hz_pts[(size_t)m];
+        float hz_c = hz_pts[(size_t)m + 1];
+        float hz_r = hz_pts[(size_t)m + 2];
+        float denom_lo = hz_c - hz_l;
+        float denom_hi = hz_r - hz_c;
+        if (std::fabs(denom_lo) < 1e-10f) denom_lo = 1e-10f;
+        if (std::fabs(denom_hi) < 1e-10f) denom_hi = 1e-10f;
+        float enorm = 2.0f / (hz_r - hz_l);
+        for (int k = 0; k < n_freqs; k++) {
+            float f = fft_freqs[(size_t)k];
+            float ramp_lo = (f - hz_l) / denom_lo;
+            float ramp_hi = (hz_r - f) / denom_hi;
+            float w = std::fmax(0.0f, std::fmin(ramp_lo, ramp_hi));
+            fb[(size_t)k * n_mels + m] = w * enorm;
         }
     }
     return fb;
@@ -455,27 +487,63 @@ bool Qwen3TtsSpeakerEncoder::bind(ggml_context* source_ctx,
         return false;
     }
 
-    // Allocate scheduler scratch space
+    // Allocate graph scratch space (large enough for any mel length).
     compute_meta_.resize(
-        ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false));
+        ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
 
-    // Create scheduler
-    {
-        ggml_backend_t be_list[1] = {backend};
-        sched_ = ggml_backend_sched_new(be_list, /*bufts=*/nullptr, 1, 4096, /*parallel=*/false, /*op_offload=*/false);
-        if (!sched_) {
-            if (error) *error += "failed to create backend scheduler for speaker encoder";
-            loaded_ = false;
-            return false;
-        }
+    // Create a CPU backend. The speaker encoder is tiny (~23 MB) and runs
+    // once per session — CPU is plenty fast (target ~50 ms for a 5-s
+    // reference). CPU also supports the full conv1d + reflect-pad op set
+    // the encoder uses. The `backend` (GPU) parameter is intentionally
+    // ignored — using the GPU here would require buffer-copies for a model
+    // that already fits in L3 cache.
+    //
+    // We use a single-backend gallocr (like codec.cpp), NOT a scheduler —
+    // the encoder graph is static and all weights live on the CPU buffer,
+    // so the scheduler's graph-splitting machinery is unnecessary and runs
+    // into buffer-assignment issues with mmap'd GgufReader weight pointers.
+    (void)backend;
+    cpu_backend_ = ggml_backend_cpu_init();
+    if (!cpu_backend_) {
+        if (error) *error += "failed to init CPU backend for speaker encoder";
+        loaded_ = false;
+        return false;
     }
+
+    // NOTE: weight registration (register_weight) happens in the loader
+    // after bind() returns — meta_ctx tensors have data==NULL (no_alloc),
+    // so the mmap pointer must be supplied explicitly via
+    // GgufReader::find() + tensor_data_ptr(). See loader.cpp Stage 17b.
 
     loaded_ = true;
     return true;
 }
 
+// ── Weight source management (mirrors codec.cpp's pattern) ─────────────────
+
+void Qwen3TtsSpeakerEncoder::register_weight(ggml_tensor* t,
+                                              const void* host_data,
+                                              size_t nbytes) {
+    if (!t || !host_data) return;
+    weight_srcs_.push_back({t, host_data, nbytes});
+}
+
+void Qwen3TtsSpeakerEncoder::reset_weight_data_() {
+    for (auto& ws : weight_srcs_) {
+        ws.tensor->data   = nullptr;
+        ws.tensor->buffer = nullptr;
+    }
+}
+
+void Qwen3TtsSpeakerEncoder::upload_weights_() {
+    for (auto& ws : weight_srcs_) {
+        if (!ws.tensor->data || !ws.data) continue;
+        ggml_backend_tensor_set(ws.tensor, ws.data, 0, ws.nbytes);
+    }
+}
+
 Qwen3TtsSpeakerEncoder::~Qwen3TtsSpeakerEncoder() {
-    if (sched_) ggml_backend_sched_free(sched_);
+    if (cpu_backend_) ggml_backend_free(cpu_backend_);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -529,20 +597,35 @@ std::vector<float> Qwen3TtsSpeakerEncoder::run_on_mel(const float* mel_TC,
     ggml_set_name(h, "spk_emb");
     ggml_build_forward_expand(gf, h);
 
-    // Compute
-    ggml_backend_sched_reset(sched_);
-    if (!ggml_backend_sched_alloc_graph(sched_, gf)) return {};
+    // Compute via direct gallocr + backend_graph_compute (single CPU backend).
+    // Weight tensors come from the GgufReader's meta_ctx — but gallocr sees
+    // buffer==NULL and allocates fresh zero-init buffers, so we must copy the
+    // real mmap data in after allocation (upload_weights_).
+    reset_weight_data_();
+    ggml_gallocr_t galloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(cpu_backend_));
+    if (!galloc) { ggml_free(ctx0); return {}; }
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return {};
+    }
+    upload_weights_();
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "spk_mel"),
                             mel_CT.data(), 0, mel_CT.size() * sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(sched_, gf) != GGML_STATUS_SUCCESS)
+    if (ggml_backend_graph_compute(cpu_backend_, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
         return {};
+    }
 
     std::vector<float> emb((size_t)enc_dim);
     ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "spk_emb"),
                             emb.data(), 0, (size_t)enc_dim * sizeof(float));
 
+    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return emb;
 }

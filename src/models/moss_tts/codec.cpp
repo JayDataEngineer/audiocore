@@ -155,12 +155,19 @@ MossCodecGraphs::~MossCodecGraphs() {
 
 bool MossCodecGraphs::bind(ggml_context* source_ctx,
                             ggml_backend_t backend,
+                            int32_t n_vq,
                             std::string* error) {
     if (present_) return true;
     source_ctx_ = source_ctx;
     backend_    = backend;
+    n_vq_       = n_vq;
     if (!source_ctx_ || !backend_) {
         if (error) *error = "MossCodecGraphs::bind: nullptr source_ctx or backend";
+        return false;
+    }
+    if (n_vq_ < 1 || n_vq_ > 32) {
+        if (error) *error = "MossCodecGraphs::bind: n_vq out of range [1, 32]: "
+                            + std::to_string(n_vq_);
         return false;
     }
     try {
@@ -192,8 +199,12 @@ bool MossCodecGraphs::bind(ggml_context* source_ctx,
             if (!w_ctx_) throw std::runtime_error("bind: ggml_init for weight ctx failed");
         }
 
+        // Resize per-quantizer vectors to n_vq_.
+        q_oproj_w_.resize(n_vq_);
+        q_oproj_b_.resize(n_vq_);
+
         // Allocate decoder effective-weight descriptors.
-        for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+        for (int i = 0; i < n_vq_; ++i) {
             const std::string n = "q.oproj." + std::to_string(i);
             q_oproj_w_[i] = make_eff_w_(n + ".w", CODEC_CB_DIM, CODEC_RVQ_DIM);
             q_oproj_b_[i] = make_eff_b_(n + ".b", CODEC_RVQ_DIM);
@@ -203,7 +214,11 @@ bool MossCodecGraphs::bind(ggml_context* source_ctx,
 
         // Allocate encoder effective-weight descriptors (if encoder resolved).
         if (want_encoder) {
-            for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+            q_iproj_w_.resize(n_vq_);
+            q_iproj_b_.resize(n_vq_);
+            codebook_normed_.resize(n_vq_);
+
+            for (int i = 0; i < n_vq_; ++i) {
                 const std::string n = "q.iproj." + std::to_string(i);
                 q_iproj_w_[i] = make_eff_w_(n + ".w", CODEC_RVQ_DIM, CODEC_CB_DIM);
                 q_iproj_b_[i] = make_eff_b_(n + ".b", CODEC_CB_DIM);
@@ -211,7 +226,7 @@ bool MossCodecGraphs::bind(ggml_context* source_ctx,
             quant_iproj_w_ = make_eff_w_("quant.iproj.w", CODEC_OUT_DIM, CODEC_RVQ_DIM);
             quant_iproj_b_ = make_eff_b_("quant.iproj.b", CODEC_RVQ_DIM);
 
-            for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+            for (int i = 0; i < n_vq_; ++i) {
                 ggml_tensor* t = ggml_new_tensor_2d(w_ctx_, GGML_TYPE_F16,
                                                      CODEC_CB_DIM, CODEC_CB_SIZE);
                 ggml_set_name(t, ("cb_norm." + std::to_string(i)).c_str());
@@ -225,7 +240,7 @@ bool MossCodecGraphs::bind(ggml_context* source_ctx,
         device_copy_src_tensors_("MossCodecGraphs::bind");
 
         // Reconstruct decoder effective weights (reads from on-device wp0/wp1).
-        for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+        for (int i = 0; i < n_vq_; ++i) {
             const std::string base = "moss.codec.quantizer.q." + std::to_string(i) + ".oproj.";
             reconstruct_wn_(base + "wp0", base + "wp1", base + "bias",
                             q_oproj_w_[i], q_oproj_b_[i],
@@ -239,7 +254,7 @@ bool MossCodecGraphs::bind(ggml_context* source_ctx,
 
         if (want_encoder) {
             // Reconstruct encoder effective weights.
-            for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+            for (int i = 0; i < n_vq_; ++i) {
                 const std::string base = "moss.codec.quantizer.q." + std::to_string(i) + ".iproj.";
                 reconstruct_wn_(base + "wp0", base + "wp1", base + "bias",
                                 q_iproj_w_[i], q_iproj_b_[i],
@@ -291,8 +306,9 @@ ggml_tensor* MossCodecGraphs::tensor_or_null_(const std::string& name) const {
 // ───────────────────────────────────────────────────────────────────────────
 
 void MossCodecGraphs::resolve_decoder_() {
+    codebook_.resize(n_vq_);
     // Codebooks: moss.codec.quantizer.q.{i}.codebook.weight  (8, 1024) f16
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    for (int i = 0; i < n_vq_; ++i) {
         codebook_[i] = tensor_("moss.codec.quantizer.q." + std::to_string(i)
                                 + ".codebook.weight");
         REG_SRC(codebook_[i]);
@@ -395,7 +411,7 @@ void MossCodecGraphs::compute_encoder_effective_weights_() {
 // normalized codebook rows. Adapted verbatim from openmoss codec.cpp lines
 // 528–554.
 void MossCodecGraphs::compute_normalized_codebooks_() {
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    for (int i = 0; i < n_vq_; ++i) {
         if (!codebook_normed_[i]) {
             throw std::runtime_error("compute_normalized_codebooks_: codebook_normed_[" +
                                       std::to_string(i) + "] not allocated");
@@ -763,8 +779,9 @@ std::vector<float> MossCodecGraphs::decode(const int32_t* codes,
     if (!present_) {
         throw std::runtime_error("MossCodecGraphs::decode: not bound (codec tensors missing?)");
     }
-    if (n_vq != CODEC_NUM_VQ) {
-        throw std::runtime_error("MossCodecGraphs::decode: expected n_vq=32, got "
+    if (n_vq != n_vq_) {
+        throw std::runtime_error("MossCodecGraphs::decode: expected n_vq="
+                                  + std::to_string(n_vq_) + ", got "
                                   + std::to_string(n_vq));
     }
     if (T_audio <= 0) return {};
@@ -798,8 +815,8 @@ std::vector<float> MossCodecGraphs::decode(const int32_t* codes,
     if (!gctx) throw std::runtime_error("MossCodecGraphs::decode: ggml_init failed");
 
     // Per-quantizer code inputs.
-    std::vector<ggml_tensor*> codes_in(CODEC_NUM_VQ);
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    std::vector<ggml_tensor*> codes_in(n_vq_);
+    for (int i = 0; i < n_vq_; ++i) {
         codes_in[i] = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T_audio);
         ggml_set_name(codes_in[i], ("codes_" + std::to_string(i)).c_str());
         ggml_set_input(codes_in[i]);
@@ -824,7 +841,7 @@ std::vector<float> MossCodecGraphs::decode(const int32_t* codes,
 
     // ── Quantizer.decode_codes ──────────────────────────────────────────
     ggml_tensor* sum = nullptr;
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    for (int i = 0; i < n_vq_; ++i) {
         // (codebook_dim=8, T) via embedding lookup → f32 (get_rows promotes).
         // codebook_[i] now points to the device copy in w_buf_ (the generic
         // device-copy mechanism in compute_effective_weights_ updated it).
@@ -860,7 +877,7 @@ std::vector<float> MossCodecGraphs::decode(const int32_t* codes,
     }
 
     // ── Upload inputs ───────────────────────────────────────────────────
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    for (int i = 0; i < n_vq_; ++i) {
         std::vector<int32_t> col(T_audio);
         for (int t = 0; t < T_audio; ++t) col[size_t(t)] = codes[i * T_audio + t];
         ggml_backend_tensor_set(codes_in[i], col.data(), 0,
@@ -960,8 +977,8 @@ std::vector<int32_t> MossCodecGraphs::encode(const float* waveform,
     ggml_tensor* residual = ggml_mul_mat(gctx, quant_iproj_w_, x);           // (512, T)
     residual = ggml_add(gctx, residual, to_f32_(gctx, quant_iproj_b_));      // (512, T)
 
-    std::array<ggml_tensor*, CODEC_NUM_VQ> indices {};
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    std::vector<ggml_tensor*> indices(n_vq_, nullptr);
+    for (int i = 0; i < n_vq_; ++i) {
         // z_e = q[i].iproj(residual)
         ggml_tensor* z_e = ggml_mul_mat(gctx, q_iproj_w_[i], residual);     // (8, T)
         z_e = ggml_add(gctx, z_e, to_f32_(gctx, q_iproj_b_[i]));            // (8, T)
@@ -988,7 +1005,7 @@ std::vector<int32_t> MossCodecGraphs::encode(const float* waveform,
     }
 
     ggml_cgraph* graph = ggml_new_graph_custom(gctx, 65536, false);
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) ggml_build_forward_expand(graph, indices[i]);
+    for (int i = 0; i < n_vq_; ++i) ggml_build_forward_expand(graph, indices[i]);
 
     if (!ggml_gallocr_alloc_graph(galloc_, graph)) {
         ggml_free(gctx);
@@ -1017,8 +1034,8 @@ std::vector<int32_t> MossCodecGraphs::encode(const float* waveform,
 
     // Read indices back: assemble (n_vq, T_audio) row-major i32.
     std::vector<int32_t> out;
-    out.assign(size_t(CODEC_NUM_VQ) * size_t(T_audio), 0);
-    for (int i = 0; i < CODEC_NUM_VQ; ++i) {
+    out.assign(size_t(n_vq_) * size_t(T_audio), 0);
+    for (int i = 0; i < n_vq_; ++i) {
         ggml_backend_tensor_get(indices[i], out.data() + size_t(i) * size_t(T_audio),
                                 0, size_t(T_audio) * sizeof(int32_t));
     }

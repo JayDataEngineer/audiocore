@@ -112,6 +112,10 @@ bool Qwen3TtsSession::load(const std::string& model_path,
         auto it = opts.extras.find("codec_path");
         if (it != opts.extras.end()) config_.codec_path = it->second;
     }
+    {
+        auto it = opts.extras.find("speaker_encoder_path");
+        if (it != opts.extras.end()) config_.speaker_encoder_path = it->second;
+    }
 
     // Resolve file paths from model directory
     std::string dir = model_path;
@@ -123,6 +127,16 @@ bool Qwen3TtsSession::load(const std::string& model_path,
     config_.talker_path    = resolve_path(dir, config_.talker_path,    "qwen3_tts_talker.gguf");
     config_.predictor_path = resolve_path(dir, config_.predictor_path, "qwen3_tts_predictor.gguf");
     config_.codec_path     = resolve_codec_path(dir, config_.codec_path);
+    // Speaker encoder GGUF is optional. Auto-probe sibling
+    // `qwen3tts-speaker-encoder.gguf` if not explicitly provided.
+    if (config_.speaker_encoder_path.empty()) {
+        const fs::path probe = fs::path(dir) / "qwen3tts-speaker-encoder.gguf";
+        if (fs::exists(probe)) config_.speaker_encoder_path = probe.string();
+    } else if (config_.speaker_encoder_path != "/dev/null") {
+        // Resolve relative paths against the model dir.
+        config_.speaker_encoder_path =
+            resolve_path(dir, config_.speaker_encoder_path, "");
+    }
 
     // Parse numeric extras
     {
@@ -214,25 +228,188 @@ bool Qwen3TtsSession::load(const std::string& model_path,
                  talker_->hidden_size(), talker_->vocab_size(),
                  talker_->has_text_embedding() ? "yes" : "no");
 
+    // ── 1a. WDELTA patch (Base → CustomVoice) ────────────────────────────
+    // If this is a CustomVoice talker AND a sibling Base talker GGUF is
+    // available (or extras["wdelta_base_path"] points at one), overwrite
+    // text_proj biases + codec_embedding in the loaded CV talker with Base's
+    // versions. After the patch, CV accepts a continuous ECAPA embedding at
+    // the speaker slot AND retains its instruct-tuned transformer norms.
+    // See Runner::apply_wdelta_patch docstring + QWEN3-TTS-GAPS.md §A4.
+    //
+    // Enabled by default when CV + sibling Base is detected; opt out via
+    // extras["wdelta_disable"]="1" (e.g. for A/B comparison).
+    if (config_.variant == Qwen3TtsVariant::CustomVoice) {
+        auto it_disable = opts.extras.find("wdelta_disable");
+        const bool wdelta_disabled =
+            (it_disable != opts.extras.end() && it_disable->second == "1");
+        if (!wdelta_disabled) {
+            // Resolve the Base GGUF path.
+            // 1. Explicit override via extras["wdelta_base_path"].
+            // 2. Sibling directory: replace "customvoice" → "base" in the
+            //    talker's parent dir (handles 0.6b-customvoice → 0.6b-base
+            //    and 1.7b-customvoice → 1.7b-base conventions).
+            // 3. Same directory: pick any *-base*.gguf or *0b6*base*.gguf.
+            std::string base_path;
+            auto it_base = opts.extras.find("wdelta_base_path");
+            if (it_base != opts.extras.end() && !it_base->second.empty()) {
+                base_path = it_base->second;
+            } else {
+                fs::path cv_dir = fs::path(config_.talker_path).parent_path();
+                std::string cv_dir_s = cv_dir.string();
+                // Case-insensitive replace of "customvoice" → "base" in the
+                // directory path. Both needles are the same length so the
+                // replacement preserves the rest of the string.
+                std::string hay = cv_dir_s;
+                std::transform(hay.begin(), hay.end(), hay.begin(),
+                               [](unsigned char c){ return std::tolower(c); });
+                size_t pos = hay.find("customvoice");
+                if (pos != std::string::npos) {
+                    std::string base_dir_s = cv_dir_s;
+                    base_dir_s.replace(pos, std::string("customvoice").size(), "base");
+                    fs::path base_dir(base_dir_s);
+                    // Look for the same talker filename the CV used, then a
+                    // few canonical alternates.
+                    const std::string cv_talker_fn =
+                        fs::path(config_.talker_path).filename().string();
+                    std::vector<fs::path> cands = {
+                        base_dir / cv_talker_fn,
+                        base_dir / "qwen3_tts_talker.gguf",
+                        base_dir / "qwen3tts-talker-0b6-f16.gguf",
+                        base_dir / "qwen3tts-talker-1b7-f16.gguf",
+                    };
+                    for (const auto& c : cands) {
+                        if (fs::exists(c)) { base_path = c.string(); break; }
+                    }
+                }
+                // Fallback #3: same directory — any *-base* or *base* GGUF.
+                if (base_path.empty()) {
+                    std::error_code ec;
+                    for (auto& e : fs::directory_iterator(cv_dir, ec)) {
+                        if (e.path().extension() != ".gguf") continue;
+                        std::string n = e.path().filename().string();
+                        std::transform(n.begin(), n.end(), n.begin(),
+                                       [](unsigned char c){ return std::tolower(c); });
+                        if (n.find("base") != std::string::npos &&
+                            n.find("talker") != std::string::npos) {
+                            base_path = e.path().string();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!base_path.empty() && fs::exists(base_path)) {
+                std::string wdelta_err;
+                if (!talker_->apply_wdelta_patch(base_path, &wdelta_err)) {
+                    std::fprintf(stderr,
+                        "qwen3_tts: WDELTA patch FAILED — continuing with the "
+                        "unpatched CV talker (B1 path remains broken).\n"
+                        "  reason: %s\n"
+                        "  base GGUF: %s\n",
+                        wdelta_err.c_str(), base_path.c_str());
+                } else {
+                    config_.wdelta_applied = true;
+                    config_.wdelta_base_path = base_path;
+                }
+            } else if (base_path.empty()) {
+                std::fprintf(stderr,
+                    "qwen3_tts: WDELTA patch SKIPPED — no sibling Base talker "
+                    "GGUF found for CV talker at %s.\n"
+                    "  To enable the 4-feature pipeline (custom embedding + "
+                    "instruct + text + quality), point extras[\"wdelta_base_path\"]\n"
+                    "  at the matching Base talker GGUF (e.g. 0.6b-base/"
+                    "qwen3_tts_talker.gguf).\n",
+                    config_.talker_path.c_str());
+            } else {
+                std::fprintf(stderr,
+                    "qwen3_tts: WDELTA patch SKIPPED — resolved base path '%s' "
+                    "does not exist.\n", base_path.c_str());
+            }
+        }
+    }
+
+
+    // ── 1b. Load tokenizer sidecar (real Qwen3 BPE text tokenizer) ────────
+    // The talker GGUF carries a dummy codec-vocab tokenizer (n_vocab == 3072
+    // to match token_embd = codec_embedding). Text tokenization needs the
+    // real Qwen3 BPE (151 936 tokens, pre=qwen2), shipped as a vocab-only
+    // sidecar GGUF. Search the talker's directory for it.
+    std::fprintf(stderr, "qwen3_tts: tokenizer sidecar probe — has_tokenizer=%d talker_path=%s\n",
+                 static_cast<int>(talker_->has_tokenizer()),
+                 config_.talker_path.c_str());
+    if (!talker_->has_tokenizer()) {
+        fs::path talker_dir = fs::path(config_.talker_path).parent_path();
+        std::vector<fs::path> candidates;
+        // Explicit override via extras["tokenizer_path"] (handled by caller
+        // writing config_.codec_path — but for the tokenizer we scan the dir).
+        for (const char* p : {
+            "qwen3tts-tokenizer.gguf",
+            "tokenizer-text.gguf",
+            "text-tokenizer.gguf",
+        }) {
+            candidates.push_back(talker_dir / p);
+        }
+        // Glob: any qwen3tts-tokenizer-*.gguf in the directory.
+        std::error_code ec;
+        for (auto& e : fs::directory_iterator(talker_dir, ec)) {
+            auto name = e.path().filename().string();
+            if (name.rfind("qwen3tts-tokenizer", 0) == 0 &&
+                e.path().extension() == ".gguf")
+                candidates.push_back(e.path());
+        }
+        bool loaded = false;
+        for (auto& p : candidates) {
+            if (!fs::exists(p)) continue;
+            std::string tok_err;
+            if (talker_->load_tokenizer(p.string(), &tok_err)) {
+                loaded = true;
+                break;
+            }
+            std::fprintf(stderr, "qwen3_tts: tokenizer candidate %s failed: %s\n",
+                         p.string().c_str(), tok_err.c_str());
+        }
+        if (!loaded) {
+            std::fprintf(stderr,
+                "qwen3_tts: WARNING — no tokenizer sidecar found in %s.\n"
+                "  Text tokenization will use the talker's dummy codec-vocab\n"
+                "  tokenizer → GARBAGE AUDIO. Re-run convert_qwen3tts without\n"
+                "  --skip-tokenizer to produce qwen3tts-tokenizer-*.gguf.\n",
+                talker_dir.c_str());
+        }
+    }
+
     // ── 2a. Load ECAPA-TDNN speaker encoder (Stage 17b) ───────────────────
-    // The speaker.* tensors live in the talker GGUF alongside the talker
-    // transformer weights. llama.cpp skips unknown tensor names, so we open
-    // the talker file with a separate GgufReader to resolve speaker.* tensors.
-    // Soft-fail: Base models without the speaker encoder tensors skip this
-    // step and Voice Clone mode returns a clear error.
+    // The speaker encoder is shipped as a STANDALONE ~23 MB GGUF
+    // (qwen3tts-speaker-encoder.gguf) produced by tools/convert_ecapa.cpp
+    // from marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B. Tensor names are
+    // namespaced as `speaker.*` so the existing bind() resolves them.
+    //
+    // If `speaker_encoder_path` is not set we fall back to the talker GGUF
+    // itself — this preserves backwards compatibility with legacy bundled
+    // layouts (CrispASR-style), even though no current upstream Qwen3-TTS
+    // talker ships ECAPA weights inside the talker GGUF.
+    //
+    // Soft-fail: Base models without the speaker encoder skip this step and
+    // Voice Clone mode returns a clear error.
     {
+        const std::string& spk_path = !config_.speaker_encoder_path.empty()
+            ? config_.speaker_encoder_path : config_.talker_path;
         std::string spk_err;
         speaker_reader_ = std::make_unique<GgufReader>();
-        if (!speaker_reader_->load(config_.talker_path, &spk_err)) {
+        if (!speaker_reader_->load(spk_path, &spk_err)) {
             std::fprintf(stderr, "qwen3_tts: speaker encoder GGUF load skipped (%s); "
                                  "voice_clone will fail fast\n", spk_err.c_str());
             speaker_reader_.reset();
         } else {
-            // Parse HP from GGUF KV
+            // Parse HP from GGUF KV. Two key conventions are accepted:
+            //   qwen3tts_spk.*   — current standalone GGUF (general.architecture="qwen3tts_spk")
+            //   qwen3tts.speaker.* — legacy bundled layout
             int32_t i32 = 0;
-            if (speaker_reader_->get_kv_i32("qwen3tts.speaker.enc_dim", &i32))
+            if (speaker_reader_->get_kv_i32("qwen3tts_spk.enc_dim", &i32) ||
+                speaker_reader_->get_kv_i32("qwen3tts.speaker.enc_dim", &i32))
                 speaker_encoder_.hp.enc_dim = uint32_t(i32);
-            if (speaker_reader_->get_kv_i32("qwen3tts.speaker.sample_rate", &i32))
+            if (speaker_reader_->get_kv_i32("qwen3tts_spk.sample_rate", &i32) ||
+                speaker_reader_->get_kv_i32("qwen3tts.speaker.sample_rate", &i32))
                 speaker_encoder_.hp.sample_rate = uint32_t(i32);
 
             speaker_backend_ = make_backend(backend_cfg, nullptr);
@@ -252,8 +429,40 @@ bool Qwen3TtsSession::load(const std::string& model_path,
             } else {
                 config_.speaker_present = true;
                 std::fprintf(stderr,
-                    "qwen3_tts: speaker encoder loaded (ECAPA-TDNN 128→%u)\n",
-                    speaker_encoder_.hp.enc_dim);
+                    "qwen3_tts: speaker encoder loaded from %s (ECAPA-TDNN 128→%u)\n",
+                    spk_path.c_str(), speaker_encoder_.hp.enc_dim);
+
+                // Register weight data sources (GGUF mmap → CPU backend
+                // buffer). The meta_ctx tensors have data==NULL (no_alloc),
+                // so run_on_mel's gallocr allocates fresh zero-init buffers
+                // for them; upload_weights_() copies the real mmap data in
+                // after allocation. Without this, all ECAPA weights are
+                // silently zero and compute_embedding returns an all-zero
+                // vector (latent bug — the ICL codec-token path carries
+                // voice identity separately, so voice_clone still produced
+                // speech, just without the ECAPA contribution).
+                {
+                    ggml_context* meta = speaker_reader_->meta_ctx();
+                    if (meta) {
+                        int n_reg = 0;
+                        for (ggml_tensor* t = ggml_get_first_tensor(meta);
+                             t; t = ggml_get_next_tensor(meta, t)) {
+                            const char* name = ggml_get_name(t);
+                            if (!name || strncmp(name, "speaker.", 8) != 0)
+                                continue;
+                            const TensorStorage* ts = speaker_reader_->find(name);
+                            if (!ts) continue;
+                            const void* mmap_ptr = speaker_reader_->tensor_data_ptr(*ts);
+                            if (!mmap_ptr) continue;
+                            speaker_encoder_.register_weight(t, mmap_ptr,
+                                                             size_t(ggml_nbytes(t)));
+                            n_reg++;
+                        }
+                        std::fprintf(stderr,
+                            "qwen3_tts: registered %d speaker weight sources\n",
+                            n_reg);
+                    }
+                }
             }
         }
     }
@@ -354,7 +563,18 @@ bool Qwen3TtsSession::load(const std::string& model_path,
                         for (ggml_tensor* t = ggml_get_first_tensor(meta);
                              t; t = ggml_get_next_tensor(meta, t)) {
                             const char* name = ggml_get_name(t);
-                            if (!name || strncmp(name, "codec.dec.", 10) != 0)
+                            // Register both decoder and encoder weights.
+                            // Decoder weights feed the decode graph (GPU
+                            // upload via upload_weights_). Encoder weights
+                            // feed both the encode graph (seanet/xfmr/ds →
+                            // GPU) and the CPU RVQ quantizer
+                            // (cenc_rvq_encode_, which reads the mmap host
+                            // pointer directly via weight_host_data_).
+                            // Previously only codec.dec.* was registered,
+                            // leaving codec.enc.* with tensor->data == NULL.
+                            // Fixed 2026-07-03 (Gap K).
+                            if (!name || (strncmp(name, "codec.dec.", 10) != 0 &&
+                                          strncmp(name, "codec.enc.", 10) != 0))
                                 continue;
                             const TensorStorage* ts = codec_reader_->find(name);
                             if (!ts) continue;

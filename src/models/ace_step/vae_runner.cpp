@@ -283,7 +283,15 @@ static void nan_check(const char* tag, const float* p, size_t n) {
 // This helper bypasses the scheduler entirely (which forces INPUT-flagged
 // tensors to the last backend = CPU) and instead allocates ALL tensors
 // directly on the CUDA backend, computes there, and downloads the result.
-struct VaeInputUpload { ggml_tensor* t; const void* data; size_t nbytes; };
+struct VaeInputUpload {
+    ggml_tensor* t;
+    const void* data;
+    size_t nbytes;
+    // Optional owned storage — keeps `data` alive until after upload.
+    // Used when `data` points to a per-call allocated buffer (e.g. F16 weight
+    // conversion) that must outlive the builder function scope.
+    std::shared_ptr<void> owned;
+};
 
 // ── VAE profiling accumulator ─────────────────────────────────────────────
 struct VaeProfiler {
@@ -1087,15 +1095,17 @@ static ggml_tensor* gb_conv1d(ggml_context* ctx, ggml_tensor* x,
                                 int stride, int pad, int dilation,
                                 std::vector<VaeInputUpload>& uploads)
 {
-    // Weight [K, IC, OC] → F16
-    static thread_local std::vector<ggml_fp16_t> w16;
+    // Weight [K, IC, OC] → F16. Each conv1d owns its F16 buffer via shared_ptr
+    // so it survives until upload (after the entire graph is built). Previously
+    // a static thread_local buffer was reused across calls, causing all convs
+    // in a multi-op sub-graph to receive the LAST conv's weights.
     const size_t n_w = static_cast<size_t>(K) * IC * OC;
-    w16.resize(n_w);
-    for (size_t i = 0; i < n_w; i++) w16[i] = ggml_fp32_to_fp16(w_f32[i]);
+    auto w16 = std::make_shared<std::vector<ggml_fp16_t>>(n_w);
+    for (size_t i = 0; i < n_w; i++) (*w16)[i] = ggml_fp32_to_fp16(w_f32[i]);
 
     ggml_tensor* w = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, K, IC, OC);
     ggml_set_input(w);
-    uploads.push_back({w, w16.data(), n_w * sizeof(ggml_fp16_t)});
+    uploads.push_back({w, w16->data(), n_w * sizeof(ggml_fp16_t), w16});
 
     ggml_tensor* r = ggml_conv_1d(ctx, w, x, stride, pad, dilation);
 
@@ -1270,13 +1280,114 @@ bool VAERunner::decode_blocks(const float* latents, int32_t n_frames,
                 },
                 &out, error, "conv1"))
             return false;
+        // Diagnostic: dump first few conv1 output values
+        if (std::getenv("ACE_STEP_VAE_DEBUG"))
+            fprintf(stderr, "[vae_diag] conv1 out T=%d C=%d [0..3]=%.4f,%.4f,%.4f,%.4f RMS=%.4f\n",
+                    out.T, out.C, out.data[0], out.data[1], out.data[2], out.data[3],
+                    std::sqrt([&]{ double s=0; for(float v: out.data) s+=v*v; return s/out.data.size(); }()));
         io = std::move(out);
     }
 
     // ── Sub-graphs 1-5: decoder blocks ────────────────────────────────────
+    // When ACE_STEP_VAE_BISECT is set, block 0 is split into sub-graphs
+    // to pinpoint divergence vs slow path.
+    //   BISECT=1: each op separately (snake, ct1d, res0, res1, res2)
+    //   BISECT=2: snake+ct1d as one, res0 as one, res1 as one, res2 as one
+    //   BISECT=3: snake+ct1d+res0 as one, res1+res2 as one
+    const bool bisect = std::getenv("ACE_STEP_VAE_BISECT") != nullptr;
+    int bisect_mode = bisect ? atoi(std::getenv("ACE_STEP_VAE_BISECT")) : 0;
+    if (bisect_mode == 0) bisect_mode = 1;
     for (int b = 0; b < 5; b++) {
-        SubGraphIO out;
         const int bi = b;
+        if (bisect && b == 0) {
+            auto rms_dump = [](const SubGraphIO& o, const char* tag) {
+                double sq = 0; for (float v : o.data) sq += v*v;
+                fprintf(stderr, "[vae_diag] blk0 %s: T=%d C=%d RMS=%.4f\n",
+                        tag, o.T, o.C, std::sqrt(sq / o.data.size()));
+            };
+            if (bisect_mode == 1) {
+                // Each op as its own sub-graph
+                SubGraphIO out;
+                // snake
+                if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                        [&](ggml_context* ctx, ggml_tensor* in, std::vector<VaeInputUpload>& u) {
+                            return gb_snake(ctx, in, dec_blk_[0].snake_a_.data(),
+                                dec_blk_[0].snake_b_.data(), kBlocks[0].in_ch, u); },
+                        &out, error, "blk0_snake")) return false;
+                rms_dump(out, "snake"); io = std::move(out);
+                // conv_t1d
+                if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                        [&](ggml_context* ctx, ggml_tensor* in, std::vector<VaeInputUpload>& u) {
+                            return gb_conv_t1d(ctx, in, dec_blk_[0].ct1_w_.data(),
+                                kBlocks[0].in_ch, kBlocks[0].out_ch, dec_blk_[0].ct1_K_,
+                                kBlocks[0].stride, kBlocks[0].padding,
+                                dec_blk_[0].ct1_b_.empty()?nullptr:dec_blk_[0].ct1_b_.data(), u); },
+                        &out, error, "blk0_ct1d")) return false;
+                rms_dump(out, "conv_t1d"); io = std::move(out);
+                // res0, res1, res2
+                for (int r = 0; r < 3; r++) {
+                    const int ri = r;
+                    if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                            [&](ggml_context* ctx, ggml_tensor* in, std::vector<VaeInputUpload>& u) {
+                                return gb_resunit(ctx, in, kBlocks[0].out_ch,
+                                    dec_blk_[0].res_[ri], kResDilations[ri], u); },
+                            &out, error, "blk0_res")) return false;
+                    char tag[16]; snprintf(tag, sizeof(tag), "res%d", ri);
+                    rms_dump(out, tag); io = std::move(out);
+                }
+                continue;
+            } else if (bisect_mode == 2) {
+                // snake+ct1d fused, then each resunit separate
+                SubGraphIO out;
+                if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                        [&](ggml_context* ctx, ggml_tensor* in, std::vector<VaeInputUpload>& u) {
+                            auto h = gb_snake(ctx, in, dec_blk_[0].snake_a_.data(),
+                                dec_blk_[0].snake_b_.data(), kBlocks[0].in_ch, u);
+                            return gb_conv_t1d(ctx, h, dec_blk_[0].ct1_w_.data(),
+                                kBlocks[0].in_ch, kBlocks[0].out_ch, dec_blk_[0].ct1_K_,
+                                kBlocks[0].stride, kBlocks[0].padding,
+                                dec_blk_[0].ct1_b_.empty()?nullptr:dec_blk_[0].ct1_b_.data(), u); },
+                        &out, error, "blk0_snake_ct1d")) return false;
+                rms_dump(out, "snake+ct1d"); io = std::move(out);
+                for (int r = 0; r < 3; r++) {
+                    const int ri = r;
+                    if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                            [&](ggml_context* ctx, ggml_tensor* in, std::vector<VaeInputUpload>& u) {
+                                return gb_resunit(ctx, in, kBlocks[0].out_ch,
+                                    dec_blk_[0].res_[ri], kResDilations[ri], u); },
+                            &out, error, "blk0_res")) return false;
+                    char tag[16]; snprintf(tag, sizeof(tag), "res%d", ri);
+                    rms_dump(out, tag); io = std::move(out);
+                }
+                continue;
+            } else if (bisect_mode == 3) {
+                // snake+ct1d+res0 fused, res1+res2 fused
+                SubGraphIO out;
+                if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                        [&](ggml_context* ctx, ggml_tensor* in, std::vector<VaeInputUpload>& u) {
+                            auto h = gb_snake(ctx, in, dec_blk_[0].snake_a_.data(),
+                                dec_blk_[0].snake_b_.data(), kBlocks[0].in_ch, u);
+                            h = gb_conv_t1d(ctx, h, dec_blk_[0].ct1_w_.data(),
+                                kBlocks[0].in_ch, kBlocks[0].out_ch, dec_blk_[0].ct1_K_,
+                                kBlocks[0].stride, kBlocks[0].padding,
+                                dec_blk_[0].ct1_b_.empty()?nullptr:dec_blk_[0].ct1_b_.data(), u);
+                            return gb_resunit(ctx, h, kBlocks[0].out_ch,
+                                dec_blk_[0].res_[0], kResDilations[0], u); },
+                        &out, error, "blk0_snake_ct1d_res0")) return false;
+                rms_dump(out, "snake+ct1d+res0"); io = std::move(out);
+                // res1+res2 fused
+                if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
+                        [&](ggml_context* ctx, ggml_tensor* in, std::vector<VaeInputUpload>& u) {
+                            auto h = gb_resunit(ctx, in, kBlocks[0].out_ch,
+                                dec_blk_[0].res_[1], kResDilations[1], u);
+                            return gb_resunit(ctx, h, kBlocks[0].out_ch,
+                                dec_blk_[0].res_[2], kResDilations[2], u); },
+                        &out, error, "blk0_res12")) return false;
+                rms_dump(out, "res1+res2"); io = std::move(out);
+                continue;
+            }
+        }
+        SubGraphIO out;
         if (!run_block_subgraph(cuda_backend_, io.data.data(), io.T, io.C,
                 [&](ggml_context* ctx, ggml_tensor* in,
                     std::vector<VaeInputUpload>& uploads) {
@@ -1284,6 +1395,12 @@ bool VAERunner::decode_blocks(const float* latents, int32_t n_frames,
                 },
                 &out, error, kBlkNames[b]))
             return false;
+        // Diagnostic: RMS after each block
+        if (std::getenv("ACE_STEP_VAE_DEBUG")) {
+            double sq = 0; for (float v : out.data) sq += v*v;
+            fprintf(stderr, "[vae_diag] after block %d: T=%d C=%d RMS=%.4f\n",
+                    b, out.T, out.C, std::sqrt(sq / out.data.size()));
+        }
         io = std::move(out);
     }
 
@@ -1412,7 +1529,9 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
     // Builds 7 sub-graphs instead of 73 per-op calls, keeping data on GPU.
     // If CUDA alloc fails (VRAM exhaustion on large tiles), falls back to
     // the per-op path which has lower peak VRAM (one op at a time).
-    if (cuda_backend_) {
+    // Set ACE_STEP_VAE_SLOW=1 to force the per-op path (with diagnostics).
+    const bool force_slow = std::getenv("ACE_STEP_VAE_SLOW") != nullptr;
+    if (cuda_backend_ && !force_slow) {
         std::string blk_err;
         if (decode_blocks(latents, n_frames, pcm, &blk_err)) {
             return true;

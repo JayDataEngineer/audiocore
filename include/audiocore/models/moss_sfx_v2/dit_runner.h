@@ -56,7 +56,8 @@ private:
     DitConfig cfg_;
 
     std::vector<std::vector<float>> modulation_f32_;
-    std::vector<float> head_modulation_f32_;
+    mutable std::vector<float> head_modulation_f32_;  // Computed per-step: param + temb
+    std::vector<float> head_mod_param_f32_;           // Raw parameter from GGUF
 
     // Static weights read before GPU migration (time embedding + projection)
     std::vector<float> cpu_te0_w_, cpu_te0_b_;
@@ -88,8 +89,8 @@ private:
         ggml_cgraph* gf = nullptr;
         ggml_tensor* x_t = nullptr;
         ggml_tensor* ctx_emb = nullptr;
-        ggml_tensor* pos_q = nullptr;
-        ggml_tensor* pos_k = nullptr;
+        ggml_tensor* pos_q = nullptr;  // self-attn RoPE positions
+        // Note: cross-attn has NO RoPE (matches Python CrossAttention.forward)
         ggml_tensor* output = nullptr;
         std::vector<ggml_tensor*> mod_tensors;  // [layer*6..layer*6+5] for chunks
         int32_t T_latent = 0;

@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='13' width='3' height='6' rx='1.5' fill='%236366f1'/><rect x='9' y='9' width='3' height='14' rx='1.5' fill='%236366f1'/><rect x='15' y='5' width='3' height='22' rx='1.5' fill='%236366f1'/><rect x='21' y='9' width='3' height='14' rx='1.5' fill='%236366f1'/><rect x='27' y='13' width='3' height='6' rx='1.5' fill='%236366f1'/></svg>">
 </head>
 <body>
 
@@ -16,25 +17,33 @@
 <!-- ════════════════════════════════════════════════════════════════════ -->
 <header class="topbar">
   <div class="brand">
-    <div class="brand-mark">
-      <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
+    <div class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="22" height="22">
         <defs>
           <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#818cf8"/>
-            <stop offset="100%" stop-color="#6366f1"/>
+            <stop offset="0%"   stop-color="#818cf8"/>
+            <stop offset="60%"  stop-color="#6366f1"/>
+            <stop offset="100%" stop-color="#22d3ee"/>
           </linearGradient>
         </defs>
-        <rect x="3" y="13" width="3" height="6" rx="1.5" fill="url(#g)"/>
-        <rect x="9" y="9"  width="3" height="14" rx="1.5" fill="url(#g)"/>
-        <rect x="15" y="5" width="3" height="22" rx="1.5" fill="url(#g)"/>
-        <rect x="21" y="9" width="3" height="14" rx="1.5" fill="url(#g)"/>
-        <rect x="27" y="13" width="3" height="6" rx="1.5" fill="url(#g)"/>
+        <rect x="3"  y="13" width="3" height="6"  rx="1.5" fill="url(#g)"/>
+        <rect x="9"  y="9"  width="3" height="14" rx="1.5" fill="url(#g)"/>
+        <rect x="15" y="5"  width="3" height="22" rx="1.5" fill="url(#g)"/>
+        <rect x="21" y="9"  width="3" height="14" rx="1.5" fill="url(#g)"/>
+        <rect x="27" y="13" width="3" height="6"  rx="1.5" fill="url(#g)"/>
       </svg>
     </div>
-    <h1>audiocore</h1>
-    <span class="brand-sub">voice studio</span>
+    <div class="brand-text">
+      <h1>audiocore</h1>
+      <span class="brand-sub">voice studio</span>
+    </div>
   </div>
   <div class="topbar-right">
+    <div class="engine-dots" id="engine-dots">
+      <span class="engine-dot" id="engine-tts"  title="Speech / TTS engine">TTS</span>
+      <span class="engine-dot" id="engine-vd"   title="Voice Design engine">VD</span>
+      <span class="engine-dot" id="engine-music" title="Music engine">Music</span>
+    </div>
     <span class="badge" id="model-badge">connecting…</span>
   </div>
 </header>
@@ -43,12 +52,12 @@
 <!-- TABS                                                                 -->
 <!-- ════════════════════════════════════════════════════════════════════ -->
 <nav class="tabs" role="tablist">
-  <button class="tab active" data-tab="design"     role="tab">✨ Voice Design</button>
-  <button class="tab"        data-tab="maker"      role="tab">🎛️ Voice Maker</button>
-  <button class="tab"        data-tab="synthesize" role="tab">🗣️ Synthesize</button>
-  <button class="tab"        data-tab="music"      role="tab">🎵 Music</button>
-  <button class="tab"        data-tab="voices"     role="tab">🎭 Voices</button>
-  <button class="tab"        data-tab="clips"      role="tab">🎬 Clips</button>
+  <button class="tab active" data-tab="design"     role="tab"><span class="tab-emoji">✨</span> Voice Design<span class="tab-key">1</span></button>
+  <button class="tab"        data-tab="maker"      role="tab"><span class="tab-emoji">🎛️</span> Voice Maker<span class="tab-key">2</span></button>
+  <button class="tab"        data-tab="synthesize" role="tab"><span class="tab-emoji">🗣️</span> Synthesize<span class="tab-key">3</span></button>
+  <button class="tab"        data-tab="music"      role="tab"><span class="tab-emoji">🎵</span> Music<span class="tab-key">4</span></button>
+  <button class="tab"        data-tab="voices"     role="tab"><span class="tab-emoji">🎭</span> Voices<span class="tab-key">5</span></button>
+  <button class="tab"        data-tab="clips"      role="tab"><span class="tab-emoji">🎬</span> Clips<span class="tab-key">6</span></button>
 </nav>
 
 <main class="shell">
@@ -58,8 +67,10 @@
     <div class="panel-grid">
       <div class="card">
         <div class="card-head">
-          <h2>Describe the voice</h2>
-          <p class="card-sub">Natural-language description → unique speaker. Powered by Qwen3-TTS VoiceDesign.</p>
+          <div>
+            <h2>Describe the voice</h2>
+            <p class="card-sub">Natural-language description → unique speaker. Powered by Qwen3-TTS VoiceDesign.</p>
+          </div>
         </div>
 
         <div class="preset-chips" id="vd-presets">
@@ -102,7 +113,12 @@
           <h2>Preview</h2>
         </div>
         <div class="player-area" id="vd-player">
-          <div class="player-empty">Generated audio appears here</div>
+          <div class="player-empty">
+            <div class="eq-bars" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div>Generated audio appears here</div>
+          </div>
         </div>
       </div>
     </div>
@@ -112,13 +128,15 @@
   <section class="panel" id="tab-maker">
     <div class="card">
       <div class="card-head">
-        <h2>Voice Maker</h2>
-        <p class="card-sub">
-          Three mathematical knobs for shaping voices without re-encoding audio.
-          Blend two voices with <b>SLERP</b>, push a voice along a
-          <b>steering vector</b>, or discover new directions from labelled
-          groups. Results are saved to your Voices library.
-        </p>
+        <div>
+          <h2>Voice Maker</h2>
+          <p class="card-sub">
+            Three mathematical knobs for shaping voices without re-encoding audio.
+            Blend two voices with <b>SLERP</b>, push a voice along a
+            <b>steering vector</b>, or discover new directions from labelled
+            groups. Results are saved to your Voices library.
+          </p>
+        </div>
       </div>
 
       <!-- Knob 1: SLERP / linear blend -->
@@ -263,7 +281,7 @@
         <div class="actions">
           <button class="btn btn-ghost"   id="mk-shape-preview" type="button">▶️ Preview</button>
           <button class="btn btn-primary" id="mk-shape-save"    type="button">💾 Save shaping</button>
-          <button class="btn btn-ghost"   id="mk-shape-clear"   type="button" type="button">🗑️ Reset</button>
+          <button class="btn btn-ghost"   id="mk-shape-clear"   type="button">🗑️ Reset</button>
         </div>
         <div class="status" id="mk-shape-status"></div>
         <div class="player-area" id="mk-shape-player" hidden></div>
@@ -275,9 +293,7 @@
   <section class="panel" id="tab-synthesize">
     <div class="panel-grid">
       <div class="card">
-        <div class="card-head">
-          <h2>Compose</h2>
-        </div>
+        <div class="card-head"><h2>Compose</h2></div>
 
         <textarea id="syn-text" rows="3"
           placeholder="Type something to speak…">I just can't believe you're really gone.</textarea>
@@ -340,7 +356,12 @@
       <div class="card">
         <div class="card-head"><h2>Preview</h2></div>
         <div class="player-area" id="syn-player">
-          <div class="player-empty">Generated audio appears here</div>
+          <div class="player-empty">
+            <div class="eq-bars" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div>Generated audio appears here</div>
+          </div>
         </div>
       </div>
     </div>
@@ -351,12 +372,14 @@
     <div class="panel-grid">
       <div class="card">
         <div class="card-head">
-          <h2>Compose</h2>
-          <p class="card-sub">ACE-Step generates music from a text caption. Four modes:
-            <b>Text-to-Music</b> (generate from scratch),
-            <b>Cover</b> (remix an existing clip),
-            <b>Repaint</b> (regenerate a region of an existing clip), and
-            <b>Completion</b> (extend a clip with new material).</p>
+          <div>
+            <h2>Compose</h2>
+            <p class="card-sub">ACE-Step generates music from a text caption. Four modes:
+              <b>Text-to-Music</b> (generate from scratch),
+              <b>Cover</b> (remix an existing clip),
+              <b>Repaint</b> (regenerate a region of an existing clip), and
+              <b>Completion</b> (extend a clip with new material).</p>
+          </div>
         </div>
 
         <div class="form-row">
@@ -430,7 +453,12 @@
       <div class="card">
         <div class="card-head"><h2>Preview</h2></div>
         <div class="player-area" id="mus-player">
-          <div class="player-empty">Generated audio appears here</div>
+          <div class="player-empty">
+            <div class="eq-bars" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div>Generated audio appears here</div>
+          </div>
         </div>
       </div>
     </div>
@@ -440,17 +468,24 @@
   <section class="panel" id="tab-voices">
     <div class="card">
       <div class="card-head">
-        <h2>Voices</h2>
-        <p class="card-sub">QWEN3VOICE files (2048-d ECAPA-TDNN embeddings). Reusable across synthesis calls.</p>
+        <div>
+          <h2>Voices</h2>
+          <p class="card-sub">QWEN3VOICE files (2048-d ECAPA-TDNN embeddings). Reusable across synthesis calls. Drag &amp; drop <code>.voice</code> files anywhere to upload.</p>
+        </div>
       </div>
-      <div class="actions">
+      <div class="library-bar">
+        <div class="search">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="7" cy="7" r="4.5"/><path d="M11 11l3 3" stroke-linecap="round"/></svg>
+          <input type="text" id="voice-search" placeholder="Search voices…">
+        </div>
+        <span class="count" id="voice-count">—</span>
         <input type="file" id="voice-upload-file" accept=".voice,audio/*" multiple>
         <button class="btn btn-primary" id="voice-upload-btn" type="button">⬆️ Upload</button>
         <button class="btn btn-ghost" id="voice-refresh" type="button">↻ Refresh</button>
       </div>
       <div class="status" id="voice-status"></div>
       <div class="voices-grid" id="voices-list">
-        <div class="empty"><div class="empty-icon">🎭</div>Loading voices…</div>
+        <div class="empty"><div class="empty-icon">🎭</div><div class="empty-title">Loading voices…</div></div>
       </div>
     </div>
   </section>
@@ -459,22 +494,51 @@
   <section class="panel" id="tab-clips">
     <div class="card">
       <div class="card-head">
-        <h2>Clips</h2>
-        <p class="card-sub">All generated audio lives here.</p>
+        <div>
+          <h2>Clips</h2>
+          <p class="card-sub">All generated audio lives here. Drag &amp; drop audio files anywhere to upload.</p>
+        </div>
       </div>
-      <div class="actions">
+      <div class="library-bar">
+        <div class="search">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="7" cy="7" r="4.5"/><path d="M11 11l3 3" stroke-linecap="round"/></svg>
+          <input type="text" id="clip-search" placeholder="Search clips…">
+        </div>
+        <span class="count" id="clip-count">—</span>
         <input type="file" id="clip-upload-file" accept="audio/*" multiple>
         <button class="btn btn-primary" id="clip-upload-btn" type="button">⬆️ Upload</button>
         <button class="btn btn-ghost" id="clip-refresh" type="button">↻ Refresh</button>
       </div>
       <div class="status" id="clip-status"></div>
       <div class="clips-grid" id="clips-list">
-        <div class="empty"><div class="empty-icon">🎬</div>Loading clips…</div>
+        <div class="empty"><div class="empty-icon">🎬</div><div class="empty-title">Loading clips…</div></div>
       </div>
     </div>
   </section>
 
 </main>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!-- FOOTER                                                               -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<footer class="footer">
+  <div>audiocore voice studio · <span id="footer-uptime">—</span></div>
+  <div class="footer-keys">
+    <span><span class="kbd">1</span>–<span class="kbd">6</span> switch tab</span>
+    <span><span class="kbd">⌘/Ctrl</span> + <span class="kbd">↵</span> run</span>
+    <span><span class="kbd">/</span> search library</span>
+  </div>
+</footer>
+
+<div class="drop-overlay" id="drop-overlay">
+  <div class="drop-card">
+    <div style="font-size: 40px;">📥</div>
+    <div>Drop files to upload</div>
+    <div style="font-size: 12px; opacity: .7; font-weight: 400;">
+      <span id="drop-target-label">Voices &amp; Clips</span>
+    </div>
+  </div>
+</div>
 
 <div class="toast" id="toast"></div>
 

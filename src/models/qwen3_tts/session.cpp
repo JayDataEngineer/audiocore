@@ -315,6 +315,15 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
             vc_spk_emb.resize((size_t)d, 0.0f);
         }
         if (!vc_spk_emb.empty()) {
+            // Apply embedding strength scaling. 1.0 = original (unchanged).
+            // <1.0 = softer/more neutral voice, >1.0 = stronger/more pronounced.
+            // Scales the embedding vector magnitude, which controls how strongly
+            // the speaker identity influences generation vs. the instruct text.
+            if (req.embedding_strength != 1.0f && req.embedding_strength > 0.0f) {
+                std::fprintf(stderr, "qwen3_tts: voice clone: applying embedding_strength=%.3f\n",
+                             req.embedding_strength);
+                for (auto& v : vc_spk_emb) v *= req.embedding_strength;
+            }
             std::fprintf(stderr, "qwen3_tts: voice clone: ECAPA embedding ready (%zu dims)\n",
                          vc_spk_emb.size());
         }

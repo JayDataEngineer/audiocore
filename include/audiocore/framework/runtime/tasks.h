@@ -50,6 +50,33 @@ struct AudioStreamCallbacks {
     std::function<void(const char* phase, float pct, const char* msg)> on_progress;
 };
 
+// ── Voice Activity Detection (silero_vad family) ──────────────────────────
+struct VadSegment {
+    int64_t start_sample = 0;
+    int64_t end_sample   = 0;
+    float   start_sec    = 0.0f;
+    float   end_sec      = 0.0f;
+};
+
+struct VadRequest {
+    std::string audio_path;              // input WAV (16 kHz mono expected)
+    int         sample_rate          = 16000;
+    float       threshold            = 0.5f;   // speech probability threshold
+    float       min_speech_dur_sec   = 0.0f;
+    float       max_speech_dur_sec   = 30.0f;
+    float       min_silence_dur_sec  = 2.0f;
+    float       speech_pad_ms        = 30.0f;
+    // If true, populate VadResponse.probabilities with per-chunk speech
+    // probabilities (debug / visualization). Otherwise left empty.
+    bool        emit_probabilities   = false;
+};
+
+struct VadResponse {
+    std::vector<VadSegment> segments;
+    std::vector<float>      probabilities;  // per-chunk, only if requested
+    std::string             error;
+};
+
 // ── Text-to-Speech ────────────────────────────────────────────────────────
 struct TtsRequest {
     // ── Core (every TTS family reads these) ──
@@ -82,6 +109,10 @@ struct TtsRequest {
     std::string quality;               // MOSS: free-text quality hint (empty = "None")
     int32_t     duration_tokens = 0;   // MOSS: duration hint in codec frames (0 = "None"; 1s ≈ 12.5)
 
+    // ── Diffusion (moss_sfx_v2) knobs ──
+    int32_t     n_diffusion_steps = 50;     // number of denoising steps
+    float       guidance_scale    = 5.0f;   // CFG guidance scale
+
     // ── Per-family text-column sampling (MOSS exposes independent text/audio params) ──
     float       text_temperature = 0.0f;  // 0 → use family default (MOSS: 1.5)
     float       text_top_p       = 0.0f;  // 0 → use family default (MOSS: 1.0)
@@ -90,6 +121,7 @@ struct TtsRequest {
     // ── Qwen3-TTS knobs ──
     float       speed = 1.0f;                 // speed multiplier
     float       repetition_penalty = 1.05f;   // repetition penalty (CB0, HuggingFace style)
+    float       embedding_strength = 1.0f;    // speaker embedding scale [0.0..2.0+]; 1.0=normal, <1=softer, >1=stronger
 
     // ── Voice sidecar DSP defaults ──
     // Populated by resolve_voice_field() when a `<name>.voice.json` sidecar

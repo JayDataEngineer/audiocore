@@ -16,13 +16,19 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <vector>
 
 namespace audiocore::moss_sfx_v2 {
 
 // ── Scheduler helper: run one VAE op graph via GPU scheduler ──────────────
-struct VaeInputUpload { ggml_tensor* t; const void* data; size_t nbytes; };
+struct VaeInputUpload {
+    ggml_tensor* t;
+    const void* data;
+    size_t nbytes;
+    std::shared_ptr<void> owned;  // keeps data buffer alive until upload
+};
 
 // ── Log filter: suppress ggml DEBUG-level messages (cosmetic reallocs) ──
 static void vae_log_filter(enum ggml_log_level level, const char* text, void* user_data) {
@@ -143,13 +149,14 @@ bool Conv1dOp::run(const float* x, int T_in, std::vector<float>& out,
         // Use pre-cached F16 if available; otherwise convert on-the-fly
         if (!weight_f16.empty()) {
             ggml_set_input(w);
-            uploads.push_back({w, weight_f16.data(), n_w * sizeof(ggml_fp16_t)});
+            uploads.push_back({w, weight_f16.data(), n_w * sizeof(ggml_fp16_t), nullptr});
         } else {
-            static thread_local std::vector<ggml_fp16_t> w16;
-            w16.resize(n_w);
-            for (size_t i = 0; i < n_w; i++) w16[i] = ggml_fp32_to_fp16(weight_f32[i]);
+            // Each conv1d needs its OWN weight buffer — a static thread_local
+            // would alias across multiple conv1d ops in the same sub-graph.
+            auto w16 = std::make_shared<std::vector<ggml_fp16_t>>(n_w);
+            for (size_t i = 0; i < n_w; i++) (*w16)[i] = ggml_fp32_to_fp16(weight_f32[i]);
             ggml_set_input(w);
-            uploads.push_back({w, w16.data(), n_w * sizeof(ggml_fp16_t)});
+            uploads.push_back({w, w16->data(), n_w * sizeof(ggml_fp16_t), w16});
         }
     } else {
         ggml_fp16_t* wd = static_cast<ggml_fp16_t*>(w->data);
@@ -252,6 +259,20 @@ void ConvT1dOp::cache_f16() {
                         weight_2d[static_cast<size_t>(k) * OC * IC +
                                   static_cast<size_t>(oc) * IC + ic];
     }
+
+    // Col2im-ordered weight: same values as weight_2d but with the
+    // K*OC column dimension indexed as oc*K+k (matching col2im_1d kernel)
+    // instead of k*OC+oc (matching ggml_conv_transpose_1d).
+    if (weight_2d_c2i.empty()) {
+        weight_2d_c2i.resize(static_cast<size_t>(IC) * K * OC);
+        for (int ic = 0; ic < IC; ic++)
+            for (int oc = 0; oc < OC; oc++)
+                for (int k = 0; k < K; k++)
+                    weight_2d_c2i[static_cast<size_t>(ic) +
+                                  (static_cast<size_t>(oc) * K + k) * IC] =
+                        weight_2d[static_cast<size_t>(ic) +
+                                  (static_cast<size_t>(k) * OC + oc) * IC];
+    }
 }
 
 bool ConvT1dOp::run(const float* x, int T_in, std::vector<float>& out,
@@ -275,20 +296,19 @@ bool ConvT1dOp::run(const float* x, int T_in, std::vector<float>& out,
     if (use_sched) {
         if (!weight_f16.empty()) {
             ggml_set_input(w);
-            uploads.push_back({w, weight_f16.data(), n_w * sizeof(ggml_fp16_t)});
+            uploads.push_back({w, weight_f16.data(), n_w * sizeof(ggml_fp16_t), nullptr});
         } else {
-            static thread_local std::vector<ggml_fp16_t> w16;
-            w16.resize(n_w);
+            auto w16 = std::make_shared<std::vector<ggml_fp16_t>>(n_w);
             for (int ic = 0; ic < IC; ic++)
                 for (int oc = 0; oc < OC; oc++)
                     for (int k = 0; k < K; k++)
-                        w16[k + static_cast<size_t>(oc) * K +
+                        (*w16)[k + static_cast<size_t>(oc) * K +
                             static_cast<size_t>(ic) * K * OC] =
                             ggml_fp32_to_fp16(
                                 weight_2d[static_cast<size_t>(k) * OC * IC +
                                           static_cast<size_t>(oc) * IC + ic]);
             ggml_set_input(w);
-            uploads.push_back({w, w16.data(), n_w * sizeof(ggml_fp16_t)});
+            uploads.push_back({w, w16->data(), n_w * sizeof(ggml_fp16_t), w16});
         }
     } else {
         ggml_fp16_t* wd = static_cast<ggml_fp16_t*>(w->data);
@@ -854,19 +874,22 @@ static ggml_tensor* graph_conv_t1d(ggml_context* ctx, ggml_tensor* x,
     // x has ne=[T_in, IC]. Transpose to [IC, T_in] for mul_mat contraction over IC.
     ggml_tensor* x_t = ggml_cont(ctx, ggml_transpose(ctx, x));
 
-    // Weight: weight_2d is already in [IC, K*OC] row-major layout
-    // (from permute_conv_t1d_weight), which matches ggml ne=[IC, K*OC].
+    // Weight: weight_2d_c2i has ne=[IC, K*OC] with the K*OC column dimension
+    // indexed as oc*K+k — the ordering that col2im_1d's CUDA kernel expects.
+    // (The old weight_2d uses k*OC+oc, which transposes (oc,k) in col2im.)
     ggml_tensor* w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
                                          conv.IC, conv.K * conv.OC);
     ggml_set_input(w);
     if (prefix) ggml_set_name(w, prefix);
-    uploads.push_back({w, conv.weight_2d.data(),
+    uploads.push_back({w, conv.weight_2d_c2i.data(),
                        static_cast<size_t>(conv.IC) * conv.K * conv.OC * sizeof(float)});
 
-    // mul_mat(w[IC, K*OC], x_t[IC, T_in]) → result [K*OC, T_in]
+    // mul_mat(w[IC, K*OC], x_t[IC, T_in]) → col [K*OC, T_in]
+    // col row j=oc*K+k holds sum_ic W[ic,oc,k] * x[t_in,ic]
     ggml_tensor* col = ggml_mul_mat(ctx, w, x_t);
 
     // col2im_1d: [K*OC, T_in] → [T_out, OC]
+    // Kernel reads col[(oc*K+k) + t_in*K_OC] — now matches our column ordering.
     // T_out = (T_in - 1) * stride + K - 2 * pad
     ggml_tensor* r = ggml_col2im_1d(ctx, col, conv.stride, conv.OC, conv.pad);
 

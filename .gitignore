@@ -34,6 +34,17 @@ config/secrets.env
 !config/*.env.example
 !examples/*.env.example
 
+# Cloud VLM (media-mcp cloud_vlm) credentials. The real key lives OUTSIDE
+# the repo at ~/.local/share/opencode/auth.json and is never touched by git.
+# These entries are belt-and-braces — they catch any accidental local copy
+# (e.g. someone runs `cp ~/.local/share/opencode/auth.json .` while debugging).
+auth.json
+opencode_auth.json
+opencode-auth.json
+.cloud_vlm_key
+media_cloud_vlm_api_key
+secrets.json
+
 # Internal notes / scratch docs (private to the maintainer; never ship).
 notes/
 

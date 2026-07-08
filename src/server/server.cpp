@@ -317,6 +317,8 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("max_new_tokens"))      tr.max_new_tokens      = body["max_new_tokens"].get<int32_t>();
         if (body.contains("max_tokens"))          tr.max_new_tokens      = body["max_tokens"].get<int32_t>();
         if (body.contains("repetition_penalty"))  tr.repetition_penalty  = body["repetition_penalty"].get<float>();
+        if (body.contains("embedding_strength"))   tr.embedding_strength   = body["embedding_strength"].get<float>();
+        if (body.contains("voice_strength"))       tr.embedding_strength   = body["voice_strength"].get<float>();
         if (body.contains("speaker_embedding") && body["speaker_embedding"].is_string()) {
             std::string b64 = body["speaker_embedding"].get<std::string>();
             if (!b64.empty()) {
@@ -610,6 +612,8 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("max_new_tokens"))      tr.max_new_tokens      = body["max_new_tokens"].get<int32_t>();
         if (body.contains("max_tokens"))          tr.max_new_tokens      = body["max_tokens"].get<int32_t>();
         if (body.contains("repetition_penalty"))  tr.repetition_penalty  = body["repetition_penalty"].get<float>();
+        if (body.contains("embedding_strength"))   tr.embedding_strength   = body["embedding_strength"].get<float>();
+        if (body.contains("voice_strength"))       tr.embedding_strength   = body["voice_strength"].get<float>();
         if (body.contains("speaker_embedding") && body["speaker_embedding"].is_string()) {
             std::string b64 = body["speaker_embedding"].get<std::string>();
             if (!b64.empty()) {

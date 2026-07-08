@@ -11,6 +11,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "audiocore/framework/core/backend.h"
 #include "audiocore/framework/io/weight_loader.h"
@@ -49,13 +50,30 @@ public:
     // are shared across every TTS family; MusicRequest/MusicResponse are
     // defined in ace_step/family.h (the only music family).
     //
-    // Scope: TTS + music generation only. ASR / transcription is explicitly
+    // Scope: TTS + music generation + VAD. ASR / transcription is explicitly
     // out of scope — those go through CrispASR / whisper.cpp upstream, not
     // here.
     virtual bool run_tts(const void* request, void* response,
                          std::string* error = nullptr)   { return false; }
     virtual bool run_music(const void* request, void* response,
                            std::string* error = nullptr) { return false; }
+
+    // Voice Activity Detection. Optional — only the silero_vad family
+    // implements this currently (MarbleNet VAD will slot in here too when
+    // ported). Same void*-erasure pattern as run_tts / run_music: caller
+    // casts to VadRequest/VadResponse from tasks.h.
+    virtual bool run_vad(const void* request, void* response,
+                         std::string* error = nullptr)   { return false; }
+
+    // Compute a speaker embedding from a reference WAV, for later reuse via
+    // TtsRequest.speaker_embedding (the voice-caching pattern: compute once,
+    // save, reuse across many calls). Currently only qwen3_tts implements
+    // this (ECAPA-TDNN encoder); other families return empty + error.
+    virtual std::vector<float> compute_embedding(const std::string& wav_path,
+                                                  std::string* error = nullptr) {
+        if (error) *error = "compute_embedding not supported by this family";
+        return {};
+    }
 
     bool loaded() const { return loaded_; }
 

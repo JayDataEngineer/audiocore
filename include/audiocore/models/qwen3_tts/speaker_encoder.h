@@ -62,6 +62,12 @@ public:
     // Lower-level: mel → speaker embedding. `mel_TC` is (T_mel, 128) row-major.
     std::vector<float> run_on_mel(const float* mel_TC, int T_mel);
 
+    // Register a weight tensor with its GGUF-mmap host pointer. Called from
+    // the loader after bind(): meta_ctx tensors have data==NULL (no_alloc),
+    // so the mmap pointer must be supplied explicitly by the caller via
+    // GgufReader::find() + tensor_data_ptr(). Mirrors codec.cpp's pattern.
+    void register_weight(ggml_tensor* t, const void* host_data, size_t nbytes);
+
     // Mel spectrogram: 24 kHz mono PCM → (T, 128) log-mel for ECAPA input.
     // Parameters: n_fft=1024, hop=256, n_mels=128, fmin=0, fmax=12000,
     // reflect-pad, periodic Hann, magnitude STFT, Slaney mel filterbank,
@@ -94,9 +100,26 @@ private:
 
     // ── Runtime state ────────────────────────────────────────────────
     bool                loaded_   = false;
-    ggml_backend_t      backend_  = nullptr;  // not owned
-    ggml_backend_sched_t sched_   = nullptr;  // owned
+    ggml_backend_t      backend_  = nullptr;  // not owned (kept for logging)
+    ggml_backend_t      cpu_backend_ = nullptr;  // owned — single CPU backend
     std::vector<uint8_t> compute_meta_;       // scratch for ggml_init
+
+    // Weight source pointers: each weight tensor resolved in bind() has its
+    // GGUF-mmap host pointer saved here. run_on_mel() builds a fresh graph
+    // + gallocr per call; gallocr sees weight tensors with buffer==NULL and
+    // allocates fresh zero-initialized CPU buffers for them, overwriting
+    // tensor->data. upload_weights_() copies the saved mmap data into those
+    // new buffers after allocation. Without this, every weight is silently
+    // zero and the ECAPA forward produces an all-zero embedding (latent bug
+    // masked by the parallel ICL codec-token path carrying voice identity).
+    struct WeightSrc {
+        ggml_tensor* tensor;
+        const void*  data;    // host pointer into GGUF mmap
+        size_t       nbytes;
+    };
+    std::vector<WeightSrc> weight_srcs_;
+    void reset_weight_data_();
+    void upload_weights_();
 
     // ── Graph helpers (adapted from CrispASR) ────────────────────────
     static ggml_tensor* same_conv1d_(ggml_context* ctx, ggml_tensor* x,

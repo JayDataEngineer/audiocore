@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MANIFEST="$PROJECT_DIR/models/manifest.json"
 MODELS_DIR="${AUDIOCORE_MODELS_DIR:-$PROJECT_DIR/weights}"
-BUILD_DIR="${AUDIOCORE_BUILD_DIR:-$PROJECT_DIR/build/bin}"
+BUILD_DIR="${AUDIOCORE_BUILD_DIR:-$PROJECT_DIR/build}"
 DRY_RUN=0
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -105,8 +105,9 @@ download_one() {
     # HF: a `subpath` means we have to enumerate the safetensors in the dir.
     # The C++ converter is the right place to enumerate — fetch_models hands
     # the repo path off to it directly.
-    local sha256
+    local sha256 subpath_is_set
     sha256="$(jq -r '.sha256 // ""' <<<"$source_json")"
+    subpath_is_set="$(jq -r 'has("subpath")' <<<"$source_json")"
 
     local dest="$dest_dir/$filename"
     mkdir -p "$dest_dir"
@@ -114,8 +115,8 @@ download_one() {
     case "$provider" in
         huggingface)
             # `filename` in the manifest means a single resolvable file. `subpath`
-            # means a directory the converter scrapes itself.
-            if [ -n "$hf_filename" ] && [[ "$hf_filename" != */ ]]; then
+            # means a directory the converter scrapes itself — triggers git clone.
+            if [ -n "$hf_filename" ] && [[ "$hf_filename" != */ ]] && [ "$subpath_is_set" != "true" ]; then
                 local url; url="$(build_hf_url "$repo" "$rev" "$hf_filename")"
                 if [ -f "$dest" ]; then
                     echo "  have: $dest"
@@ -173,8 +174,8 @@ download_one() {
                     echo "  convert (in-place): $bin --in $dest"
                     [ $DRY_RUN -eq 1 ] || "$bin" --in "$dest"
                 else
-                    echo "  convert: $bin $dest_dir/$repo"
-                    [ $DRY_RUN -eq 1 ] || "$bin" "$dest_dir/$repo"
+                    echo "  convert: $bin $dest_dir/$repo --outdir $dest_dir"
+                    [ $DRY_RUN -eq 1 ] || "$bin" "$dest_dir/$repo" --outdir "$dest_dir"
                 fi
                 ;;
             *)

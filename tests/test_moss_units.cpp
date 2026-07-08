@@ -13,6 +13,9 @@
 
 using namespace audiocore::moss;
 
+// Local constant for test dimension (the default 32-codebook layout).
+static constexpr int32_t N_VQ = 32;
+
 // ── Test macros (void-safe, accumulate failures) ────────────────────────────
 static int g_n_pass = 0;
 static int g_n_fail = 0;
@@ -34,7 +37,7 @@ static int g_n_fail = 0;
 // =========================================================================
 
 static void test_init_delay_state_empty() {
-    auto s = init_delay_state({});
+    auto s = init_delay_state({}, N_VQ);
     CHECK(s.audio_buf.empty(), "empty prompt → empty audio_buf");
     CHECK(s.text_history.empty(), "empty prompt → empty text_history");
     CHECK(!s.is_audio, "empty prompt → is_audio=false");
@@ -48,7 +51,7 @@ static void test_init_delay_state_text_only() {
         for (int s = 0; s < N_VQ; ++s)
             prompt[i][1 + s] = AUDIO_PAD_CODE;
     }
-    auto s = init_delay_state(prompt);
+    auto s = init_delay_state(prompt, N_VQ);
     CHECK_EQUAL(s.text_history.size(), 5, "5 text history entries");
     CHECK_EQUAL(s.audio_buf.size(), 5, "5 audio buf entries");
     CHECK_EQUAL(s.audio_length, 0, "audio_length=0 with no audio start");
@@ -59,7 +62,7 @@ static void test_init_delay_state_with_audio() {
     std::vector<std::vector<int32_t>> prompt(5, std::vector<int32_t>(1 + N_VQ, 0));
     for (int i = 0; i < 4; ++i) prompt[i][0] = 100 + i;
     prompt[4][0] = AUDIO_START_TOKEN_ID;
-    auto s = init_delay_state(prompt);
+    auto s = init_delay_state(prompt, N_VQ);
     CHECK_EQUAL(s.audio_length, 1, "audio_length=1 with audio start at end");
     CHECK(s.is_audio, "is_audio=true with audio start");
 }
@@ -105,7 +108,7 @@ static void test_apply_de_delay_basic() {
         for (int s = 0; s < N_VQ; ++s)
             input[t][s] = t;
 
-    auto output = apply_de_delay_pattern(input);
+    auto output = apply_de_delay_pattern(input, N_VQ);
     // output size = T_delayed - N_VQ + 1 = 37 - 32 + 1 = 6
     CHECK_EQUAL((int)output.size(), 6, "output has T_delayed - N_VQ + 1 frames");
     // result[t][s] = input[t+s][s] = t+s
@@ -116,13 +119,13 @@ static void test_apply_de_delay_basic() {
 }
 
 static void test_apply_de_delay_empty() {
-    auto result = apply_de_delay_pattern({});
+    auto result = apply_de_delay_pattern({}, N_VQ);
     CHECK(result.empty(), "empty input → empty output");
 }
 
 static void test_apply_de_delay_short() {
     std::vector<std::vector<int32_t>> input(10, std::vector<int32_t>(N_VQ, 0));
-    auto result = apply_de_delay_pattern(input);
+    auto result = apply_de_delay_pattern(input, N_VQ);
     CHECK(result.empty(), "< N_VQ frames → empty");
 }
 
@@ -138,7 +141,7 @@ static void test_extract_audio_segments() {
         for (int s = 0; s < N_VQ; ++s)
             input[t][s] = t;  // small ints, never AUDIO_PAD_CODE
 
-    auto result = extract_audio_segments(input);
+    auto result = extract_audio_segments(input, N_VQ);
     CHECK(!result.empty(), "non-pad frames → non-empty");
     // After de-delay: result[t][s] = t+s, all != 1024, so frames should be kept
     // Output size should be T_delayed - N_VQ + 1 = 6
@@ -147,12 +150,12 @@ static void test_extract_audio_segments() {
 
 static void test_extract_audio_segments_all_pad() {
     std::vector<std::vector<int32_t>> input(33, std::vector<int32_t>(N_VQ, AUDIO_PAD_CODE));
-    auto result = extract_audio_segments(input);
+    auto result = extract_audio_segments(input, N_VQ);
     CHECK(result.empty(), "all pad → empty");
 }
 
 static void test_extract_audio_segments_empty() {
-    auto result = extract_audio_segments({});
+    auto result = extract_audio_segments({}, N_VQ);
     CHECK(result.empty(), "empty → empty");
 }
 

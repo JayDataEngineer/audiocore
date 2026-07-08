@@ -14,15 +14,17 @@
     el.className = "status" + (type ? " " + type : "");
   }
 
+  let toastTimer = null;
   function toast(msg, type) {
     const t = $("#toast");
     t.textContent = msg;
     t.className = "toast show " + (type || "ok");
-    clearTimeout(t._timer);
-    t._timer = setTimeout(() => (t.className = "toast"), 3000);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (t.className = "toast"), 3200);
   }
 
   function fmt_size(n) {
+    if (n == null) return "?";
     for (const u of ["B", "KB", "MB", "GB"]) {
       if (n < 1024) return n.toFixed(u === "B" ? 0 : 1) + " " + u;
       n /= 1024;
@@ -62,27 +64,75 @@
 
   function clear_player(el) {
     el.classList.remove("has-audio");
-    el.innerHTML = '<div class="player-empty">Generated audio appears here</div>';
+    el.innerHTML = emptyPlayerMarkup();
+  }
+
+  function emptyPlayerMarkup(label) {
+    return '<div class="player-empty">' +
+      '<div class="eq-bars" aria-hidden="true">' +
+        '<span></span><span></span><span></span><span></span>' +
+        '<span></span><span></span><span></span>' +
+      '</div>' +
+      '<div>' + esc(label || "Generated audio appears here") + '</div>' +
+    '</div>';
+  }
+
+  // Update slider track fill so the colored portion runs from 0 → thumb.
+  function sync_slider_fill(s) {
+    if (!s) return;
+    const min = parseFloat(s.min || 0);
+    const max = parseFloat(s.max || 100);
+    const v   = parseFloat(s.value);
+    const pct = ((v - min) / (max - min)) * 100;
+    s.style.setProperty("--val", (isNaN(pct) ? 50 : pct) + "%");
+  }
+  function sync_all_sliders() {
+    $$(".slider").forEach(sync_slider_fill);
   }
 
   // ── Tab switching ──────────────────────────────────────────────────
+  const TAB_IDS = ["design", "maker", "synthesize", "music", "voices", "clips"];
+
+  function activate_tab(target, { persist = true } = {}) {
+    $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === target));
+    $$(".panel").forEach((p) =>
+      p.classList.toggle("active", p.id === "tab-" + target)
+    );
+    if (persist) {
+      try { localStorage.setItem("ac:tab", target); } catch (_) {}
+    }
+    if (target === "voices") load_voices();
+    if (target === "clips")  load_clips();
+    if (target === "maker")  refresh_maker_dropdowns();
+    if (target === "music")  refresh_music_sources();
+    if (target === "voices" || target === "clips") {
+      const search = $("#" + (target === "voices" ? "voice-search" : "clip-search"));
+      if (search) setTimeout(() => search.focus(), 50);
+    }
+  }
+
   $$(".tab").forEach((tab) => {
-    tab.addEventListener("click", () => {
-      const target = tab.dataset.tab;
-      $$(".tab").forEach((t) => t.classList.toggle("active", t === tab));
-      $$(".panel").forEach((p) =>
-        p.classList.toggle("active", p.id === "tab-" + target)
-      );
-      if (target === "voices") load_voices();
-      if (target === "clips")  load_clips();
-    });
+    tab.addEventListener("click", () => activate_tab(tab.dataset.tab));
   });
+
+  // Restore last tab on load (default: design).
+  try {
+    const saved = localStorage.getItem("ac:tab");
+    if (saved && TAB_IDS.indexOf(saved) >= 0 && saved !== "design") {
+      activate_tab(saved, { persist: false });
+    }
+  } catch (_) {}
 
   // ── Models ─────────────────────────────────────────────────────────
   let MODELS = [];
   let ACTIVE_TTS = null;
   let ACTIVE_VD  = null;
   let ACTIVE_MUSIC = null;
+
+  function set_engine_dot(id, state) {
+    const el = $("#" + id);
+    if (el) el.className = "engine-dot " + (state || "");
+  }
 
   async function load_models() {
     try {
@@ -94,6 +144,9 @@
       if (!MODELS.length) {
         badge.textContent = "no models";
         badge.className = "badge err";
+        set_engine_dot("engine-tts", "");
+        set_engine_dot("engine-vd", "");
+        set_engine_dot("engine-music", "");
         return;
       }
 
@@ -116,11 +169,23 @@
 
       badge.textContent = MODELS.length + " model" + (MODELS.length === 1 ? "" : "s");
       badge.className = "badge";
+      set_engine_dot("engine-tts",   ACTIVE_TTS   ? "ready" : "");
+      set_engine_dot("engine-vd",    ACTIVE_VD    ? "ready" : "");
+      set_engine_dot("engine-music", ACTIVE_MUSIC ? "ready" : "");
       console.log({ ACTIVE_TTS, ACTIVE_VD, ACTIVE_MUSIC, MODELS });
     } catch (e) {
       $("#model-badge").textContent = "offline";
       $("#model-badge").className = "badge err";
+      set_engine_dot("engine-tts", "");
+      set_engine_dot("engine-vd", "");
+      set_engine_dot("engine-music", "");
     }
+  }
+
+  // Mark a dot as "active" while a request is in flight, then back to ready.
+  function with_engine_dot(id, promise) {
+    set_engine_dot(id, "active");
+    return promise.finally(() => set_engine_dot(id, ACTIVE_TTS || ACTIVE_VD || ACTIVE_MUSIC ? "ready" : ""));
   }
 
   // ── Voice Design tab ───────────────────────────────────────────────
@@ -161,17 +226,18 @@
         text_top_k:  50,
         max_new_tokens: 100,
       };
-      const r = await fetch("/v1/audio/speech", {
+      const p = fetch("/v1/audio/speech", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+      }).then(async (r) => {
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.error || "Voice design failed (" + r.status + ")");
+        }
+        return r.blob();
       });
-      if (!r.ok) {
-        const j = await r.json().catch(() => ({}));
-        status(st, j.error || "Voice design failed (" + r.status + ")", "err");
-        return;
-      }
-      const blob = await r.blob();
+      const blob = await with_engine_dot("engine-vd", p);
       vd_last_blob = blob;
       const url = URL.createObjectURL(blob);
       set_player($("#vd-player"), url,
@@ -253,23 +319,42 @@
     fill($("#mk-shift-dir"),  dir_only,   true);
     fill($("#mk-disc-pos"),   voice_only, false);
     fill($("#mk-disc-neg"),   voice_only, false);
-  }
 
-  // Open the tab → refresh dropdowns.
-  // (the global tab click handler already wires this; we hook in addition)
-  document.addEventListener("click", (e) => {
-    const t = e.target.closest(".tab");
-    if (t && t.dataset.tab === "maker") refresh_maker_dropdowns();
-    if (t && t.dataset.tab === "music") refresh_music_sources();
-  });
+    // Knob 4 dropdown (kept here so a single refresh covers all four knobs).
+    const shapeSel = $("#mk-shape-voice");
+    if (shapeSel) {
+      const cur = shapeSel.value;
+      shapeSel.innerHTML = "";
+      if (!voice_only.length) {
+        const o = document.createElement("option");
+        o.value = ""; o.textContent = "(none available)";
+        shapeSel.appendChild(o);
+      } else {
+        for (const v of voice_only) {
+          const o = document.createElement("option");
+          o.value = v.name;
+          const tag = v.dsp ? `  [pitch ${(v.dsp.pitch_shift||0).toFixed(1)}, sp ${(v.dsp.speed||1).toFixed(2)}]` : "";
+          o.textContent = v.name + tag;
+          shapeSel.appendChild(o);
+        }
+        if (cur) for (const o of shapeSel.options) if (o.value === cur) { shapeSel.value = cur; break; }
+        if (!shapeSel.value && voice_only.length) {
+          shapeSel.selectedIndex = 0;
+          load_shape_for_voice();
+        }
+      }
+    }
+  }
 
   // Live slider value displays
   $("#mk-blend-t").addEventListener("input", (e) => {
     $("#mk-blend-t-val").textContent = parseFloat(e.target.value).toFixed(2);
+    sync_slider_fill(e.target);
   });
   $("#mk-shift-scale").addEventListener("input", (e) => {
     const v = parseFloat(e.target.value);
     $("#mk-shift-scale-val").textContent = (v >= 0 ? "+" : "") + v.toFixed(2);
+    sync_slider_fill(e.target);
   });
 
   // Knob 1: blend
@@ -358,10 +443,6 @@
   });
 
   // ── Knob 4: Shape voice (DSP sidecar) ──────────────────────────────
-  // Loads the saved pitch/speed for the selected voice into the sliders,
-  // then Preview runs a one-shot TTS using the slider values, and Save
-  // writes them to <voice>.voice.json so all future Synthesize calls
-  // using that voice automatically inherit the shaping.
   async function load_shape_for_voice() {
     const name = $("#mk-shape-voice").value;
     if (!name) return;
@@ -372,6 +453,8 @@
       $("#mk-shape-speed").value = j.speed || 1.0;
       $("#mk-shape-pitch-val").textContent = (j.pitch_shift || 0).toFixed(1) + " st";
       $("#mk-shape-speed-val").textContent = (j.speed || 1.0).toFixed(2) + "×";
+      sync_slider_fill($("#mk-shape-pitch"));
+      sync_slider_fill($("#mk-shape-speed"));
       const st = $("#mk-shape-status");
       if (j.has_meta) {
         status(st, `Loaded saved shaping: ${(j.pitch_shift||0).toFixed(1)} st / ${(j.speed||1.0).toFixed(2)}×`, "info");
@@ -381,45 +464,16 @@
     } catch (_) { /* silent */ }
   }
 
-  // Refresh dropdowns also fills the knob-4 select and re-fetches meta.
-  const _orig_refresh = refresh_maker_dropdowns;
-  refresh_maker_dropdowns = async function () {
-    await _orig_refresh();
-    const sel = $("#mk-shape-voice");
-    if (!sel) return;
-    // _orig_refresh doesn't fill mk-shape-voice, so derive from voices list
-    try {
-      const r = await fetch("/v1/voices");
-      const j = await r.json();
-      const voices = (j.voices || []).filter(v => !v.name.endsWith(".dir"));
-      const cur = sel.value;
-      sel.innerHTML = "";
-      if (!voices.length) {
-        const o = document.createElement("option");
-        o.value = ""; o.textContent = "(none available)";
-        sel.appendChild(o);
-        return;
-      }
-      for (const v of voices) {
-        const o = document.createElement("option");
-        o.value = v.name;
-        const tag = v.dsp ? `  [pitch ${(v.dsp.pitch_shift||0).toFixed(1)}, sp ${(v.dsp.speed||1).toFixed(2)}]` : "";
-        o.textContent = v.name + tag;
-        sel.appendChild(o);
-      }
-      if (cur) for (const o of sel.options) if (o.value === cur) { sel.value = cur; break; }
-      if (!sel.value) load_shape_for_voice();
-    } catch (_) {}
-  };
-
   $("#mk-shape-voice").addEventListener("change", load_shape_for_voice);
   $("#mk-shape-pitch").addEventListener("input", (e) => {
     const v = parseFloat(e.target.value);
     $("#mk-shape-pitch-val").textContent = (v >= 0 ? "+" : "") + v.toFixed(1) + " st";
+    sync_slider_fill(e.target);
   });
   $("#mk-shape-speed").addEventListener("input", (e) => {
     const v = parseFloat(e.target.value);
     $("#mk-shape-speed-val").textContent = v.toFixed(2) + "×";
+    sync_slider_fill(e.target);
   });
 
   // Preview: synthesize with the current slider values (one-shot, doesn't save)
@@ -434,7 +488,7 @@
     const speed = parseFloat($("#mk-shape-speed").value);
     status(st, `Previewing at ${pitch.toFixed(1)} st / ${speed.toFixed(2)}×…`, "loading");
     player.hidden = false;
-    player.innerHTML = '<div class="player-empty">Generating preview…</div>';
+    player.innerHTML = emptyPlayerMarkup("Generating preview…");
     try {
       const r = await fetch("/v1/audio/speech", {
         method: "POST",
@@ -456,7 +510,7 @@
       const blob = await r.blob();
       const url = URL.createObjectURL(blob);
       player.innerHTML = `<audio controls autoplay src="${url}"></audio>
-        <div class="hint">Preview • ${pitch.toFixed(1)} st • ${speed.toFixed(2)}× (not saved)</div>`;
+        <div class="player-meta">preview · ${pitch.toFixed(1)} st · ${speed.toFixed(2)}× (not saved)</div>`;
       status(st, "Preview ready. Adjust sliders and Preview again, or Save shaping.", "ok");
     } catch (err) { status(st, "Error: " + err.message, "err"); }
   });
@@ -498,6 +552,8 @@
       $("#mk-shape-speed").value = 1.0;
       $("#mk-shape-pitch-val").textContent = "0.0 st";
       $("#mk-shape-speed-val").textContent = "1.00×";
+      sync_slider_fill($("#mk-shape-pitch"));
+      sync_slider_fill($("#mk-shape-speed"));
       status(st, j.ok ? "Shaping reset to defaults." : (j.error || "Nothing to reset."), "ok");
       refresh_maker_dropdowns();
     } catch (err) { status(st, "Error: " + err.message, "err"); }
@@ -546,6 +602,8 @@
       $("#syn-speed").value = speed;
       $("#syn-pitch-val").textContent = pitch.toFixed(1);
       $("#syn-speed-val").textContent = speed.toFixed(2);
+      sync_slider_fill($("#syn-pitch"));
+      sync_slider_fill($("#syn-speed"));
     } catch (_) {}
   }
   if ($("#syn-uploaded")) {
@@ -555,9 +613,11 @@
   // Slider live values
   $("#syn-pitch").addEventListener("input", (e) => {
     $("#syn-pitch-val").textContent = parseFloat(e.target.value).toFixed(1);
+    sync_slider_fill(e.target);
   });
   $("#syn-speed").addEventListener("input", (e) => {
     $("#syn-speed-val").textContent = parseFloat(e.target.value).toFixed(2);
+    sync_slider_fill(e.target);
   });
 
   let syn_last_blob = null;
@@ -618,17 +678,18 @@
     clear_player($("#syn-player"));
 
     try {
-      const r = await fetch("/v1/audio/speech", {
+      const p = fetch("/v1/audio/speech", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+      }).then(async (r) => {
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.error || "TTS failed (" + r.status + ")");
+        }
+        return r.blob();
       });
-      if (!r.ok) {
-        const j = await r.json().catch(() => ({}));
-        status(st, j.error || "TTS failed (" + r.status + ")", "err");
-        return;
-      }
-      const blob = await r.blob();
+      const blob = await with_engine_dot("engine-tts", p);
       syn_last_blob = blob;
       const url = URL.createObjectURL(blob);
       const meta = (body.mode || "tts") + " · " + (blob.size / 1024).toFixed(1) + " KB";
@@ -704,15 +765,19 @@
   sync_music_mode_rows();
   $("#mus-m0").addEventListener("input", (e) => {
     $("#mus-m0-val").textContent = parseFloat(e.target.value).toFixed(2);
+    sync_slider_fill(e.target);
   });
   $("#mus-m1").addEventListener("input", (e) => {
     $("#mus-m1-val").textContent = parseFloat(e.target.value).toFixed(2);
+    sync_slider_fill(e.target);
   });
   $("#mus-pitch").addEventListener("input", (e) => {
     $("#mus-pitch-val").textContent = e.target.value;
+    sync_slider_fill(e.target);
   });
   $("#mus-speed").addEventListener("input", (e) => {
     $("#mus-speed-val").textContent = parseFloat(e.target.value).toFixed(2);
+    sync_slider_fill(e.target);
   });
 
   $("#mus-btn").addEventListener("click", async () => {
@@ -757,6 +822,7 @@
     btn.disabled = true; btn.textContent = (batch_n > 1) ? "Generating batch…" : "Generating…";
     clear_player($("#mus-player"));
     const results = [];  // {seed, blob, error}
+    let engine_promise = Promise.resolve();
 
     for (let i = 0; i < batch_n; i++) {
       const seed_i = (base_seed === 0) ? 0 : base_seed + i;
@@ -782,22 +848,26 @@
         const speed = parseFloat($("#mus-speed").value) || 1.0;
         if (Math.abs(pitch) > 0.01) body.pitch_shift = pitch;
         if (Math.abs(speed - 1.0) > 0.01) body.speed = speed;
-        const r = await fetch("/v1/audio/music", {
+        const req = fetch("/v1/audio/music", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
+        }).then(async (r) => {
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            throw new Error(j.error || ("HTTP " + r.status));
+          }
+          return r.blob();
         });
-        if (!r.ok) {
-          const j = await r.json().catch(() => ({}));
-          results.push({ seed: seed_i, error: j.error || ("HTTP " + r.status) });
-          continue;
-        }
-        const blob = await r.blob();
+        // Light up the music dot during the first request.
+        if (i === 0) engine_promise = with_engine_dot("engine-music", req);
+        const blob = await req;
         results.push({ seed: seed_i, blob });
       } catch (err) {
         results.push({ seed: seed_i, error: err.message });
       }
     }
+    await engine_promise;
 
     // Render results. Single success → existing player + download. Multiple
     // → numbered grid of players, each downloadable. Download button keeps
@@ -816,22 +886,37 @@
       set_player(player, url,
         mode + " · stereo · " + (ok[0].blob.size / 1024 / 1024).toFixed(2) + " MB");
     } else {
-      // Batch: rebuild player area as a grid.
+      // Batch: rebuild player area as a styled grid.
       player.innerHTML = "";
+      player.classList.add("has-audio");
       const grid = document.createElement("div");
-      grid.style.cssText = "display:grid;grid-template-columns:1fr;gap:12px;";
+      grid.className = "clips-grid";
+      grid.style.gridTemplateColumns = "1fr";
+      grid.style.marginTop = "0";
       for (const r of ok) {
         const url = URL.createObjectURL(r.blob);
         const card = document.createElement("div");
-        card.style.cssText = "padding:8px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);";
+        card.className = "clip";
         const label = document.createElement("div");
-        label.style.cssText = "font-size:12px;color:var(--fg);margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;";
+        label.className = "clip-info";
+        label.style.display = "flex";
+        label.style.justifyContent = "space-between";
+        label.style.alignItems = "center";
+        label.style.marginBottom = "6px";
         const seedTxt = r.seed ? ("seed " + r.seed) : "random";
-        label.innerHTML = '<span><b>#' + (results.indexOf(r) + 1) + '</b> · ' + esc(seedTxt) +
-          ' · ' + (r.blob.size / 1024 / 1024).toFixed(2) + ' MB</span>';
+        label.innerHTML =
+          '<div>' +
+            '<div class="clip-name">#' + (results.indexOf(r) + 1) + ' · ' + esc(mode) + '</div>' +
+            '<div class="clip-meta">' +
+              '<span class="tag">' + esc(seedTxt) + '</span>' +
+              '<span class="tag">' + (r.blob.size / 1024 / 1024).toFixed(2) + ' MB</span>' +
+            '</div>' +
+          '</div>';
         const dlBtn = document.createElement("button");
-        dlBtn.className = "btn-icon";
-        dlBtn.textContent = "⬇";
+        dlBtn.className = "btn btn-ghost";
+        dlBtn.style.padding = "6px 12px";
+        dlBtn.style.fontSize = "12px";
+        dlBtn.innerHTML = "⬇ Download";
         dlBtn.title = "Download this variation";
         dlBtn.onclick = () => {
           const a = document.createElement("a");
@@ -845,7 +930,7 @@
         const au = document.createElement("audio");
         au.controls = true;
         au.src = url;
-        au.style.cssText = "width:100%;";
+        au.style.width = "100%";
         card.appendChild(au);
         grid.appendChild(card);
       }
@@ -875,73 +960,117 @@
   });
 
   // ── Voices library ─────────────────────────────────────────────────
+  let VOICES_CACHE = [];
+  let CLIPS_CACHE  = [];
+
+  function apply_voice_filter() {
+    const q = ($("#voice-search").value || "").trim().toLowerCase();
+    const list = $("#voices-list");
+    const count = $("#voice-count");
+    if (!VOICES_CACHE.length) return;
+    const filtered = VOICES_CACHE.filter(v =>
+      !q || (v.name || "").toLowerCase().indexOf(q) >= 0
+    );
+    count.textContent = filtered.length + "/" + VOICES_CACHE.length + " voices";
+    render_voices(filtered);
+  }
+
+  function render_voices(voices) {
+    const list = $("#voices-list");
+    if (!voices.length) {
+      list.innerHTML = '<div class="empty">' +
+        '<div class="empty-icon">🎭</div>' +
+        '<div class="empty-title">No voices match</div>' +
+        '<div class="empty-hint">Try a different search, or save one from Voice Design.</div>' +
+      '</div>';
+      return;
+    }
+    list.innerHTML = "";
+    for (const v of voices) {
+      const el = document.createElement("div");
+      el.className = "voice-card";
+      const sz = fmt_size(v.size || 0);
+      const dim = v.dim ? v.dim + "-d" : "?-d";
+      const l2  = v.l2_norm ? v.l2_norm.toFixed(2) : "?";
+      el.innerHTML =
+        '<div class="voice-name" title="' + esc(v.name) + '">' + esc(v.name) + '</div>' +
+        '<div class="voice-meta">' +
+          '<span class="tag">' + dim + '</span>' +
+          '<span class="tag">L2 ' + l2 + '</span>' +
+          '<span class="tag">' + sz + '</span>' +
+        '</div>' +
+        '<div class="voice-actions">' +
+          '<button class="btn-icon use-voice" data-name="' + esc(v.name) + '">Use</button>' +
+          '<button class="btn-icon play-voice" data-name="' + esc(v.name) + '">▶ Demo</button>' +
+          '<button class="btn-icon danger del-voice" data-name="' + esc(v.name) + '">Delete</button>' +
+        '</div>';
+      list.appendChild(el);
+    }
+    $$(".use-voice").forEach((b) => b.addEventListener("click", (e) => {
+      const name = e.target.dataset.name;
+      // switch to synthesize tab
+      activate_tab("synthesize");
+      $("#syn-voice-source").value = "uploaded";
+      $("#syn-voice-source").dispatchEvent(new Event("change"));
+      // try to select this voice in the dropdown
+      for (const o of $("#syn-uploaded").options) {
+        if (o.textContent.indexOf(name) >= 0 || o.value.indexOf(name) >= 0) {
+          $("#syn-uploaded").selectedIndex = o.index;
+          break;
+        }
+      }
+    }));
+    $$(".play-voice").forEach((b) => b.addEventListener("click", demo_voice));
+    $$(".del-voice").forEach((b) => b.addEventListener("click", async (e) => {
+      const name = e.target.dataset.name;
+      if (!confirm('Delete voice "' + name + '"?')) return;
+      try {
+        const r = await fetch("/v1/voices/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        const j = await r.json();
+        if (j.ok) { toast("Deleted " + name, "ok"); load_voices(); }
+        else      { toast(j.error || "Delete failed", "err"); }
+      } catch (_) { toast("Delete failed", "err"); }
+    }));
+  }
+
   async function load_voices() {
     const list = $("#voices-list");
     try {
       const r = await fetch("/v1/voices");
       if (!r.ok) throw new Error(r.statusText);
       const j = await r.json();
-      const voices = j.voices || [];
+      VOICES_CACHE = j.voices || [];
       // also populate the syn-uploaded select
       const sel = $("#syn-uploaded");
       sel.innerHTML = "";
-      if (!voices.length) {
-        list.innerHTML = '<div class="empty"><div class="empty-icon">🎭</div>No voices yet. Save one from Voice Design or upload a .voice file.</div>';
+      if (!VOICES_CACHE.length) {
+        $("#voice-count").textContent = "0 voices";
+        list.innerHTML = '<div class="empty">' +
+          '<div class="empty-icon">🎭</div>' +
+          '<div class="empty-title">No voices yet</div>' +
+          '<div class="empty-hint">Save one from Voice Design, blend in Voice Maker, or drag &amp; drop a .voice file here.</div>' +
+        '</div>';
         return;
       }
-      list.innerHTML = "";
-      for (const v of voices) {
-        const el = document.createElement("div");
-        el.className = "voice-card";
-        const sz = fmt_size(v.size || 0);
-        const dim = v.dim ? v.dim + "-d" : "?-d";
-        const l2  = v.l2_norm ? v.l2_norm.toFixed(2) : "?";
-        el.innerHTML =
-          '<div class="voice-name" title="' + esc(v.name) + '">' + esc(v.name) + '</div>' +
-          '<div class="voice-meta">' + dim + ' · L2=' + l2 + ' · ' + sz + '</div>' +
-          '<div class="voice-actions">' +
-            '<button class="btn-icon use-voice" data-name="' + esc(v.name) + '">Use</button>' +
-            '<button class="btn-icon play-voice" data-name="' + esc(v.name) + '">▶ Demo</button>' +
-            '<button class="btn-icon danger del-voice" data-name="' + esc(v.name) + '">Delete</button>' +
-          '</div>';
-        list.appendChild(el);
-
+      for (const v of VOICES_CACHE) {
         const o = document.createElement("option");
         o.value = v.path || v.name;
+        const dim = v.dim ? v.dim + "-d" : "?-d";
         o.textContent = v.name + " (" + dim + ")";
         sel.appendChild(o);
       }
-      $$(".use-voice").forEach((b) => b.addEventListener("click", (e) => {
-        const name = e.target.dataset.name;
-        // switch to synthesize tab
-        $('.tab[data-tab="synthesize"]').click();
-        $("#syn-voice-source").value = "uploaded";
-        $("#syn-voice-source").dispatchEvent(new Event("change"));
-        // try to select this voice in the dropdown
-        for (const o of $("#syn-uploaded").options) {
-          if (o.textContent.indexOf(name) >= 0 || o.value.indexOf(name) >= 0) {
-            $("#syn-uploaded").selectedIndex = o.index;
-            break;
-          }
-        }
-      }));
-      $$(".play-voice").forEach((b) => b.addEventListener("click", demo_voice));
-      $$(".del-voice").forEach((b) => b.addEventListener("click", async (e) => {
-        const name = e.target.dataset.name;
-        if (!confirm('Delete voice "' + name + '"?')) return;
-        try {
-          const r = await fetch("/v1/voices/delete", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name }),
-          });
-          const j = await r.json();
-          if (j.ok) { toast("Deleted " + name, "ok"); load_voices(); }
-          else      { toast(j.error || "Delete failed", "err"); }
-        } catch (_) { toast("Delete failed", "err"); }
-      }));
+      apply_voice_filter();
     } catch (e) {
-      list.innerHTML = '<div class="empty"><div class="empty-icon">⚠</div>Could not reach server.</div>';
+      $("#voice-count").textContent = "—";
+      list.innerHTML = '<div class="empty">' +
+        '<div class="empty-icon">⚠</div>' +
+        '<div class="empty-title">Could not reach server</div>' +
+        '<div class="empty-hint">Check that the audiocore process is running and healthy.</div>' +
+      '</div>';
     }
   }
 
@@ -969,7 +1098,7 @@
       const blob = await r.blob();
       // Switch to synthesize tab to play
       const url = URL.createObjectURL(blob);
-      $('.tab[data-tab="synthesize"]').click();
+      activate_tab("synthesize");
       set_player($("#syn-player"), url, "demo · " + name + " · " + (blob.size/1024).toFixed(1) + " KB");
       status(st, "Demo generated.", "ok");
     } catch (err) {
@@ -978,99 +1107,246 @@
   }
 
   $("#voice-refresh").addEventListener("click", load_voices);
+  $("#voice-search").addEventListener("input", apply_voice_filter);
 
   $("#voice-upload-btn").addEventListener("click", async () => {
     const files = $("#voice-upload-file").files;
     if (!files.length) { toast("Pick a file first", "err"); return; }
-    const st = $("#voice-status");
-    status(st, "Uploading…", "loading");
-    const fd = new FormData();
-    for (const f of files) fd.append("file", f, f.name);
-    try {
-      const r = await fetch("/v1/voices/upload", { method: "POST", body: fd });
-      const j = await r.json();
-      if (j.ok) {
-        toast("Uploaded " + (j.saved || []).length + " voice(s)", "ok");
-        load_voices();
-        status(st, "Uploaded.", "ok");
-      } else status(st, j.error || "Upload failed", "err");
-    } catch (err) {
-      status(st, "Error: " + err.message, "err");
-    }
+    await upload_files("/v1/voices/upload", files, $("#voice-status"), () => load_voices());
+    $("#voice-upload-file").value = "";
   });
 
   // ── Clips library ──────────────────────────────────────────────────
+  function apply_clip_filter() {
+    const q = ($("#clip-search").value || "").trim().toLowerCase();
+    const count = $("#clip-count");
+    if (!CLIPS_CACHE.length) return;
+    const filtered = CLIPS_CACHE.filter(c =>
+      !q || (c.name || "").toLowerCase().indexOf(q) >= 0
+    );
+    count.textContent = filtered.length + "/" + CLIPS_CACHE.length + " clips";
+    render_clips(filtered);
+  }
+
+  function render_clips(clips) {
+    const list = $("#clips-list");
+    if (!clips.length) {
+      list.innerHTML = '<div class="empty">' +
+        '<div class="empty-icon">🎬</div>' +
+        '<div class="empty-title">No clips match</div>' +
+        '<div class="empty-hint">Generate audio in Voice Design, Synthesize, or Music.</div>' +
+      '</div>';
+      return;
+    }
+    list.innerHTML = "";
+    for (const c of clips) {
+      const el = document.createElement("div");
+      el.className = "clip";
+      el.innerHTML =
+        '<audio controls preload="metadata" src="/v1/clips/raw/' + encodeURIComponent(c.name) + '"></audio>' +
+        '<div class="clip-info">' +
+          '<div class="clip-name" title="' + esc(c.name) + '">' + esc(c.name) + '</div>' +
+          '<div class="clip-meta">' +
+            (c.duration ? '<span class="tag">' + fmt_dur(c.duration) + '</span>' : '') +
+            '<span class="tag">' + fmt_size(c.size) + '</span>' +
+          '</div>' +
+        '</div>' +
+        '<button class="btn btn-danger" data-del-clip="' + esc(c.name) + '">Delete</button>';
+      list.appendChild(el);
+    }
+    $$("[data-del-clip]").forEach((b) => b.addEventListener("click", async (e) => {
+      const name = e.target.dataset.delClip;
+      if (!confirm('Delete "' + name + '"?')) return;
+      try {
+        const r = await fetch("/v1/clips/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        const j = await r.json();
+        if (j.ok) { toast("Deleted " + name, "ok"); load_clips(); }
+        else      { toast(j.error || "Delete failed", "err"); }
+      } catch (_) { toast("Delete failed", "err"); }
+    }));
+  }
+
   async function load_clips() {
     const list = $("#clips-list");
     try {
       const r = await fetch("/v1/clips");
       if (!r.ok) throw new Error(r.statusText);
       const j = await r.json();
-      const clips = j.clips || [];
+      CLIPS_CACHE = j.clips || [];
 
-      if (!clips.length) {
-        list.innerHTML = '<div class="empty"><div class="empty-icon">🎬</div>No clips yet.</div>';
+      if (!CLIPS_CACHE.length) {
+        $("#clip-count").textContent = "0 clips";
+        list.innerHTML = '<div class="empty">' +
+          '<div class="empty-icon">🎬</div>' +
+          '<div class="empty-title">No clips yet</div>' +
+          '<div class="empty-hint">Generate audio in Voice Design, Synthesize, or Music.</div>' +
+        '</div>';
         return;
       }
-
-      list.innerHTML = "";
-      for (const c of clips) {
-        const el = document.createElement("div");
-        el.className = "clip";
-        el.innerHTML =
-          '<audio controls preload="metadata" src="/v1/clips/raw/' + encodeURIComponent(c.name) + '"></audio>' +
-          '<div class="clip-info">' +
-            '<div class="clip-name" title="' + esc(c.name) + '">' + esc(c.name) + '</div>' +
-            '<div class="clip-meta">' +
-              fmt_size(c.size) +
-              (c.duration ? " · " + fmt_dur(c.duration) : "") +
-            '</div>' +
-          '</div>' +
-          '<button class="btn btn-danger" data-del-clip="' + esc(c.name) + '">Delete</button>';
-        list.appendChild(el);
-      }
-      $$("[data-del-clip]").forEach((b) => b.addEventListener("click", async (e) => {
-        const name = e.target.dataset.delClip;
-        if (!confirm('Delete "' + name + '"?')) return;
-        try {
-          const r = await fetch("/v1/clips/delete", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name }),
-          });
-          const j = await r.json();
-          if (j.ok) { toast("Deleted " + name, "ok"); load_clips(); }
-          else      { toast(j.error || "Delete failed", "err"); }
-        } catch (_) { toast("Delete failed", "err"); }
-      }));
+      apply_clip_filter();
     } catch (e) {
-      list.innerHTML = '<div class="empty"><div class="empty-icon">⚠</div>Could not reach server.</div>';
+      $("#clip-count").textContent = "—";
+      list.innerHTML = '<div class="empty">' +
+        '<div class="empty-icon">⚠</div>' +
+        '<div class="empty-title">Could not reach server</div>' +
+        '<div class="empty-hint">Check that the audiocore process is running and healthy.</div>' +
+      '</div>';
     }
   }
 
   $("#clip-refresh").addEventListener("click", load_clips);
+  $("#clip-search").addEventListener("input", apply_clip_filter);
 
   $("#clip-upload-btn").addEventListener("click", async () => {
     const files = $("#clip-upload-file").files;
     if (!files.length) { toast("Pick a file first", "err"); return; }
-    const st = $("#clip-status");
-    status(st, "Uploading…", "loading");
+    await upload_files("/v1/clips/upload", files, $("#clip-status"), () => load_clips());
+    $("#clip-upload-file").value = "";
+  });
+
+  // Shared upload helper used by both buttons and drag-drop.
+  async function upload_files(endpoint, files, status_el, on_done) {
+    if (!files.length) return;
+    if (status_el) status(status_el, "Uploading " + files.length + " file(s)…", "loading");
     const fd = new FormData();
     for (const f of files) fd.append("file", f, f.name);
     try {
-      const r = await fetch("/v1/clips/upload", { method: "POST", body: fd });
+      const r = await fetch(endpoint, { method: "POST", body: fd });
       const j = await r.json();
       if (j.ok) {
-        toast("Uploaded " + (j.saved || []).length + " clip(s)", "ok");
-        load_clips();
-        status(st, "", "");
-      } else status(st, j.error || "Upload failed", "err");
+        const n = (j.saved || []).length;
+        toast("Uploaded " + n + " file" + (n === 1 ? "" : "s"), "ok");
+        if (status_el) status(status_el, "Uploaded " + n + " file" + (n === 1 ? "" : "s") + ".", "ok");
+        if (on_done) on_done();
+      } else {
+        if (status_el) status(status_el, j.error || "Upload failed", "err");
+        toast(j.error || "Upload failed", "err");
+      }
     } catch (err) {
-      status(st, "Error: " + err.message, "err");
+      if (status_el) status(status_el, "Error: " + err.message, "err");
+      else toast("Upload failed", "err");
+    }
+  }
+
+  // ── Drag & drop upload anywhere ────────────────────────────────────
+  const drop_overlay = $("#drop-overlay");
+  const drop_label   = $("#drop-target-label");
+  let drag_counter = 0;
+
+  function route_drop_files(files) {
+    // Decide where to upload based on the currently active tab and file type.
+    const active = $(".tab.active")?.dataset.tab;
+    const arr = [...files];
+    const voices = arr.filter(f => /\.(voice|wav|mp3|flac|ogg|m4a|opus)$/i.test(f.name) &&
+                                   /\.voice$/i.test(f.name));
+    const audio  = arr.filter(f => !/\.voice$/i.test(f.name) &&
+                                   /\.(wav|mp3|flac|ogg|m4a|opus)$/i.test(f.name));
+    // If the active tab is voices or clips, send everything there.
+    if (active === "voices") {
+      return upload_files("/v1/voices/upload", arr, $("#voice-status"), load_voices);
+    } else if (active === "clips") {
+      return upload_files("/v1/clips/upload", arr, $("#clip-status"), load_clips);
+    }
+    // Otherwise split: .voice → voices, audio → clips.
+    const jobs = [];
+    if (voices.length) jobs.push(upload_files("/v1/voices/upload", voices, $("#voice-status"), load_voices));
+    if (audio.length)  jobs.push(upload_files("/v1/clips/upload",  audio,  $("#clip-status"),  load_clips));
+    if (!jobs.length) {
+      toast("Drop .voice or audio files", "err");
+      return;
+    }
+    return Promise.all(jobs);
+  }
+
+  window.addEventListener("dragenter", (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    drag_counter++;
+    const active = $(".tab.active")?.dataset.tab;
+    drop_label.textContent = (active === "voices") ? "Voices library"
+                           : (active === "clips")  ? "Clips library"
+                           : "Voices & Clips";
+    drop_overlay.classList.add("show");
+  });
+  window.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  });
+  window.addEventListener("dragleave", (e) => {
+    if (!e.dataTransfer) return;
+    drag_counter = Math.max(0, drag_counter - 1);
+    if (drag_counter === 0) drop_overlay.classList.remove("show");
+  });
+  window.addEventListener("drop", (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.types || !e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    drag_counter = 0;
+    drop_overlay.classList.remove("show");
+    const files = [...e.dataTransfer.files].filter(f => f && f.size > 0);
+    if (!files.length) return;
+    route_drop_files(files);
+  });
+
+  // ── Keyboard shortcuts ─────────────────────────────────────────────
+  document.addEventListener("keydown", (e) => {
+    // Ignore when typing in an input/textarea, unless it's a global escape.
+    const tag = (e.target.tagName || "").toLowerCase();
+    const typing = tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable;
+
+    // Cmd/Ctrl + Enter → trigger primary action of active tab.
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      const active = $(".tab.active")?.dataset.tab;
+      const map = {
+        design: "#vd-btn",
+        maker:  "#mk-shape-preview",
+        synthesize: "#syn-btn",
+        music:  "#mus-btn",
+      };
+      const sel = map[active];
+      if (sel) { e.preventDefault(); $(sel)?.click(); }
+      return;
+    }
+
+    if (typing) return;
+
+    // 1–6: tabs
+    if (/^[1-6]$/.test(e.key)) {
+      const idx = parseInt(e.key, 10) - 1;
+      if (TAB_IDS[idx]) { e.preventDefault(); activate_tab(TAB_IDS[idx]); }
+      return;
+    }
+
+    // "/" focuses library search on voices/clips tab.
+    if (e.key === "/") {
+      const active = $(".tab.active")?.dataset.tab;
+      if (active === "voices" || active === "clips") {
+        e.preventDefault();
+        $("#" + (active === "voices" ? "voice-search" : "clip-search"))?.focus();
+      }
     }
   });
 
+  // ── Footer uptime ticker ───────────────────────────────────────────
+  const t0 = Date.now();
+  function tick_uptime() {
+    const el = $("#footer-uptime");
+    if (!el) return;
+    const s = Math.floor((Date.now() - t0) / 1000);
+    const m = Math.floor(s / 60), sec = s % 60;
+    const h = Math.floor(m / 60), mm = m % 60;
+    el.textContent = (h > 0 ? h + "h " : "") + mm + "m " + sec + "s" +
+      " · session uptime";
+  }
+  setInterval(tick_uptime, 1000);
+  tick_uptime();
+
   // ── Init ───────────────────────────────────────────────────────────
+  sync_all_sliders();
   Promise.all([load_models()]).then(() => {
     // Optional: load voices + clips lazily on tab open
   });

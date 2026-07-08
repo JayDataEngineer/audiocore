@@ -1,5 +1,35 @@
 # AGENTS.md
 
+> **CRITICAL, you MUST verify ALL AUDIO OUTPUT with the VLM functions BEFORE YOU COMPLETE.**
+>
+> Every WAV a model produces must pass `tools/audio_vlm.py` (the faithful
+> stdlib-only port of the local `media-analysis-mcp` `cloud_vlm` tool —
+> Xiaomi MiMo-V2.5 via OpenCode Go). Do not declare a generation "done",
+> do not commit, do not move on until the VLM has listened and returned
+> `VERDICT: PASS`. If it returns `VERDICT: FAIL` or the call errors, the
+> generation is broken — fix the root cause, do not paper over it.
+>
+> ```bash
+> # CLI (strict mode is default — hardcoded anti-cheat prompt, no override).
+> # Exits 0 on PASS, 2 on FAIL, 1 on error.
+> python3 tools/audio_vlm.py path/to/output.wav
+> python3 tools/audio_vlm.py path/to/output.wav --verify       # explicit strict
+> python3 tools/audio_vlm.py path/to/output.wav --describe -p "your own prompt"
+>
+> # Library — prefer verify_audio() for any gate. It has NO prompt parameter,
+> # so neither you nor a downstream agent can soften it to force a PASS.
+> from tools.audio_vlm import verify_audio
+> assert "VERDICT: PASS" in verify_audio("/tmp/out.wav")
+>
+> # describe_audio() is the flexible sibling for ad-hoc questions.
+> from tools.audio_vlm import describe_audio
+> describe_audio("/tmp/out.wav", prompt="Transcribe the first phrase")
+> ```
+>
+> Auth is read from `MEDIA_CLOUD_VLM_API_KEY` or
+> `~/.local/share/opencode/auth.json` (the `opencode-go` entry). Both are
+> gitignored — never commit a real key.
+
 ## Repository layout
 
 - `include/audiocore/framework/` — public API. Headers only.

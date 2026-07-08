@@ -4,10 +4,10 @@
   "homepage": "https://github.com/OpenMOSS-Team/audiocore",
   "description": "Canonical record of every GGUF family/variant audiocore supports, with download locations. Fetch with scripts/fetch_models.sh. Self-describe via audiocore_cli --list-supported.",
   "status_legend": {
-    "wired":     "parses, runs the model, returns non-silent audio end-to-end",
-    "partial":   "request parses, model runs, but a stage is a stub or missing",
-    "not_impl":  "no code path; the request is rejected or silently ignored",
-    "blocked":   "requires new model weights or a major port; see GAPS.md"
+    "wired": "parses, runs the model, returns non-silent audio end-to-end",
+    "partial": "request parses, model runs, but a stage is a stub or missing",
+    "not_impl": "no code path; the request is rejected or silently ignored",
+    "blocked": "requires new model weights or a major port; see GAPS.md"
   },
   "families": {
     "moss_tts": {
@@ -16,12 +16,30 @@
       "license": "Apache-2.0",
       "homepage": "https://github.com/pwilkin/openmoss",
       "modes": {
-        "tts":          { "status": "wired",    "notes": "Full pipeline: upstream <user_inst> template, codec encoder+decoder, voice clone via real WAV encode+splice. Requires codec-bearing GGUF (smcleod sidecar or moss.codec.* tensors)." },
-        "sfx":          { "status": "wired",    "notes": "Text→audio via MOSS-SoundEffect checkpoint (n_vq=16). Same AR path as tts mode — the model weights determine output type. Load the SFX GGUF and request mode='sfx'." },
-        "voice_clone":  { "status": "wired",    "notes": "Reads reference WAV, runs codec encoder, delay-pattern-splices into prompt grid. Requires codec-bearing GGUF." },
-        "dialogue":     { "status": "not_impl", "notes": "Fail-fast. Requires MOSS-TTSD checkpoint (not available)." },
-        "voice_design": { "status": "wired",    "notes": "Via MOSS-VoiceGenerator variant (n_vq=16, loaded as moss_tts). Fail-fast on flagship (n_vq=32) checkpoint." },
-        "streaming":    { "status": "wired",    "notes": "Per-frame codec decode during AR loop. ~cfg_.n_vq × 80ms cold-start, then 80ms/frame." }
+        "tts": {
+          "status": "wired",
+          "notes": "Full pipeline: upstream <user_inst> template, codec encoder+decoder, voice clone via real WAV encode+splice. Requires codec-bearing GGUF (smcleod sidecar or moss.codec.* tensors)."
+        },
+        "sfx": {
+          "status": "wired",
+          "notes": "Text\u2192audio via MOSS-SoundEffect checkpoint (n_vq=16). Same AR path as tts mode \u2014 the model weights determine output type. Load the SFX GGUF and request mode='sfx'."
+        },
+        "voice_clone": {
+          "status": "wired",
+          "notes": "Reads reference WAV, runs codec encoder, delay-pattern-splices into prompt grid. Requires codec-bearing GGUF."
+        },
+        "dialogue": {
+          "status": "not_impl",
+          "notes": "Fail-fast. Requires MOSS-TTSD checkpoint (not available)."
+        },
+        "voice_design": {
+          "status": "wired",
+          "notes": "Via MOSS-VoiceGenerator variant (n_vq=16, loaded as moss_tts). Fail-fast on flagship (n_vq=32) checkpoint."
+        },
+        "streaming": {
+          "status": "wired",
+          "notes": "Per-frame codec decode during AR loop. ~cfg_.n_vq \u00d7 80ms cold-start, then 80ms/frame."
+        }
       },
       "variants": {
         "moss-tts-q4-k-m": {
@@ -48,7 +66,7 @@
               "filename": "moss-tts-q8_0.gguf"
             },
             "sidecar_v15_q4_km": {
-              "_comment": "Pre-built sidecar pair from smcleod/MOSS-TTS-v1.5-GGUF — backbone in X.gguf, codec+audio embeddings+LM heads in X.extras.gguf (moss.* KV namespace). Loaded as-is by audiocore; no converter needed.",
+              "_comment": "Pre-built sidecar pair from smcleod/MOSS-TTS-v1.5-GGUF \u2014 backbone in X.gguf, codec+audio embeddings+LM heads in X.extras.gguf (moss.* KV namespace). Loaded as-is by audiocore; no converter needed.",
               "provider": "huggingface",
               "repo": "smcleod/MOSS-TTS-v1.5-GGUF",
               "revision": "main",
@@ -93,13 +111,15 @@
               }
             }
           ],
-          "status_note": "Reference ONNX weights for the ggml codec port (see GAPS.md §1.3 and docs/CODEC_PORTS.md §1). audiocore does not load ONNX directly — Stage 1 removed that surface. The port reads moss.codec.* tensors straight from the sidecar GGUF (smcleod/MOSS-TTS-v1.5-GGUF ships them pre-built)."
+          "status_note": "Reference ONNX weights for the ggml codec port (see GAPS.md \u00a71.3 and docs/CODEC_PORTS.md \u00a71). audiocore does not load ONNX directly \u2014 Stage 1 removed that surface. The port reads moss.codec.* tensors straight from the sidecar GGUF (smcleod/MOSS-TTS-v1.5-GGUF ships them pre-built)."
         },
         "moss-voicegen-q8_0": {
           "display": "MOSS-VoiceGenerator (Q8_0, n_vq=16)",
           "params_b": 8,
           "min_vram_gb": 14,
-          "modes": ["voice_design"],
+          "modes": [
+            "voice_design"
+          ],
           "files": [
             {
               "name": "firstclass_gguf",
@@ -121,7 +141,9 @@
           "display": "MOSS-SoundEffect v1.0 (f16, n_vq=16)",
           "params_b": 8,
           "min_vram_gb": 18,
-          "modes": ["sfx"],
+          "modes": [
+            "sfx"
+          ],
           "files": [
             {
               "name": "firstclass_gguf",
@@ -151,18 +173,32 @@
         }
       }
     },
-
     "qwen3_tts": {
       "display": "Qwen3-TTS",
       "vendor": "Alibaba QwenLM",
       "license": "Apache-2.0",
       "homepage": "https://huggingface.co/QwenLM/Qwen3-TTS",
       "modes": {
-        "tts_batch":     { "status": "partial",  "notes": "Talker + MTP predictor wired; codec→PCM is a silence stub" },
-        "tts_instruct":  { "status": "partial",  "notes": "Stage 10: speaker_name → codec token routing wired; instruct summed into text embedding. Codec stub." },
-        "voice_clone":   { "status": "not_impl", "notes": "Stage 10: fails fast with pointer at GAPS.md §2.3 (ECAPA-TDNN speaker encoder needs a GGUF port)." },
-        "voice_design":  { "status": "partial",  "notes": "Stage 10: instruct prefixed with official VoiceDesign template, routed through any variant. Best-effort on Base; true fidelity needs VoiceDesign-variant weights." },
-        "streaming":     { "status": "not_impl", "notes": "Stage 10: fails fast with pointer at GAPS.md §2.2. Chunked transport scaffold exists at /v1/audio/speech/stream." }
+        "tts_batch": {
+          "status": "partial",
+          "notes": "Talker + MTP predictor wired; codec\u2192PCM is a silence stub"
+        },
+        "tts_instruct": {
+          "status": "partial",
+          "notes": "Stage 10: speaker_name \u2192 codec token routing wired; instruct summed into text embedding. Codec stub."
+        },
+        "voice_clone": {
+          "status": "wired",
+          "notes": "Stage 17b CLOSED (2026-07-03): ECAPA-TDNN speaker encoder loaded from standalone qwen3tts-speaker-encoder.gguf (~23 MB, converted from marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B via tools/convert_ecapa.cpp). Two paths: (a) reference_audio \u2192 compute_embedding \u2192 2048-dim vector cached for reuse; (b) speaker_embedding passed directly (voice-caching pattern). Vector flows through the talker's [spk_emb] prompt slot. End-to-end RTF 0.128 (matches Base \u2014 embedding injection is free). Note: the parallel ICL codec-encoder path (reference_audio \u2192 codec tokens) has a separate pre-existing bug \u2014 see MODEL-GAPS.md Gap K."
+        },
+        "voice_design": {
+          "status": "partial",
+          "notes": "Stage 10: instruct prefixed with official VoiceDesign template, routed through any variant. Best-effort on Base; true fidelity needs VoiceDesign-variant weights."
+        },
+        "streaming": {
+          "status": "not_impl",
+          "notes": "Stage 10: fails fast with pointer at GAPS.md \u00a72.2. Chunked transport scaffold exists at /v1/audio/speech/stream."
+        }
       },
       "variants": {
         "qwen3-tts-1.7b-base": {
@@ -189,15 +225,27 @@
                 "revision": "main",
                 "convert_with": "convert_qwen3tts"
               }
+            },
+            {
+              "name": "speaker_encoder_gguf",
+              "filename": "qwen3tts-speaker-encoder.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B",
+                "revision": "main",
+                "convert_with": "convert_ecapa",
+                "notes": "ECAPA-TDNN speaker encoder, 76 tensors, ~23 MB F16. Standalone \u2014 produces a 2048-dim x-vector from a 24 kHz mono WAV. Output dim matches 1.7B d_model; for 0.6B (d_model=1024) the runtime zero-pads. Architecture: 128-mel\u2192Conv1d\u21923\u00d7SE-Res2Net\u2192MFA\u2192ASP\u2192FC."
+              }
             }
           ],
           "server_config": {
             "family": "qwen3_tts",
             "path": "${MODELS_DIR}/qwen3_tts/1.7b-base/",
             "extras": {
-              "talker_path":    "qwen3tts-talker-1b7-f16.gguf",
+              "talker_path": "qwen3tts-talker-1b7-f16.gguf",
               "predictor_path": "qwen3tts-predictor-1b7-f16.gguf",
-              "n_gpu_layers":   "99"
+              "n_gpu_layers": "99",
+              "speaker_encoder_path": "qwen3tts-speaker-encoder.gguf"
             }
           }
         },
@@ -225,16 +273,38 @@
                 "revision": "main",
                 "convert_with": "convert_qwen3tts"
               }
+            },
+            {
+              "name": "speaker_encoder_gguf",
+              "filename": "qwen3tts-speaker-encoder.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B",
+                "revision": "main",
+                "convert_with": "convert_ecapa",
+                "notes": "ECAPA-TDNN speaker encoder, 76 tensors, ~23 MB F16. Standalone \u2014 produces a 2048-dim x-vector from a 24 kHz mono WAV. Output dim matches 1.7B d_model; for 0.6B (d_model=1024) the runtime zero-pads. Architecture: 128-mel\u2192Conv1d\u21923\u00d7SE-Res2Net\u2192MFA\u2192ASP\u2192FC."
+              }
             }
           ],
-          "default_speakers": ["Cherry","Ethan","Serena","Chelsie","Dallas","Aria","Quinn","Leo","Bella"],
+          "default_speakers": [
+            "Cherry",
+            "Ethan",
+            "Serena",
+            "Chelsie",
+            "Dallas",
+            "Aria",
+            "Quinn",
+            "Leo",
+            "Bella"
+          ],
           "server_config": {
             "family": "qwen3_tts",
             "path": "${MODELS_DIR}/qwen3_tts/1.7b-customvoice/",
             "extras": {
-              "talker_path":    "qwen3tts-talker-1b7-f16.gguf",
+              "talker_path": "qwen3tts-talker-1b7-f16.gguf",
               "predictor_path": "qwen3tts-predictor-1b7-f16.gguf",
-              "n_gpu_layers":   "99"
+              "n_gpu_layers": "99",
+              "speaker_encoder_path": "qwen3tts-speaker-encoder.gguf"
             }
           }
         },
@@ -262,15 +332,27 @@
                 "revision": "main",
                 "convert_with": "convert_qwen3tts"
               }
+            },
+            {
+              "name": "speaker_encoder_gguf",
+              "filename": "qwen3tts-speaker-encoder.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B",
+                "revision": "main",
+                "convert_with": "convert_ecapa",
+                "notes": "ECAPA-TDNN speaker encoder, 76 tensors, ~23 MB F16. Standalone \u2014 produces a 2048-dim x-vector from a 24 kHz mono WAV. Output dim matches 1.7B d_model; for 0.6B (d_model=1024) the runtime zero-pads. Architecture: 128-mel\u2192Conv1d\u21923\u00d7SE-Res2Net\u2192MFA\u2192ASP\u2192FC."
+              }
             }
           ],
           "server_config": {
             "family": "qwen3_tts",
             "path": "${MODELS_DIR}/qwen3_tts/1.7b-voicedesign/",
             "extras": {
-              "talker_path":    "qwen3tts-talker-1b7-f16.gguf",
+              "talker_path": "qwen3tts-talker-1b7-f16.gguf",
               "predictor_path": "qwen3tts-predictor-1b7-f16.gguf",
-              "n_gpu_layers":   "99"
+              "n_gpu_layers": "99",
+              "speaker_encoder_path": "qwen3tts-speaker-encoder.gguf"
             }
           }
         },
@@ -298,15 +380,27 @@
                 "revision": "main",
                 "convert_with": "convert_qwen3tts"
               }
+            },
+            {
+              "name": "speaker_encoder_gguf",
+              "filename": "qwen3tts-speaker-encoder.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B",
+                "revision": "main",
+                "convert_with": "convert_ecapa",
+                "notes": "ECAPA-TDNN speaker encoder, 76 tensors, ~23 MB F16. Standalone \u2014 produces a 2048-dim x-vector from a 24 kHz mono WAV. Output dim matches 1.7B d_model; for 0.6B (d_model=1024) the runtime zero-pads. Architecture: 128-mel\u2192Conv1d\u21923\u00d7SE-Res2Net\u2192MFA\u2192ASP\u2192FC."
+              }
             }
           ],
           "server_config": {
             "family": "qwen3_tts",
             "path": "${MODELS_DIR}/qwen3_tts/0.6b-base/",
             "extras": {
-              "talker_path":    "qwen3tts-talker-0b6-f16.gguf",
+              "talker_path": "qwen3tts-talker-0b6-f16.gguf",
               "predictor_path": "qwen3tts-predictor-0b6-f16.gguf",
-              "n_gpu_layers":   "99"
+              "n_gpu_layers": "99",
+              "speaker_encoder_path": "qwen3tts-speaker-encoder.gguf"
             }
           }
         },
@@ -346,23 +440,40 @@
               }
             }
           ],
-          "status_note": "Pre-built GGUFs from cstr/qwen3-tts-tokenizer-12hz-GGUF load directly with no conversion. Architecture reference for the ggml decoder port is CrispStrobe/CrispASR (MIT). See docs/CODEC_PORTS.md §2 and GAPS.md §2.3."
+          "status_note": "Pre-built GGUFs from cstr/qwen3-tts-tokenizer-12hz-GGUF load directly with no conversion. Architecture reference for the ggml decoder port is CrispStrobe/CrispASR (MIT). See docs/CODEC_PORTS.md \u00a72 and GAPS.md \u00a72.3."
         }
       }
     },
-
     "ace_step": {
       "display": "ACE-Step",
       "vendor": "StepFun",
       "license": "Apache-2.0",
       "homepage": "https://huggingface.co/ACE-Step/ACE-Step",
       "modes": {
-        "text_to_music": { "status": "wired",    "notes": "Full pipeline: LM → DiT → VAE → 48 kHz stereo PCM" },
-        "cover":         { "status": "not_impl", "notes": "Planned: DiT accepts a target-voice conditioning signal" },
-        "repaint":       { "status": "not_impl", "notes": "Planned: mask + partial-latent DiT conditioning" },
-        "stem":          { "status": "blocked",  "notes": "Separate model (Demucs-class); not part of ACE-Step proper" },
-        "lego":          { "status": "blocked",  "notes": "Separate stem-assembler; not part of ACE-Step proper" },
-        "completion":    { "status": "not_impl", "notes": "Planned: partial-song conditioning + extension graph" }
+        "text_to_music": {
+          "status": "wired",
+          "notes": "Full pipeline: LM \u2192 DiT \u2192 VAE \u2192 48 kHz stereo PCM"
+        },
+        "cover": {
+          "status": "not_impl",
+          "notes": "Planned: DiT accepts a target-voice conditioning signal"
+        },
+        "repaint": {
+          "status": "not_impl",
+          "notes": "Planned: mask + partial-latent DiT conditioning"
+        },
+        "stem": {
+          "status": "blocked",
+          "notes": "Separate model (Demucs-class); not part of ACE-Step proper"
+        },
+        "lego": {
+          "status": "blocked",
+          "notes": "Separate stem-assembler; not part of ACE-Step proper"
+        },
+        "completion": {
+          "status": "not_impl",
+          "notes": "Planned: partial-song conditioning + extension graph"
+        }
       },
       "variants": {
         "ace-step-1.5-turbo": {
@@ -522,6 +633,238 @@
           "server_config": {
             "family": "ace_step",
             "path": "${MODELS_DIR}/ace_step/xl-turbo/"
+          }
+        },
+        "ace-step-1.5-base": {
+          "display": "ACE-Step 1.5 Base (1.7B LM, 50-step default \u2014 pretrained root, not instruction-tuned)",
+          "params_b": 3.5,
+          "min_vram_gb": 12,
+          "files": [
+            {
+              "name": "dit",
+              "filename": "acestep-v15-base-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-v15-base-Q8_0.gguf"
+              }
+            },
+            {
+              "name": "lm",
+              "filename": "acestep-5Hz-lm-1.7B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-5Hz-lm-1.7B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "te",
+              "filename": "Qwen3-Embedding-0.6B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "Qwen3-Embedding-0.6B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "vae",
+              "filename": "vae-BF16.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "vae-BF16.gguf"
+              }
+            }
+          ],
+          "status_note": "Pretrained root for the 1.5 family (SFT and Turbo are fine-tuned from this). Uses the linear 50-step schedule (same as SFT) via build_schedule() \u2014 Base was not trained for the 8-step turbo shortcut. Variant auto-detected by '-base' substring in loader.cpp.",
+          "server_config": {
+            "family": "ace_step",
+            "path": "${MODELS_DIR}/ace_step/1.5-base/"
+          }
+        },
+        "ace-step-xl-sft": {
+          "display": "ACE-Step XL SFT (4B LM, 50-step default)",
+          "params_b": 4,
+          "min_vram_gb": 16,
+          "files": [
+            {
+              "name": "dit",
+              "filename": "acestep-v15-xl-sft-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-v15-xl-sft-Q8_0.gguf"
+              }
+            },
+            {
+              "name": "lm",
+              "filename": "acestep-5Hz-lm-4B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-5Hz-lm-4B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "te",
+              "filename": "Qwen3-Embedding-1.7B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "Qwen3-Embedding-1.7B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "vae",
+              "filename": "vae-BF16.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "vae-BF16.gguf"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "ace_step",
+            "path": "${MODELS_DIR}/ace_step/xl-sft/"
+          }
+        },
+        "ace-step-xl-base": {
+          "display": "ACE-Step XL Base (4B LM, 8-step default \u2014 pretrained root)",
+          "params_b": 4,
+          "min_vram_gb": 16,
+          "files": [
+            {
+              "name": "dit",
+              "filename": "acestep-v15-xl-base-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-v15-xl-base-Q8_0.gguf"
+              }
+            },
+            {
+              "name": "lm",
+              "filename": "acestep-5Hz-lm-4B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "acestep-5Hz-lm-4B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "te",
+              "filename": "Qwen3-Embedding-1.7B-Q8_0.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "Qwen3-Embedding-1.7B-Q8_0.gguf"
+              },
+              "post_process": "convert_acestep --in <file>"
+            },
+            {
+              "name": "vae",
+              "filename": "vae-BF16.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "Serveurperso/ACE-Step-1.5-GGUF",
+                "revision": "main",
+                "filename": "vae-BF16.gguf"
+              }
+            }
+          ],
+          "status_note": "XL Base uses the turbo 8-step schedule (empty-variant fallback in build_schedule) \u2014 kept consistent with the existing XL Base benchmark at RTF 5.68. Substring detection in loader.cpp excludes 'xl-base' from the new 'base' variant branch so this behaviour is preserved.",
+          "server_config": {
+            "family": "ace_step",
+            "path": "${MODELS_DIR}/ace_step/xl-base/"
+          }
+        }
+      },
+      "alternate_components": {
+        "_comment": "Drop-in component swaps that share the same tensor layout as the stock files above. Use by symlinking the alternate over the stock filename in the variant's model dir.",
+        "scragvae": {
+          "display": "ScragVAE \u2014 high-frequency VAE decoder replacement for ACE-Step 1.5",
+          "replaces": "vae-BF16.gguf",
+          "filename": "scragvae-BF16.gguf",
+          "source": {
+            "provider": "huggingface",
+            "repo": "scragnog/Ace-Step-1.5-ScragVAE",
+            "revision": "main",
+            "filename": "scragvae-BF16.gguf"
+          },
+          "status_note": "Same 365 tensors, same names, same shapes as stock vae-BF16.gguf (verified \u2014 pure drop-in). Retrained decoder preserves 12 kHz\u201324 kHz high frequencies and transients that the stock VAE rolls off above ~6 kHz. To use: symlink scragvae-BF16.gguf \u2192 vae-BF16.gguf in the variant dir. End-to-end benchmark: RTF 3.70 with turbo DiT (matches stock VAE's 3.90 \u2014 same architecture, only weights differ)."
+        }
+      }
+    },
+    "moss_sfx_v2": {
+      "display": "MOSS-SoundEffect-v2",
+      "vendor": "OpenCode-Team",
+      "license": "MIT",
+      "homepage": "https://github.com/anomalyco/audiocore",
+      "modes": {
+        "text_to_sfx": {
+          "status": "wired",
+          "notes": "Flow-matching 1.3B DiT → DAC VAE decoder → PCM mono. 10s output, 50-step Euler. Requires mse2-dit.gguf + mse2-vae.gguf; qwen3-te.gguf optional."
+        }
+      },
+      "variants": {
+        "default": {
+          "display": "MSE2 1.3B (BF16)",
+          "params_b": 1.3,
+          "min_vram_gb": 4,
+          "files": [
+            {
+              "name": "dit",
+              "filename": "mse2-dit.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "anomalyco/mse2-gguf",
+                "revision": "main",
+                "filename": "mse2-dit.gguf"
+              }
+            },
+            {
+              "name": "vae",
+              "filename": "mse2-vae.gguf",
+              "source": {
+                "provider": "huggingface",
+                "repo": "anomalyco/mse2-gguf",
+                "revision": "main",
+                "filename": "mse2-vae.gguf"
+              }
+            },
+            {
+              "name": "te",
+              "filename": "qwen3-te.gguf",
+              "optional": true,
+              "source": {
+                "provider": "huggingface",
+                "repo": "anomalyco/mse2-gguf",
+                "revision": "main",
+                "filename": "qwen3-te.gguf"
+              }
+            }
+          ],
+          "server_config": {
+            "family": "moss_sfx_v2",
+            "path": "${MODELS_DIR}/moss_sfx_v2/"
           }
         }
       }

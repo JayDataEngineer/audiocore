@@ -105,11 +105,13 @@ int main() {
     const char* env_seed = std::getenv("ACESTEP_SEED");
     const char* env_guid = std::getenv("ACESTEP_GUIDANCE");
     const char* env_temp = std::getenv("ACESTEP_TEMP");
+    const char* env_steps = std::getenv("ACESTEP_STEPS");
     req.caption     = env_cap ? env_cap : "lo-fi ambient piano with soft rain";
     req.duration    = env_dur ? std::stof(env_dur) : 10.0f;
     req.seed        = env_seed ? std::stoull(env_seed) : 42ULL;
     req.guidance_scale = env_guid ? std::stof(env_guid) : 7.5f;
     req.temperature = env_temp ? std::stof(env_temp) : 0.0f;
+    req.n_diffusion_steps = env_steps ? std::stoi(env_steps) : 0;
     req.top_p       = 1.0f;
     req.mode        = "text_to_music";
     std::fprintf(stderr, "[INFO] caption:    %s\n", req.caption.c_str());

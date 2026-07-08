@@ -109,8 +109,8 @@ private:
                                 std::vector<float>* embd_out,
                                 std::string* error);
 
-    // Embed a single (1+N_VQ) token vector into one hidden_size row.
-    // tokens[0] is the text token, tokens[1..N_VQ] are audio codec tokens.
+    // Embed a single (1+n_vq) token vector into one hidden_size row.
+    // tokens[0] is the text token, tokens[1..n_vq] are audio codec tokens.
     bool embed_one_step(const int32_t* tokens, std::vector<float>* embd_out,
                         std::string* error);
 
@@ -158,6 +158,8 @@ private:
     MossConfig     cfg_;
     bool           owns_ext_ctx_ = false;
 };
+
+
 
 }  // namespace audiocore::moss
 

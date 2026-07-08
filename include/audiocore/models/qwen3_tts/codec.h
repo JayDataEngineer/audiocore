@@ -96,6 +96,14 @@ public:
         uint32_t max_pos        = 8000;
         float    rope_theta     = 10000.0f;
         float    rms_norm_eps   = 1e-5f;
+        // Encoder transformer (codec.enc.xfmr.*) has its own head config —
+        // it is a SEPARATE 8-layer / 512-dim / 8-head transformer from the
+        // decoder. n_heads*head_dim = 8*64 = 512 = hidden_size (matches
+        // speech_tokenizer/config.json → encoder_config). Decoder uses
+        // n_heads=16 above; reusing it for the encoder trips the QKV reshape
+        // (16*64=1024 ≠ the 512-wide attn_*_w projection).
+        uint32_t enc_n_heads    = 8;
+        uint32_t enc_head_dim   = 64;
         int      upsample_rates[4] = {8, 5, 4, 3};  // 4 decoder blocks
         int      upsampling_ratios[2] = {2, 2};     // 2 ConvNeXt upsample stages
     };
@@ -201,6 +209,13 @@ private:
     };
     std::vector<WeightSrc> weight_srcs_;
 
+    // Look up the registered CPU (GGUF mmap) host pointer for a tensor.
+    // Encoder RVQ weights are read by CPU code (cenc_rvq_encode_), so they
+    // are never placed in a graph and gallocr never assigns them a backend
+    // buffer — tensor->data stays NULL. The loader registers their mmap
+    // pointers in weight_srcs_, and this helper recovers them.
+    const void* weight_host_data_(const ggml_tensor* t) const;
+
     // Upload all registered weight data to backend device memory.
     // Called inside decode() after galloc allocates the graph.
     void upload_weights_();
@@ -266,7 +281,7 @@ private:
     ggml_tensor* res_unit_(ggml_context* ctx, ggml_tensor* x,
                              const ResUnit& ru, int dilation) const;
     ggml_tensor* dec_block_(ggml_context* ctx, ggml_tensor* x,
-                              const DecBlock& blk, int stride) const;
+                              const DecBlock& blk, int stride, int block_idx) const;
     ggml_tensor* self_attn_(ggml_context* ctx, ggml_tensor* x,
                               const XfmrLayer& L, ggml_tensor* pos,
                               ggml_tensor* mask) const;

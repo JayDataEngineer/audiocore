@@ -93,6 +93,12 @@ struct Qwen3TtsConfig {
     std::string codec_path;           // Stage 17: path to codec GGUF
                                        // (cstr/qwen3-tts-tokenizer-12hz-GGUF);
                                        // empty if no codec sidecar found.
+    std::string speaker_encoder_path; // Stage 17b: path to standalone
+                                       // ECAPA-TDNN speaker-encoder GGUF
+                                       // (qwen3tts-speaker-encoder.gguf from
+                                       // marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B).
+                                       // Empty → fall back to talker_path
+                                       // (for older bundled-tensor layouts).
     int  n_codebooks        = 32;
     int  n_ctx_talker       = 8192;
     int  n_ctx_predictor    = 4096;
@@ -109,10 +115,21 @@ struct Qwen3TtsConfig {
     // Qwen3TtsCodecGraphs::bind() succeeded. Drives the run_inference
     // Phase 4 branch: bound → real codec decode; unbound → silence fallback.
     bool codec_present      = false;
-    // Stage 17b: true once the ECAPA-TDNN speaker encoder was loaded from
-    // the talker GGUF. Drives the Voice Clone branch in run_inference:
-    // bound → real ECAPA embedding; unbound → fail-fast with GAPS.md pointer.
+    // Stage 17b: true once the ECAPA-TDNN speaker encoder was loaded
+    // (either from speaker_encoder_path or, for legacy layouts, from
+    // speaker.* tensors bundled inside the talker GGUF). Drives the Voice
+    // Clone branch in run_inference: bound → real ECAPA embedding;
+    // unbound → fail-fast with GAPS.md pointer.
     bool speaker_present    = false;
+    // WDELTA (Base → CustomVoice weight patching) — see
+    // Runner::apply_wdelta_patch docstring. Populated by Qwen3TtsSession::load
+    // when a CV talker is loaded and a sibling Base talker GGUF is found.
+    // wdelta_applied=true means text_proj biases + codec_embedding in the
+    // loaded CV talker have been overwritten with Base's versions, unlocking
+    // the 4-feature pipeline (custom embedding + instruct + text + quality)
+    // on the CV variant. Drives the speaker-embedding path in synthesize().
+    bool wdelta_applied     = false;
+    std::string wdelta_base_path;
 };
 
 // Parse a mode string ("tts" | "voice_design" | "voice_clone" | "streaming")
@@ -159,6 +176,14 @@ public:
     std::vector<float> extract_speaker_embedding(const std::string& wav_path,
                                                   std::string* error = nullptr);
 
+    // Base Session override — delegates to extract_speaker_embedding so
+    // Python bindings can call compute_embedding() generically across all
+    // families (returns empty + error on families that don't implement it).
+    std::vector<float> compute_embedding(const std::string& wav_path,
+                                          std::string* error = nullptr) override {
+        return extract_speaker_embedding(wav_path, error);
+    }
+
     // Synthesize with a pre-computed speaker embedding (bypasses WAV load).
     // `embedding` must be the output of extract_speaker_embedding or match
     // the talker's n_embd dimension.
@@ -166,6 +191,10 @@ public:
                                    const float* embedding, size_t emb_dim,
                                    TtsResponse& resp,
                                    std::string* error = nullptr);
+
+    // True when the ECAPA-TDNN speaker encoder GGUF was loaded alongside
+    // the talker. Required for extract_speaker_embedding / voice-clone mode.
+    bool speaker_encoder_loaded() const { return config_.speaker_present; }
 
 private:
     std::unique_ptr<qwen3::Runner> talker_;     // qwen3tts backbone + dual-embedding extras

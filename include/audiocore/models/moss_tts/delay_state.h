@@ -25,7 +25,6 @@ inline constexpr int32_t AUDIO_USER_SLOT_TOKEN_ID = 151654;
 inline constexpr int32_t AUDIO_ASSISTANT_GEN_SLOT_TOKEN_ID = 151656;
 inline constexpr int32_t AUDIO_ASSISTANT_DELAY_SLOT_TOKEN_ID = 151662;
 inline constexpr int32_t AUDIO_PAD_CODE = 1024;
-inline constexpr int32_t N_VQ = 32;
 inline constexpr int32_t AUDIO_VOCAB_SIZE = 1024;  // 0-1023, pad=1024
 
 // ── Sampling configuration ────────────────────────────────────────────────
@@ -47,19 +46,21 @@ struct DelayState {
     bool    is_audio = false;
     bool    is_stopping = false;
     int32_t time_step = 0;
+    int32_t n_vq = 32;
     std::vector<int32_t> text_history;
 
-    // Audio history: each entry is N_VQ int32 codes.
+    // Audio history: each entry is n_vq int32 codes.
     std::vector<std::vector<int32_t>> audio_buf;
 };
 
 // Initialize delay state from prompt multi-channel tokens.
-// prompt: (S, 1+N_VQ) — channel 0 = text tokens, channels 1..N_VQ = audio codes.
-DelayState init_delay_state(const std::vector<std::vector<int32_t>>& prompt);
+// prompt: (S, 1+n_vq) — channel 0 = text tokens, channels 1..n_vq = audio codes.
+DelayState init_delay_state(const std::vector<std::vector<int32_t>>& prompt,
+                            int32_t n_vq);
 
-// Execute one autoregressive step. Returns (1+N_VQ) next token IDs.
+// Execute one autoregressive step. Returns (1+n_vq) next token IDs.
 //   text_logits:  (vocab_size,) — llama text logits at last position
-//   audio_logits: (N_VQ, audio_vocab_size+1) — per-stream audio logits
+//   audio_logits: (n_vq, audio_vocab_size+1) — per-stream audio logits
 // config is taken by non-const reference because the rng inside it advances.
 std::vector<int32_t> delay_step(DelayState& state,
                                 const float* text_logits, int32_t text_vocab,
@@ -67,14 +68,16 @@ std::vector<int32_t> delay_step(DelayState& state,
                                 SamplingConfig& config);
 
 // Remove delay pattern from generated audio codes.
-// delay_codes: (T_delayed, N_VQ) — the audio channels from generation
-// Returns: (T, N_VQ) — de-delayed codes, T = T_delayed - N_VQ + 1
+// delay_codes: (T_delayed, n_vq) — the audio channels from generation
+// Returns: (T, n_vq) — de-delayed codes, T = T_delayed - n_vq + 1
 std::vector<std::vector<int32_t>> apply_de_delay_pattern(
-    const std::vector<std::vector<int32_t>>& delay_codes);
+    const std::vector<std::vector<int32_t>>& delay_codes,
+    int32_t n_vq);
 
 // Extract non-padding audio segments after de-delaying.
 std::vector<std::vector<int32_t>> extract_audio_segments(
-    const std::vector<std::vector<int32_t>>& codes);
+    const std::vector<std::vector<int32_t>>& codes,
+    int32_t n_vq);
 
 }  // namespace audiocore::moss
 

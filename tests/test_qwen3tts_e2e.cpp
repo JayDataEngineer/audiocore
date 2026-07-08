@@ -39,14 +39,12 @@ int main() {
     }
     std::string model_dir = env_dir;
 
+    // Only set talker/predictor/codec paths if explicitly provided via env.
+    // Otherwise, let the loader auto-discover using its canonical names
+    // (qwen3_tts_talker.gguf, qwen3_tts_predictor.gguf, tokenizer-f16.gguf).
     const char* env_talker = std::getenv("QWEN3TTS_TALKER");
-    std::string talker_fn  = env_talker ? env_talker : "talker.q5_k.gguf";
-
-    const char* env_pred = std::getenv("QWEN3TTS_PREDICTOR");
-    std::string pred_fn  = env_pred ? env_pred : "predictor.q8_0.gguf";
-
-    const char* env_codec = std::getenv("QWEN3TTS_CODEC");
-    std::string codec_fn  = env_codec ? env_codec : "tokenizer-q8_0.gguf";
+    const char* env_pred   = std::getenv("QWEN3TTS_PREDICTOR");
+    const char* env_codec  = std::getenv("QWEN3TTS_CODEC");
 
     const char* env_ngpu = std::getenv("QWEN3TTS_NGPU");
     std::string ngpu_str = env_ngpu ? env_ngpu : "99";
@@ -55,9 +53,12 @@ int main() {
     std::string backend_dev = env_dev ? env_dev : "ggml_cuda";
 
     std::fprintf(stderr, "[INFO] Qwen3-TTS dir: %s\n", model_dir.c_str());
-    std::fprintf(stderr, "[INFO] talker:         %s\n", talker_fn.c_str());
-    std::fprintf(stderr, "[INFO] predictor:      %s\n", pred_fn.c_str());
-    std::fprintf(stderr, "[INFO] codec:          %s\n", codec_fn.c_str());
+    std::fprintf(stderr, "[INFO] talker:         %s\n",
+                 env_talker ? env_talker : "(auto-discover)");
+    std::fprintf(stderr, "[INFO] predictor:      %s\n",
+                 env_pred ? env_pred : "(auto-discover)");
+    std::fprintf(stderr, "[INFO] codec:          %s\n",
+                 env_codec ? env_codec : "(auto-discover)");
     std::fprintf(stderr, "[INFO] n_gpu_layers:   %s\n", ngpu_str.c_str());
     std::fprintf(stderr, "[INFO] backend:        %s\n", backend_dev.c_str());
 
@@ -66,9 +67,9 @@ int main() {
     std::fprintf(stderr, "[INFO] qwen3_tts session created\n");
 
     LoadOptions opts;
-    opts.extras["talker_path"]    = talker_fn;
-    opts.extras["predictor_path"] = pred_fn;
-    opts.extras["codec_path"]     = codec_fn;
+    if (env_talker) opts.extras["talker_path"]    = env_talker;
+    if (env_pred)   opts.extras["predictor_path"] = env_pred;
+    if (env_codec)  opts.extras["codec_path"]     = env_codec;
     opts.extras["n_gpu_layers"]   = ngpu_str;
 
     BackendKind kind = BackendKind::ggml_cpu;
