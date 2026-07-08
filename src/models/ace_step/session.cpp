@@ -315,13 +315,26 @@ static constexpr int32_t FSQ_CODE_COUNT  = 64000;     // valid FSQ codes (levels
 static constexpr const char* LM_INSTRUCTION =
     "Generate audio semantic tokens based on the given conditions:";
 
+// DIT_INSTR_TEXT2MUSIC — matches ref-acestep/src/task-types.h:70
+// This is the instruction the TE encodes for the DiT cross-attention in
+// text2music mode (the common case). COVER mode ("Generate audio semantic
+// tokens...") is only used when the USER provides audio_codes for style
+// reinterpretation — NOT when the LM generates codes internally.
+//   ref: pipeline-synth.cpp:321-325
+//     s.use_source_context = !reqs[0].audio_codes.empty();  ← USER codes
+//     s.instruction_str = use_source_context ? DIT_INSTR_COVER : DIT_INSTR_TEXT2MUSIC;
+// The LM-generated codes ALWAYS feed the DiT src via the FSQ detokenizer
+// regardless of the instruction (pipeline-synth-ops.cpp:675-722).
+static constexpr const char* DIT_INSTR_TEXT2MUSIC =
+    "Fill the audio semantic mask based on the given conditions:";
+
 // Text-encoder prompt (for TE/DiT cross-attention). This is the
 // "instruction + caption + metas" format used by the text encoder.
 // Matches ref-acestep/src/pipeline-synth-ops.cpp:422-430 (build_prompt_strings).
 static std::string format_te_prompt(const std::string& caption,
                                     const std::string& lyrics,
                                     float audio_duration) {
-    const std::string& instruction = LM_INSTRUCTION;
+    const std::string& instruction = DIT_INSTR_TEXT2MUSIC;
     int dur_int = (audio_duration > 0.0f) ? static_cast<int>(audio_duration) : 30;
     std::string metas = "- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n"
                         "- duration: " + std::to_string(dur_int) + " seconds\n";

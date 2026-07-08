@@ -56,8 +56,8 @@ struct MusicRequest {
     int32_t     seed         = 0;
     float       guidance_scale = 1.0f;
     int32_t     n_diffusion_steps = 0;  // 0 → variant default (turbo=8, sft=50)
-    float       temperature  = 0.0f;   // LM sampling temp (0=argmax, >0=stochastic)
-    float       top_p        = 1.0f;   // LM nucleus sampling threshold
+    float       temperature  = 0.85f;  // LM sampling temp (ref default=0.85, 0=argmax)
+    float       top_p        = 0.9f;   // LM nucleus sampling threshold (ref default=0.9)
     // ── Repaint / completion conditioning ─────────────────────────────────
     std::vector<float> input_audio;    // stereo PCM interleaved at 48kHz
     float              mask_start = 0.0f;  // normalized position [0,1)
