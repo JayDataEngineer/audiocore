@@ -170,6 +170,16 @@ private:
     std::vector<float> repaint_latent_cond_;
     // For cover mode: VAE-encoded + FSQ-roundtripped source audio latent [T, 64]
     std::vector<float> cover_latent_cond_;
+
+    // ── Detokenized LM codes → DiT source latent ───────────────────────────
+    // The reference pipeline (pipeline-synth.cpp:321-324) ALWAYS detokenizes
+    // the LM audio codes through the FSQ detokenizer and feeds the result as
+    // the DiT's source context (src channels 0–63). Without this path the DiT
+    // receives only silence as source, and the caption has near-zero effect
+    // on the output — the LM codes are the primary musical conditioning.
+    // [T_25Hz, 64] = [n_codes * 5, 64]
+    std::vector<float> lm_src_latents_;
+    int32_t            lm_src_T_ = 0;  // T_25Hz = n_codes * 5
 };
 
 }  // namespace audiocore::acestep

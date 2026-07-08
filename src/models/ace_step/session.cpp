@@ -307,9 +307,15 @@ static void bf16_to_f32_buf_local(const void* src, float* dst, int32_t n) {
 static std::string format_sft_prompt(const std::string& caption,
                                      const std::string& lyrics,
                                      float audio_duration) {
-    // Default instruction for text2music (DEFAULT_DIT_INSTRUCTION upstream).
+    // When LM codes are present (always true in our pipeline), the reference
+    // uses the COVER instruction (task-types.h:73):
+    //   "Generate audio semantic tokens based on the given conditions:"
+    // The TEXT2MUSIC instruction ("Fill the audio semantic mask...") is only
+    // used when there are NO audio codes — pure silence-source DiT.
+    // Using COVER instruction matches what the model was trained with when
+    // the detokenized codes serve as source context.
     const std::string instruction =
-        "Fill the audio semantic mask based on the given conditions:";
+        "Generate audio semantic tokens based on the given conditions:";
 
     // Metadata string. Upstream _build_metadata_string defaults unset fields
     // to "N/A"; the duration uses "{int(d)} seconds".
@@ -503,6 +509,33 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     }
     fprintf(stderr, "[ace_step] run_lm: decode loop done (%zu codes)\n", music_codes->size());
 
+    // (7) FSQ detokenize the LM codes → 25 Hz source latent for the DiT.
+    //     The reference pipeline (pipeline-synth.cpp:321-324,
+    //     pipeline-synth-ops.cpp:662-704) ALWAYS runs this path when audio_codes
+    //     are present. The detokenized latent fills the DiT's src channels
+    //     (0–63), providing the primary musical conditioning from the caption.
+    //     Without it the DiT receives only silence as source and the caption
+    //     has near-zero effect on the output.
+    if (!detokenizer_runner_) {
+        if (error) *error = "ACE-Step: detokenizer_runner not initialized — "
+                            "cannot produce DiT source latent from LM codes";
+        return false;
+    }
+    fprintf(stderr, "[ace_step] run_lm: FSQ detokenize %zu codes → 25 Hz latent...\n",
+            music_codes->size());
+    lm_src_T_ = 0;
+    lm_src_latents_.clear();
+    if (!detokenizer_runner_->decode(music_codes->data(),
+                                     static_cast<int32_t>(music_codes->size()),
+                                     &lm_src_latents_, error)) {
+        if (error) *error = std::string("ACE-Step: FSQ detokenize FAILED — ") +
+                            (error ? *error : "(no detail)");
+        return false;
+    }
+    lm_src_T_ = static_cast<int32_t>(music_codes->size()) * 5;
+    fprintf(stderr, "[ace_step] run_lm: detokenize done (T_25Hz=%d, %zu floats)\n",
+            lm_src_T_, lm_src_latents_.size());
+
     return true;
 }
 
@@ -549,28 +582,31 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
 
     // ── 1. Source latent for DiT context (src channels 0..63) ──────────────
     //
-    // Upstream ACE-Step prepare_src_latents (pipeline_ace_step.py:626):
-    //   • cover from audio_codes  → detokenize residual-FSQ codes
-    //   • cover from src_audio    → VAE-encode (then tokenize+detokenize for cover)
-    //   • text_to_music (no src)  → silence_latent  ← THIS IS OUR CASE
+    // The reference pipeline (pipeline-synth-ops.cpp:662-724) ALWAYS
+    // detokenizes the LM audio codes through the FSQ detokenizer and uses the
+    // result as the DiT's source context. The detokenized latent provides the
+    // primary musical conditioning — the caption's influence flows through the
+    // LM → codes → detokenize → DiT src path. Frames beyond the detokenized
+    // length are padded with silence_latent.
     //
-    // For text_to_music, src_latents = silence_latent (the learned "no music"
-    // reference), NOT the detokenized LM codes. The DiT learns: "given silence
-    // as src + text conditioning, generate music." The LM codes drive the
-    // generation only indirectly — they were already consumed by the LM to
-    // produce a musical token sequence that conditions the DiT via the text
-    // encoder path (not via src).
+    // Previously we used silence_latent as src for text_to_music, which
+    // completely bypassed the LM codes. This caused the caption to have
+    // near-zero effect on the output — the DiT had only the weak cross-attention
+    // text signal, with no musical content from the LM.
     //
-    // The detokenizer_runner is kept wired (detokenizer_runner_ member) for
-    // future cover-mode support (residual-FSQ decode path), but is NOT invoked
-    // for text_to_music. See docs/ACE-STEP-DETOKENIZER-GAP.md.
-    //
-    // For cover mode the src is cover_latent_cond_ which already holds the
-    // VAE-encoded + temporally-smoothed source latents.
+    // HARD ERROR: if lm_src_latents_ is empty, the detokenizer did not run.
+    // This is a fatal error — no silent fallback to silence.
 
     // ── 2. Prepare conditioning for DiT ─────────────────────────────────────
     if (!is_cover_mode && (te_cond_.empty() || te_cond_len_ <= 0)) {
         if (error) *error = "ACE-Step: run_lm must execute before run_dit_and_vae";
+        return false;
+    }
+    // HARD ERROR: detokenized LM source latent must be present for text2music.
+    // Without it the DiT runs on silence and the caption is ignored.
+    if (!is_cover_mode && repaint_latent_cond_.empty() && lm_src_latents_.empty()) {
+        if (error) *error = "ACE-Step: lm_src_latents_ is empty — the FSQ detokenizer "
+                            "did not run. Cannot generate music without LM source latent.";
         return false;
     }
     // For cover mode, use empty text conditioning (TE is not needed since
@@ -749,13 +785,23 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
                 std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
                             static_cast<size_t>(out_ch) * sizeof(float));
         } else {
-            // text_to_music: src = silence_latent (the learned "no music"
-            // reference). Matches upstream prepare_src_latents for the no-source
-            // case. The silence_latent tensor (shape [64, 15000]) is cropped
-            // or tiled to the target latent length.
-            if (silence_ptr && t < silence_T)
-                std::memcpy(row, silence_ptr + static_cast<size_t>(t) * out_ch,
+            // text_to_music: src = detokenized LM codes (PRIMARY musical
+            // conditioning). The LM generates music codes conditioned on the
+            // caption; the FSQ detokenizer converts them to a 25 Hz latent
+            // that serves as the DiT's source context. Matches reference
+            // pipeline-synth-ops.cpp:714-718. Frames beyond the detokenized
+            // length are padded with silence_latent.
+            if (t < lm_src_T_) {
+                std::memcpy(row,
+                            &lm_src_latents_[static_cast<size_t>(t) * out_ch],
                             static_cast<size_t>(out_ch) * sizeof(float));
+            } else {
+                int32_t sil_idx = t - lm_src_T_;
+                if (silence_ptr && sil_idx < silence_T)
+                    std::memcpy(row,
+                                silence_ptr + static_cast<size_t>(sil_idx) * out_ch,
+                                static_cast<size_t>(out_ch) * sizeof(float));
+            }
         }
 
         // ── mask (channels 64–127) ──

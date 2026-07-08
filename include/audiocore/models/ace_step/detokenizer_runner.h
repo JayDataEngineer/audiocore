@@ -30,6 +30,7 @@
 #include <vector>
 
 struct ggml_context;
+struct ggml_tensor;
 
 namespace audiocore::acestep {
 
@@ -48,6 +49,21 @@ public:
 
 private:
     ggml_context* ext_ctx_;
+
+    // ── CPU weight context ────────────────────────────────────────────────
+    // DiTRunner::ensure_backend() migrates ALL ext_ctx_ tensors to CUDA after
+    // the first DiT forward. After migration, tensor->data points to GPU
+    // memory — the CPU-side detokenizer graph compute segfaults trying to read
+    // these pointers. We clone all detokenizer weights into a SEPARATE CPU
+    // ggml context on the FIRST decode() call (which runs before any DiT
+    // forward → before migration). Subsequent calls reference detok_wctx_
+    // exclusively, never touching the migrated ext_ctx_.
+    ggml_context* detok_wctx_ = nullptr;
+    bool detok_wctx_ready_ = false;
+
+    // Clone all "detokenizer.*" and "tokenizer.quantizer.project_out.*"
+    // tensors from ext_ctx_ to detok_wctx_. Must run before CUDA migration.
+    void build_weight_ctx();
 };
 
 }  // namespace audiocore::acestep

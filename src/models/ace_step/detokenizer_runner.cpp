@@ -83,7 +83,73 @@ static std::vector<float> dequant_to_f32(const ggml_tensor* t) {
 DetokenizerRunner::DetokenizerRunner(ggml_context* ext_ctx)
     : ext_ctx_(ext_ctx) {}
 
-DetokenizerRunner::~DetokenizerRunner() = default;
+DetokenizerRunner::~DetokenizerRunner() {
+    if (detok_wctx_) ggml_free(detok_wctx_);
+}
+
+void DetokenizerRunner::build_weight_ctx() {
+    if (detok_wctx_ready_) return;
+
+    // First pass: calculate total memory needed for all detokenizer weights.
+    size_t total_bytes = 0;
+    int n_tensors = 0;
+    for (ggml_tensor* t = ggml_get_first_tensor(ext_ctx_); t;
+         t = ggml_get_next_tensor(ext_ctx_, t)) {
+        const char* name = ggml_get_name(t);
+        if (!name) continue;
+        std::string nm(name);
+        bool want = (nm.find("detokenizer.") == 0 ||
+                     nm.find("tokenizer.quantizer.project_out") == 0);
+        if (!want) continue;
+        total_bytes += ggml_row_size(t->type, t->ne[0]) *
+                       static_cast<size_t>(ggml_nrows(t));
+        n_tensors++;
+    }
+    total_bytes += (size_t)ggml_tensor_overhead() * (n_tensors + 8) + 1024;
+    fprintf(stderr, "[detok] building weight context: %d tensors, %zu bytes\n",
+            n_tensors, total_bytes);
+
+    // Allocate a persistent arena (intentionally leaked — detokenizer lives
+    // for the entire session, and the arena must outlive any decode() call).
+    char* arena = (char*)std::malloc(total_bytes);
+    if (!arena) {
+        fprintf(stderr, "[detok] FATAL: malloc(%zu) failed for weight arena\n",
+                total_bytes);
+        return;
+    }
+    struct ggml_init_params p = { total_bytes, arena, /*no_alloc=*/false };
+    detok_wctx_ = ggml_init(p);
+    if (!detok_wctx_) {
+        std::free(arena);
+        fprintf(stderr, "[detok] FATAL: ggml_init failed for weight context\n");
+        return;
+    }
+
+    // Second pass: clone each tensor into the weight context (original type).
+    int n_cloned = 0;
+    for (ggml_tensor* t = ggml_get_first_tensor(ext_ctx_); t;
+         t = ggml_get_next_tensor(ext_ctx_, t)) {
+        const char* name = ggml_get_name(t);
+        if (!name) continue;
+        std::string nm(name);
+        bool want = (nm.find("detokenizer.") == 0 ||
+                     nm.find("tokenizer.quantizer.project_out") == 0);
+        if (!want) continue;
+
+        ggml_tensor* dst = ggml_new_tensor(detok_wctx_, t->type,
+                                           ggml_n_dims(t), t->ne);
+        size_t nbytes = ggml_row_size(t->type, t->ne[0]) *
+                        static_cast<size_t>(ggml_nrows(t));
+        std::memcpy(dst->data, t->data, nbytes);
+        ggml_set_name(dst, name);
+        n_cloned++;
+    }
+
+    detok_wctx_ready_ = true;
+    fprintf(stderr, "[detok] weight context built: %d tensors, %zu bytes\n",
+            n_cloned, total_bytes);
+    fflush(stderr);
+}
 
 bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
                                 std::vector<float>* latents, std::string* error) {
@@ -106,20 +172,30 @@ bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
 
     fprintf(stderr, "[detok] decode: N=%d codes, P=%d → %d latent frames\n",
             N, P, N * P);
+    fflush(stderr);
+
+    // Clone all detokenizer weights to a CPU ggml context BEFORE any CUDA
+    // migration. After the first DiT forward, ext_ctx_ tensors migrate to
+    // GPU and CPU-side reads crash. The weight context is built once (first
+    // decode call, before any DiT forward) and reused.
+    build_weight_ctx();
+    if (!detok_wctx_ready_ || !detok_wctx_) {
+        if (error) *error = "Detokenizer: failed to build CPU weight context";
+        return false;
+    }
 
     // ═══ Phase 1: FSQ code → 6-D → 204-D continuous (CPU) ═══
     // For each LM code: decode to 6-D via fsq_decode_one, then apply
     // tokenizer.quantizer.project_out (Linear 6 → 2048). This reconstructs
     // the `quantized` representation that the upstream detokenizer consumes.
-    ggml_tensor* proj_w_t = ggml_get_tensor(ext_ctx_,
+    ggml_tensor* proj_w_t = ggml_get_tensor(detok_wctx_,
         "tokenizer.quantizer.project_out.weight");
-    ggml_tensor* proj_b_t = ggml_get_tensor(ext_ctx_,
+    ggml_tensor* proj_b_t = ggml_get_tensor(detok_wctx_,
         "tokenizer.quantizer.project_out.bias");
     if (!proj_w_t) {
         if (error) *error = "Detokenizer: tokenizer.quantizer.project_out.weight not found";
         return false;
     }
-    // proj_w_t ne=[6, 2048] → row-major [6, 2048] (6 in, 2048 out)
     auto proj_w = dequant_to_f32(proj_w_t);
     auto proj_b = proj_b_t ? dequant_to_f32(proj_b_t) : std::vector<float>(H, 0.0f);
 
@@ -169,16 +245,23 @@ bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
     }
     ggml_cgraph* gf = ggml_new_graph_custom(ctx, 8192, false);
 
+    // All weight tensors come from detok_wctx_ (CPU-only clone), never from
+    // ext_ctx_ (which migrates to GPU after the first DiT forward).
+    // We use ggml_get_tensor on detok_wctx_ and reference the returned tensor
+    // in our computation graph. The weight tensors live in detok_wctx_ which
+    // is a separate CPU ggml context — it persists across decode() calls and
+    // is never migrated to GPU.
+
     // ── Input: quantized [N, H] → ggml 2D ne=[H, N] ──────────────────────
     ggml_tensor* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, N);
     std::memcpy(x->data, quantized.data(), quantized.size() * sizeof(float));
 
     // ── embed_tokens Linear (H → H) ──────────────────────────────────────
     {
-        ggml_tensor* w = ggml_get_tensor(ext_ctx_, "detokenizer.embed_tokens.weight");
-        ggml_tensor* b = ggml_get_tensor(ext_ctx_, "detokenizer.embed_tokens.bias");
+        ggml_tensor* w = ggml_get_tensor(detok_wctx_, "detokenizer.embed_tokens.weight");
+        ggml_tensor* b = ggml_get_tensor(detok_wctx_, "detokenizer.embed_tokens.bias");
         if (!w) {
-            if (error) *error = "Detokenizer: detokenizer.embed_tokens.weight missing";
+            if (error) *error = "Detokenizer: detokenizer.embed_tokens.weight missing from cache";
             ggml_free(ctx); return false;
         }
         x = ggml_mul_mat(ctx, w, x);  // ne=[H, N]
@@ -193,21 +276,26 @@ bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
         ggml_tensor* target = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, P, N);
         x = ggml_repeat(ctx, x, target);  // [H, P, N]
     }
-    // special_tokens in GGUF: ne=[H=2048, P=5] (Q8_0). ggml_repeat only
-    // supports F32/F16/BF16/I32 source types, so we dequantize to F32 on the
-    // CPU side (it's only 10K floats) and bind the F32 buffer into our graph
-    // context. The buffer stays alive for the duration of decode().
-    std::vector<float> special_tokens_f32;
+    // special_tokens in GGUF: ne=[H=2048, P=5]. ggml_repeat only supports
+    // F32/F16/BF16/I32 source types; if the weight is Q8_0 we dequantize,
+    // otherwise we reference it directly from detok_wctx_.
     {
-        ggml_tensor* st_src = ggml_get_tensor(ext_ctx_, "detokenizer.special_tokens");
+        ggml_tensor* st_src = ggml_get_tensor(detok_wctx_,
+            "detokenizer.special_tokens");
         if (!st_src) {
             if (error) *error = "Detokenizer: detokenizer.special_tokens missing";
             ggml_free(ctx); return false;
         }
-        special_tokens_f32 = dequant_to_f32(st_src);  // H*P entries
-        ggml_tensor* st = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, P);
-        std::memcpy(st->data, special_tokens_f32.data(),
-                    special_tokens_f32.size() * sizeof(float));
+        // If already F32, reference directly; otherwise dequantize into local.
+        ggml_tensor* st;
+        if (st_src->type == GGML_TYPE_F32 || st_src->type == GGML_TYPE_F16 ||
+            st_src->type == GGML_TYPE_BF16) {
+            st = st_src;
+        } else {
+            auto st_f32 = dequant_to_f32(st_src);
+            st = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, P);
+            std::memcpy(st->data, st_f32.data(), st_f32.size() * sizeof(float));
+        }
         st = ggml_reshape_3d(ctx, st, H, P, 1);
         ggml_tensor* st_target = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, P, N);
         st = ggml_repeat(ctx, st, st_target);  // [H, P, N]
@@ -222,7 +310,7 @@ bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
         auto W = [&](const char* suffix) -> ggml_tensor* {
             char nm[256];
             std::snprintf(nm, sizeof(nm), "%s.%s", prefix, suffix);
-            return ggml_get_tensor(ext_ctx_, nm);
+            return ggml_get_tensor(detok_wctx_, nm);
         };
 
         // ── Pre-norm (RMSNorm over ne[0]=H) ──────────────────────────────
@@ -314,7 +402,7 @@ bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
 
     // ── Final RMSNorm + proj_out (H → out_dim) ───────────────────────────
     {
-        ggml_tensor* norm_w = ggml_get_tensor(ext_ctx_, "detokenizer.norm.weight");
+        ggml_tensor* norm_w = ggml_get_tensor(detok_wctx_, "detokenizer.norm.weight");
         x = ggml_rms_norm(ctx, x, eps);
         if (norm_w) {
             x = ggml_mul(ctx, x, ggml_repeat(ctx,
@@ -322,10 +410,10 @@ bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
         }
     }
     {
-        ggml_tensor* po_w = ggml_get_tensor(ext_ctx_, "detokenizer.proj_out.weight");
-        ggml_tensor* po_b = ggml_get_tensor(ext_ctx_, "detokenizer.proj_out.bias");
+        ggml_tensor* po_w = ggml_get_tensor(detok_wctx_, "detokenizer.proj_out.weight");
+        ggml_tensor* po_b = ggml_get_tensor(detok_wctx_, "detokenizer.proj_out.bias");
         if (!po_w) {
-            if (error) *error = "Detokenizer: detokenizer.proj_out.weight missing";
+            if (error) *error = "Detokenizer: detokenizer.proj_out.weight missing from cache";
             ggml_free(ctx); return false;
         }
         x = ggml_mul_mat(ctx, po_w, x);  // [out_dim, P, N]
@@ -336,8 +424,13 @@ bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
     }
 
     // ── Build & compute ──────────────────────────────────────────────────
+    fprintf(stderr, "[detok] graph build + compute (N=%d, wctx=%p)...\n",
+            N, (void*)detok_wctx_);
+    fflush(stderr);
     ggml_build_forward_expand(gf, x);
     ggml_graph_compute_with_ctx(ctx, gf, 1);
+    fprintf(stderr, "[detok] graph compute done\n");
+    fflush(stderr);
 
     // ── Copy out: x is [out_dim=64, P=5, N] (ne order fastest-first).
     // We want time-major [T=N*P, out_dim] where T is the 25 Hz frame index.
