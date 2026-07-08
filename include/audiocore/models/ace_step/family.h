@@ -142,6 +142,16 @@ private:
     std::vector<float> proj_in_w_f32_;   // decoder.proj_in.1.weight  f32 [2, 2048, 192]
     std::vector<float> proj_out_w_f32_;  // decoder.proj_out.1.weight f32 [2, 64, 2048]
 
+    // ── CPU-cached tensor data (read BEFORE CUDA migration to avoid stale GPU ptrs) ──
+    // DiTRunner::ensure_backend() migrates ALL ext_ctx_ tensors to CUDA. After
+    // migration, tensor->data points to GPU memory, which cannot be dereferenced
+    // from CPU. We cache these on first access (before migration) and reuse.
+    std::vector<float> silence_latent_cache_;  // silence_latent [64, T]
+    int32_t            silence_T_cache_   = 0;  // T dimension of silence_latent
+    std::vector<float> proj_in_bias_cache_;    // decoder.proj_in.1.bias [H]
+    std::vector<float> proj_out_bias_cache_;   // decoder.proj_out.1.bias [64]
+    bool               cpu_caches_ready_  = false;
+
     // ── Cached between run_lm() and run_dit_and_vae() ──────────────────────
     std::vector<float> te_cond_;       // TE hidden states: [T_text, encoder_hidden]
     std::vector<float> te_uncond_;     // null-text TE hidden (for CFG)

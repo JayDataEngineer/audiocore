@@ -426,8 +426,10 @@ std::shared_ptr<httplib::Server> build_server(
         auto& slot = sg->slot;
 
         acestep::MusicRequest mr;
-        mr.caption  = body.value("caption", "");
-        mr.lyrics   = body.value("lyrics", "");
+        // Accept both "caption" (upstream ACE-Step field) and "prompt"
+        // (OpenAI-style alias used by the webUI and API callers).
+        mr.caption  = body.value("caption", body.value("prompt", ""));
+        mr.lyrics   = body.value("lyrics", body.value("prompt_lyrics", ""));
         mr.duration = body.value("duration", 30.0f);
         mr.mode     = body.value("mode", "text_to_music");
         mr.mask_start = body.value("mask_start", 0.0f);

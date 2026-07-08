@@ -586,42 +586,59 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
             T_latent, S_patches, P, H, in_ch, out_ch);
 
     // Load silence latent (used as src for text2music and inside repaint zone)
+    // CRITICAL: DiTRunner::ensure_backend() migrates ALL ext_ctx_ tensors to
+    // CUDA. After migration, tensor->data is a GPU pointer that CANNOT be
+    // dereferenced from CPU. We cache silence_latent + biases on first access
+    // (before migration) and reuse the CPU copies on all subsequent requests.
     const float* silence_ptr = nullptr;
     int32_t silence_T = 0;
-    // silence_latent is shipped in the GGUF as ne=[D=64, T=15000] but the raw
-    // bytes are ALREADY in time-major flat order (flat[t*64 + c]). The
-    // converter (infra/repos/acestep.cpp/convert.py:165) does
-    //   src = np.frombuffer(raw, dtype=np.float32).reshape(64, 15000)
-    //   return src.T.copy()    # shape (15000, 64), C-contiguous
-    // before writing, so the bytes hit the GGUF already time-major. In ggml
-    // ne[0] is the fastest-varying dim — ne[0]=64 matches the inner stride of
-    // a (15000, 64) C-contiguous array. The direct pointer is correct; any
-    // additional transpose here would scramble the data.
-    {
+    const float* proj_in_bias  = nullptr;
+    const float* proj_out_bias = nullptr;
+
+    if (!cpu_caches_ready_) {
+        // First request: tensors are still on CPU (migration happens later
+        // during DiT forward → ensure_backend). Read and cache them now.
         ggml_tensor* st = ggml_get_tensor(ext_ctx_, "silence_latent");
         if (st) {
-            silence_ptr = static_cast<const float*>(st->data);
-            silence_T   = static_cast<int32_t>(st->ne[1]);
+            silence_T_cache_ = static_cast<int32_t>(st->ne[1]);
             const int32_t D = static_cast<int32_t>(st->ne[0]);
+            const size_t N = static_cast<size_t>(silence_T_cache_) * D;
+            silence_latent_cache_.resize(N);
+            std::memcpy(silence_latent_cache_.data(), st->data, N * sizeof(float));
+
             // Sanity stats — silence_latent should be ~N(0, 0.5)-ish.
             double sum = 0.0, sq = 0.0; float mn = 1e30f, mx = -1e30f;
-            const size_t N = static_cast<size_t>(silence_T) * D;
             for (size_t i = 0; i < N; i++) {
-                float v = silence_ptr[i];
+                float v = silence_latent_cache_[i];
                 sum += v; sq += (double)v * v;
                 if (v < mn) mn = v; if (v > mx) mx = v;
             }
             fprintf(stderr, "[ace_step] silence_latent [D=%d, T=%d] flat-time-major "
-                            "mean=%.4f RMS=%.4f range=[%.4f,%.4f]\n",
-                    D, silence_T, sum / N, std::sqrt(sq / N), mn, mx);
+                            "mean=%.4f RMS=%.4f range=[%.4f,%.4f] (cached to CPU)\n",
+                    D, silence_T_cache_, sum / N, std::sqrt(sq / N), mn, mx);
         }
+
+        // Cache proj_in / proj_out biases
+        ggml_tensor* pi_b = ggml_get_tensor(ext_ctx_, "decoder.proj_in.1.bias");
+        ggml_tensor* po_b = ggml_get_tensor(ext_ctx_, "decoder.proj_out.1.bias");
+        if (pi_b) {
+            size_t n = static_cast<size_t>(pi_b->ne[0]);
+            proj_in_bias_cache_.resize(n);
+            std::memcpy(proj_in_bias_cache_.data(), pi_b->data, n * sizeof(float));
+        }
+        if (po_b) {
+            size_t n = static_cast<size_t>(po_b->ne[0]);
+            proj_out_bias_cache_.resize(n);
+            std::memcpy(proj_out_bias_cache_.data(), po_b->data, n * sizeof(float));
+        }
+        cpu_caches_ready_ = true;
     }
 
-    // proj_in / proj_out biases
-    ggml_tensor* pi_b = ggml_get_tensor(ext_ctx_, "decoder.proj_in.1.bias");
-    ggml_tensor* po_b = ggml_get_tensor(ext_ctx_, "decoder.proj_out.1.bias");
-    const float* proj_in_bias  = pi_b ? static_cast<const float*>(pi_b->data) : nullptr;
-    const float* proj_out_bias = po_b ? static_cast<const float*>(po_b->data) : nullptr;
+    // Use cached CPU copies (valid even after CUDA migration)
+    silence_ptr = silence_latent_cache_.empty() ? nullptr : silence_latent_cache_.data();
+    silence_T   = silence_T_cache_;
+    proj_in_bias  = proj_in_bias_cache_.empty()  ? nullptr : proj_in_bias_cache_.data();
+    proj_out_bias = proj_out_bias_cache_.empty() ? nullptr : proj_out_bias_cache_.data();
 
     // Repaint zone in latent frames (mask_start/mask_end are normalized [0,1])
     int32_t repaint_t0 = 0, repaint_t1 = 0;
