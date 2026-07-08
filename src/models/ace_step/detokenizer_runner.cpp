@@ -148,7 +148,6 @@ void DetokenizerRunner::build_weight_ctx() {
     detok_wctx_ready_ = true;
     fprintf(stderr, "[detok] weight context built: %d tensors, %zu bytes\n",
             n_cloned, total_bytes);
-    fflush(stderr);
 }
 
 bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
@@ -172,7 +171,6 @@ bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
 
     fprintf(stderr, "[detok] decode: N=%d codes, P=%d → %d latent frames\n",
             N, P, N * P);
-    fflush(stderr);
 
     // Clone all detokenizer weights to a CPU ggml context BEFORE any CUDA
     // migration. After the first DiT forward, ext_ctx_ tensors migrate to
@@ -424,13 +422,8 @@ bool DetokenizerRunner::decode(const int32_t* codes, int32_t n_codes,
     }
 
     // ── Build & compute ──────────────────────────────────────────────────
-    fprintf(stderr, "[detok] graph build + compute (N=%d, wctx=%p)...\n",
-            N, (void*)detok_wctx_);
-    fflush(stderr);
     ggml_build_forward_expand(gf, x);
     ggml_graph_compute_with_ctx(ctx, gf, 1);
-    fprintf(stderr, "[detok] graph compute done\n");
-    fflush(stderr);
 
     // ── Copy out: x is [out_dim=64, P=5, N] (ne order fastest-first).
     // We want time-major [T=N*P, out_dim] where T is the 25 Hz frame index.
