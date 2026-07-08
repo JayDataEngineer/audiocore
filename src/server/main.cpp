@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unistd.h>
@@ -214,19 +215,17 @@ int main(int argc, char** argv) {
     }
 
     // ── Load models via ModelRegistry → ILoadedModel → IOfflineTaskSession ──
-    // ALL models are registered in the slots map. Only the first ACE-Step
-    // model + all non-ACE models are loaded eagerly. Additional ACE-Step
-    // variants are registered but NOT loaded — the webapp loads them on
-    // demand via /v1/models/load (after unloading the current one to free
-    // VRAM). This keeps only one ACE model in VRAM at a time while letting
-    // the user switch from the webapp without restarting the server.
+    // ALL models are registered in the slots map. For each FAMILY, only the
+    // first model is loaded eagerly; subsequent models of the same family
+    // are registered but NOT loaded — the webapp loads them on demand via
+    // /v1/models/load (after unloading the current one to free VRAM).
+    // This applies to ACE-Step (turbo/base/scrag), qwen3_tts
+    // (CustomVoice/VoiceDesign), and any other multi-variant family.
+    // Single-model families (e.g. moss_sfx) are always eager.
     auto slots = std::make_shared<
         std::unordered_map<std::string, std::shared_ptr<ModelSlot>>>();
-    std::string first_ace_step_id;
-    for (const ConfigModel& m : cfg.models) {
-        if (m.family == "ace_step" && first_ace_step_id.empty())
-            first_ace_step_id = m.id;
-    }
+    // Track which families already have an eagerly-loaded representative.
+    std::set<std::string> eager_families;
 
     for (const ConfigModel& m : cfg.models) {
         audiocore::ModelLoadRequest req;
@@ -241,9 +240,8 @@ int main(int argc, char** argv) {
         req.options["backend"] = m.backend;
         req.options["device"] = std::to_string(cfg.device);
 
-        // Only load the first ACE-Step model + all non-ACE models eagerly.
-        // Other ACE models are registered for webapp load-on-demand.
-        const bool defer = (m.family == "ace_step" && m.id != first_ace_step_id);
+        // First model of each family is eager; the rest wait for webapp load.
+        const bool defer = !eager_families.insert(m.family).second;
 
         auto slot = std::make_shared<ModelSlot>();
         slot->load_req = req;

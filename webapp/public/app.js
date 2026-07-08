@@ -243,6 +243,7 @@
   });
 
   let vd_last_blob = null;
+  let vd_saved_name = null;   // auto-saved .voice name from last design
 
   $("#vd-btn").addEventListener("click", async () => {
     const st = $("#vd-status");
@@ -251,8 +252,12 @@
     const text = $("#vd-text").value.trim();
     if (!instruct) { status(st, "Describe a voice first.", "err"); return; }
     if (!text)     { status(st, "Type some sample text.", "err"); return; }
-    if (!ACTIVE_VD && !ACTIVE_TTS) {
-      status(st, "No TTS model loaded.", "err");
+    // Voice Design requires the dedicated VoiceDesign checkpoint — the
+    // CustomVoice talker cannot do voice_design mode.  Show a clear error
+    // instead of silently falling back to a model that will reject it.
+    if (!ACTIVE_VD) {
+      status(st, "Voice Design requires the qwen3-tts-voicedesign model. "
+        + "Load it from the \u{1F4E6} Models tab (or unload CustomVoice first to free VRAM).", "err");
       return;
     }
 
@@ -263,7 +268,7 @@
 
     try {
       const body = {
-        model: ACTIVE_VD || ACTIVE_TTS,
+        model: ACTIVE_VD,
         input: text,
         mode: "voice_design",
         instruct,
@@ -288,14 +293,54 @@
       const url = URL.createObjectURL(blob);
       set_player($("#vd-player"), url,
         "voice_design · " + (blob.size / 1024).toFixed(1) + " KB");
-      status(st, "Done. Save the result as a .voice to reuse in Synthesize.", "ok");
       $("#vd-save").disabled = false;
+
+      // Auto-save the designed voice as a .voice file so it's immediately
+      // available in the Synthesize tab without a manual save step.
+      status(st, "Done — auto-saving voice for Synthesize…", "ok");
+      try {
+        const form = new FormData();
+        form.append("file", blob, "designed_" + Date.now() + ".wav");
+        form.append("encode_voice", "true");
+        const sr = await fetch("/v1/clips/upload", { method: "POST", body: form });
+        const sj = await sr.json();
+        if (sj.ok && sj.saved && sj.saved.length) {
+          vd_saved_name = sj.saved[0];
+          $("#vd-to-syn").disabled = false;
+          status(st, "Voice saved as " + vd_saved_name + ". Click “Use in Synthesize” to speak with it.", "ok");
+          toast("Voice designed and saved!", "ok");
+        }
+      } catch (_) {
+        status(st, "Done. Click “Save as .voice” to use in Synthesize.", "ok");
+      }
     } catch (err) {
       status(st, "Error: " + err.message, "err");
     }
 
     btn.disabled = false;
     btn.textContent = "✨ Design voice";
+  });
+
+  // "Use in Synthesize" — jumps to the synthesize tab and auto-selects the
+  // most recently designed voice so the user can immediately type text and
+  // synthesize with it.
+  $("#vd-to-syn").addEventListener("click", async () => {
+    if (!vd_saved_name) return;
+    // Ensure the uploaded-voice dropdown is populated.
+    await load_voices();
+    activate_tab("synthesize");
+    $("#syn-voice-source").value = "uploaded";
+    $("#syn-voice-source").dispatchEvent(new Event("change"));
+    // Select the designed voice in the dropdown.
+    const sel = $("#syn-uploaded");
+    for (const o of sel.options) {
+      if (o.value.indexOf(vd_saved_name) >= 0 || o.textContent.indexOf(vd_saved_name) >= 0) {
+        sel.selectedIndex = o.index;
+        break;
+      }
+    }
+    load_syn_voice_meta();
+    $("#syn-text").focus();
   });
 
   $("#vd-save").addEventListener("click", async () => {
@@ -630,6 +675,13 @@
     $("#syn-uploaded").hidden = v !== "uploaded";
     $("#syn-ref-row").hidden  = v !== "reference";
     if (v === "uploaded") load_syn_voice_meta();
+    if (v === "designed") {
+      if (vd_saved_name) {
+        status($("#syn-status"), "Using last designed voice: " + vd_saved_name, "info");
+      } else {
+        status($("#syn-status"), "No designed voice yet — create one in the Voice Design tab.", "info");
+      }
+    }
   });
 
   // When a saved .voice is picked in Synthesize, load its saved shaping
@@ -691,9 +743,16 @@
     if (src === "preset") {
       body.speaker = $("#syn-preset").value;
       body.mode = "voice_clone";
-    } else if (src === "uploaded") {
-      const v = $("#syn-uploaded").value;
-      if (!v) { status(st, "No saved voice — generate one in Voice Design first.", "err"); return; }
+    } else if (src === "uploaded" || src === "designed") {
+      // "designed" auto-uses the most recent Voice Design output;
+      // "uploaded" lets the user pick from saved .voice files.
+      const v = (src === "designed") ? vd_saved_name : $("#syn-uploaded").value;
+      if (!v) {
+        status(st, src === "designed"
+          ? "No designed voice yet — create one in the Voice Design tab."
+          : "No saved voice — generate one in Voice Design first.", "err");
+        return;
+      }
       body.voice = v;
       body.mode = "voice_clone";
     } else if (src === "reference") {

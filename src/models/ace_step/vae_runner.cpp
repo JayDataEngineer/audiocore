@@ -1523,14 +1523,25 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
                                       (tile_sample % UPSAMPLE);
                     if (hann_idx < hann_w.size()) w = hann_w[hann_idx];
                 }
-                // Fade-out region (last OVERLAP_FRAMES of tile, skip last tile)
+                // Fade-out region (last OVERLAP_FRAMES of tile, skip last tile).
+                // The outgoing tile must be at FULL volume when entering the
+                // overlap (frames_from_end = OVERLAP-1 → hann ≈ 1.0) and SILENT
+                // when leaving (frames_from_end = 0 → hann = 0).  This
+                // COMPLEMENTS the fade-in (which goes 0 → 1) so the weights
+                // always sum to ≈1 in the overlap — a proper crossfade.
+                //
+                // BUGFIX: the old index was (OVERLAP-1 - frames_from_end),
+                // which is the same direction as fade-in.  Both tiles went to
+                // 0 at the overlap START (silence → click) and to 1.0 at the
+                // overlap END (double volume → pop).  This was the root cause
+                // of the periodic crackle heard every ~3.2 s in 10 s clips.
                 size_t tile_total_frames = tile_pcm.size() / 2 / UPSAMPLE;
                 size_t frames_from_end = (tile_total_frames >= 1)
                     ? (tile_total_frames - 1 - tile_pcm_frame) : 0;
                 if (frames_from_end < static_cast<size_t>(OVERLAP_FRAMES) &&
                     t1 < n_frames) {
-                    size_t hann_idx = (OVERLAP_FRAMES - 1 - frames_from_end) *
-                                      UPSAMPLE + (tile_sample % UPSAMPLE);
+                    size_t hann_idx = frames_from_end * UPSAMPLE +
+                                      (tile_sample % UPSAMPLE);
                     if (hann_idx < hann_w.size()) w *= hann_w[hann_idx];
                 }
                 (*pcm)[dst_off + i] += w * tile_pcm[i];

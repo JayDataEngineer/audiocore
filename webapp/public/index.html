@@ -105,6 +105,7 @@
         <div class="actions">
           <button class="btn btn-primary" id="vd-btn" type="button">✨ Design voice</button>
           <button class="btn btn-ghost"   id="vd-save" type="button" disabled>💾 Save as .voice</button>
+          <button class="btn btn-ghost"   id="vd-to-syn" type="button" disabled>🎙️ Use in Synthesize</button>
         </div>
         <div class="status" id="vd-status"></div>
       </div>
@@ -311,6 +312,7 @@
           <select id="syn-voice-source">
             <option value="preset">Preset speaker</option>
             <option value="uploaded">Uploaded / Saved .voice</option>
+            <option value="designed">🎤 Last designed voice</option>
             <option value="reference">Reference audio (clone)</option>
             <option value="none">None (plain TTS)</option>
           </select>
