@@ -120,6 +120,7 @@ Runner::~Runner() {
     delete[] small_to_mtp_w_;
     delete[] small_to_mtp_b_;
     if (ctx_)   llama_free(ctx_);
+    if (ctx_secondary_) llama_free(ctx_secondary_);
     if (model_) llama_model_free(model_);
     if (tokenizer_model_) llama_model_free(tokenizer_model_);
 }
@@ -1294,6 +1295,84 @@ bool Runner::clear_kv_cache(std::string* error) {
     }
     // Remove all tokens of all sequences (seq_id < 0 = any sequence,
     // p0 = 0, p1 = -1 = infinity) to effectively clear the KV cache.
+    return llama_memory_seq_rm(mem, -1, 0, -1);
+}
+
+// ── Secondary context (for CFG) ────────────────────────────────────────────
+//
+// ACE-Step's LM uses classifier-free guidance by default (lm_cfg_scale=2.0).
+// Each code step requires BOTH a conditional and unconditional forward pass.
+// The secondary context shares the model weights (no extra weight memory)
+// but has its own independent KV cache.
+
+bool Runner::init_secondary_context(std::string* error) {
+    if (ctx_secondary_) return true;  // already initialized
+    if (!model_) {
+        if (error) *error = "init_secondary_context: no model loaded";
+        return false;
+    }
+    // Clone the context params from the primary context.
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx           = llama_n_ctx(ctx_);
+    cp.n_batch         = llama_n_batch(ctx_);
+    // Match threading of primary (single-thread is fine for batch=1 decode).
+    cp.n_threads       = 1;
+    cp.n_threads_batch = 1;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.embeddings      = true;
+    cp.no_perf         = true;
+
+    ctx_secondary_ = llama_init_from_model(model_, cp);
+    if (!ctx_secondary_) {
+        if (error) *error = "init_secondary_context: llama_init_from_model failed";
+        return false;
+    }
+    return true;
+}
+
+bool Runner::forward_tokens_secondary(const int32_t* tokens, int32_t n_tokens,
+                                      int32_t n_pos, float* logits,
+                                      std::string* error) {
+    if (!ctx_secondary_) {
+        if (error) *error = "forward_tokens_secondary: no secondary context "
+                            "(call init_secondary_context first)";
+        return false;
+    }
+    llama_batch b = make_batch(n_tokens, n_pos, /*is_embd=*/false,
+                               nullptr, reinterpret_cast<const llama_token*>(tokens),
+                               /*last_only=*/false, n_pos_per_embd_);
+    const int32_t n_vocab = vocab_size_;
+    bool ok = (llama_decode(ctx_secondary_, b) == 0);
+    if (!ok) {
+        if (error) *error = "llama_decode (secondary) failed";
+    } else if (logits) {
+        for (int32_t i = 0; i < n_tokens && ok; i++) {
+            const float* row = llama_get_logits_ith(ctx_secondary_, i);
+            if (!row) {
+                if (error) *error = "llama_get_logits_ith (secondary) failed";
+                ok = false;
+                break;
+            }
+            std::memcpy(logits + static_cast<size_t>(i) * n_vocab, row,
+                        static_cast<size_t>(n_vocab) * sizeof(float));
+        }
+    }
+    b.token = nullptr;
+    b.embd  = nullptr;
+    llama_batch_free(b);
+    return ok;
+}
+
+bool Runner::clear_secondary_kv_cache(std::string* error) {
+    if (!ctx_secondary_) {
+        if (error) *error = "clear_secondary_kv_cache: no secondary context";
+        return false;
+    }
+    llama_memory_t mem = llama_get_memory(ctx_secondary_);
+    if (!mem) {
+        if (error) *error = "clear_secondary_kv_cache: llama_get_memory null";
+        return false;
+    }
     return llama_memory_seq_rm(mem, -1, 0, -1);
 }
 

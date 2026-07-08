@@ -266,6 +266,21 @@ public:
     // Returns false on failure.
     bool clear_kv_cache(std::string* error = nullptr);
 
+    // ── Secondary context (for CFG / classifier-free guidance) ────────────
+    // ACE-Step's LM uses classifier-free guidance (cfg_scale=2.0 by default)
+    // which requires running BOTH a conditional and an unconditional forward
+    // pass per step. The secondary context shares the model weights (no
+    // extra GPU memory for weights) but has its own KV cache.
+    // Returns false if the secondary context could not be created.
+    bool init_secondary_context(std::string* error = nullptr);
+    bool has_secondary_context() const { return ctx_secondary_ != nullptr; }
+
+    // Forward on the secondary context. Same contract as forward_tokens.
+    bool forward_tokens_secondary(const int32_t* tokens, int32_t n_tokens,
+                                  int32_t n_pos, float* logits,
+                                  std::string* error = nullptr);
+    bool clear_secondary_kv_cache(std::string* error = nullptr);
+
     llama_model*   raw_model()    const { return model_; }
     llama_context* raw_context()  const { return ctx_;   }
 
@@ -277,6 +292,7 @@ private:
 
     llama_model*   model_ = nullptr;
     llama_context* ctx_   = nullptr;
+    llama_context* ctx_secondary_ = nullptr;  // for CFG (shares model_)
     int32_t        hidden_size_ = 0;
     int32_t        vocab_size_  = 0;
     int32_t        n_codebooks_ = 32;       // Qwen3-TTS default

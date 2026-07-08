@@ -55,9 +55,27 @@ struct MusicRequest {
     float       duration     = 30.0f; // seconds
     int32_t     seed         = 0;
     float       guidance_scale = 1.0f;
+    // ── Musical metadata (for CoT YAML injection in Phase 2) ───────────────
+    // These fields populate the deterministic CoT YAML that the LM expects
+    // between <think> and </think> before generating audio codes. When left
+    // at their defaults (0/empty), Phase 1 reasoning will infer them.
+    // When ALL are provided by the user, Phase 1 can be skipped entirely.
+    // Matches ref-acestep/src/prompt.h:AcePrompt.
+    int32_t     bpm             = 0;    // 0 = unknown (LM infers in Phase 1)
+    std::string keyscale;                // e.g. "C major", empty = unknown
+    std::string timesignature;           // e.g. "4/4" or "4", empty = unknown
+    std::string vocal_language  = "en";  // ISO 639-1 code, "unknown" = none
     int32_t     n_diffusion_steps = 0;  // 0 → variant default (turbo=8, sft=50)
     float       temperature  = 0.85f;  // LM sampling temp (ref default=0.85, 0=argmax)
     float       top_p        = 0.9f;   // LM nucleus sampling threshold (ref default=0.9)
+    // LM-level classifier-free guidance scale. SEPARATE from the DiT-level
+    // guidance_scale above. The reference default is 2.0 (ref-acestep/
+    // request.cpp:31). CFG requires running BOTH cond and uncond LM forward
+    // passes per code step. When > 1.0, the secondary LM context is used
+    // for the uncond path. When 1.0, CFG is disabled (cond logits used
+    // directly). Without CFG the LM collapses to emitting the same dominant
+    // code ~96% of the time regardless of caption (verified).
+    float       lm_cfg_scale = 2.0f;
     // ── Repaint / completion conditioning ─────────────────────────────────
     std::vector<float> input_audio;    // stereo PCM interleaved at 48kHz
     float              mask_start = 0.0f;  // normalized position [0,1)

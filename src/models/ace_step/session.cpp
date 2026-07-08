@@ -21,6 +21,7 @@
 #include <cstring>
 #include <chrono>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 #include <cstdio>   // stderr diagnostic
@@ -369,15 +370,6 @@ static std::vector<int32_t> build_lm_prompt_tokens(const qwen3::Runner& lm,
                                                    std::string* error) {
     std::vector<int32_t> ids;
 
-    int dur_int = (audio_duration > 0.0f) ? static_cast<int>(audio_duration) : 30;
-
-    // Build CoT YAML (matches ref build_cot_yaml — prompt.h:241-262)
-    std::string cot;
-    if (!caption.empty()) {
-        cot += "caption: |\n  " + caption + "\n";
-    }
-    cot += "duration: " + std::to_string(dur_int) + "\n";
-
     // Helper: tokenize a text segment and append to ids (no special tokens).
     auto append_text = [&](const std::string& text) -> bool {
         std::vector<int32_t> toks;
@@ -404,12 +396,73 @@ static std::vector<int32_t> build_lm_prompt_tokens(const qwen3::Runner& lm,
     if (!append_text("\n"))
         return {};
 
-    // Assistant turn with CoT injected (codes_phase starts immediately)
+    // Assistant turn — OPEN (no <think> block injected).
+    // The model generates its OWN <think> reasoning block (genre analysis,
+    // BPM, key, etc.), then </think>, then audio codes. This matches
+    // ref-acestep/src/prompt.h:171-187 (build_lm_prompt — Phase 1 prompt).
+    // Previously we injected a hardcoded CoT and immediately entered
+    // codes_phase, which skipped the model's reasoning and produced
+    // generic ambient output regardless of caption.
+    ids.push_back(TOKEN_IM_START);
+    if (!append_text("assistant\n"))
+        return {};
+
+    return ids;
+}
+
+// LM UNCONDITIONAL prompt — for classifier-free guidance (CFG).
+// Matches ref-acestep/src/prompt.h:301-327 (build_lm_prompt_uncond_with_cot).
+//
+//   <|im_start|>system\n# Instruction\n{LM_INSTRUCTION}\n\n<|im_end|>\n
+//   <|im_start|>user\n{negative_prompt or ""}<|im_end|>\n
+//   <|im_start|>assistant\n<think>\n\n</think>\n\n
+//
+// Differences from cond prompt:
+//   • User turn has no "# Caption\n" / "# Lyric\n" headers — just the
+//     negative_prompt (or empty). Matches training CFG dropout.
+//   • Assistant turn has EMPTY reasoning: <think>\n\n</think>. The model
+//     has "decided" there's nothing to reason about.
+//   • Ends with </think>\n\n — ready to emit codes immediately (no Phase A
+//     reasoning loop needed for uncond).
+static std::vector<int32_t> build_lm_uncond_prompt_tokens(
+        const qwen3::Runner& lm,
+        const std::string& negative_prompt,
+        std::string* error) {
+    std::vector<int32_t> ids;
+
+    auto append_text = [&](const std::string& text) -> bool {
+        std::vector<int32_t> toks;
+        if (!lm.tokenize(text, /*add_special=*/false, /*parse_special=*/false,
+                         &toks, nullptr, error))
+            return false;
+        ids.insert(ids.end(), toks.begin(), toks.end());
+        return true;
+    };
+
+    // System turn — same instruction as cond.
+    ids.push_back(TOKEN_IM_START);
+    if (!append_text("system\n# Instruction\n" + std::string(LM_INSTRUCTION) + "\n\n"))
+        return {};
+    ids.push_back(TOKEN_IM_END);
+    if (!append_text("\n"))
+        return {};
+
+    // User turn — bare negative prompt (no Caption/Lyric wrappers).
+    // Empty by default (pure unconditional).
+    ids.push_back(TOKEN_IM_START);
+    if (!append_text("user\n" + negative_prompt))
+        return {};
+    ids.push_back(TOKEN_IM_END);
+    if (!append_text("\n"))
+        return {};
+
+    // Assistant turn — EMPTY CoT: <think>\n\n</think>\n\n
+    // The model has already "finished reasoning" and is ready for codes.
     ids.push_back(TOKEN_IM_START);
     if (!append_text("assistant\n"))
         return {};
     ids.push_back(TOKEN_THINK);
-    if (!append_text("\n" + cot))
+    if (!append_text("\n\n"))
         return {};
     ids.push_back(TOKEN_THINK_END);
     if (!append_text("\n\n"))
@@ -423,6 +476,218 @@ static std::vector<int32_t> build_lm_prompt_tokens(const qwen3::Runner& lm,
 static std::string format_lyrics(const std::string& lyrics,
                                  const std::string& lang = "en") {
     return "# Languages\n" + lang + "\n\n# Lyric\n" + lyrics + "<|endoftext|>";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Two-Phase LM: metadata struct, CoT parser, YAML builder, Phase 2 prompt
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Ported from ref-acestep/src/prompt.h. The reference splits LM generation
+// into Phase 1 (free reasoning → parse metadata) and Phase 2 (deterministic
+// CoT YAML injection → code generation). The model was trained where the
+// code-generation prompt ALWAYS contains clean YAML between <think> and
+// </think>. Generating codes after free-form (non-YAML) reasoning produces
+// out-of-distribution input → code collapse → generic ambient audio.
+
+// Metadata struct — mirrors ref-acestep/src/prompt.h:AcePrompt
+struct AceMetadata {
+    std::string caption;
+    std::string lyrics;
+    float       duration     = 0.0f;
+    int         bpm          = 0;
+    std::string keyscale;
+    std::string timesignature;
+    std::string vocal_language;
+};
+
+// Parse CoT reasoning text → metadata fields.
+// Ported from ref-acestep/src/prompt.h:parse_cot_and_lyrics.
+static bool parse_cot_text(const std::string& text, AceMetadata* out) {
+    size_t ts = text.find("<think>");
+    size_t te = text.find("</think>");
+
+    std::string cot;
+    std::string lyrics_after;
+
+    if (ts != std::string::npos && te != std::string::npos) {
+        cot          = text.substr(ts + 7, te - ts - 7);
+        lyrics_after = text.substr(te + 8);
+    } else if (te != std::string::npos) {
+        cot          = text.substr(0, te);
+        lyrics_after = text.substr(te + 8);
+    } else {
+        cot = text;
+    }
+
+    auto get_field = [&](const std::string& key) -> std::string {
+        std::string needle = key + ":";
+        size_t      p      = cot.find(needle);
+        if (p == std::string::npos) return "";
+        p += needle.size();
+        while (p < cot.size() && (cot[p] == ' ' || cot[p] == '\'')) p++;
+        size_t end = cot.find('\n', p);
+        if (end == std::string::npos) end = cot.size();
+        std::string val = cot.substr(p, end - p);
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\'' || val.back() == '\r'))
+            val.pop_back();
+        return val;
+    };
+
+    std::string bpm_s = get_field("bpm");
+    if (!bpm_s.empty()) out->bpm = atoi(bpm_s.c_str());
+
+    std::string dur_s = get_field("duration");
+    if (!dur_s.empty()) out->duration = (float)atof(dur_s.c_str());
+
+    out->keyscale       = get_field("keyscale");
+    out->timesignature  = get_field("timesignature");
+    out->vocal_language = get_field("language");
+
+    // Caption: may span multiple lines (YAML word-wrap).
+    {
+        std::string cap = get_field("caption");
+        if (!cap.empty()) {
+            size_t cp = cot.find("caption:");
+            if (cp != std::string::npos) {
+                cp += 8;
+                size_t end = cot.find("\nduration:", cp);
+                if (end == std::string::npos) end = cot.find("\nkeyscale:", cp);
+                if (end == std::string::npos) end = cot.size();
+                std::string full_cap = cot.substr(cp, end - cp);
+                std::string cleaned;
+                bool in_space = true;
+                for (char ch : full_cap) {
+                    if (ch == '\n' || ch == '\r') ch = ' ';
+                    if (ch == ' ') {
+                        if (!in_space) cleaned += ' ';
+                        in_space = true;
+                    } else {
+                        cleaned += ch;
+                        in_space = false;
+                    }
+                }
+                while (!cleaned.empty() && cleaned.back() == ' ') cleaned.pop_back();
+                while (!cleaned.empty() && cleaned.front() == ' ') cleaned.erase(cleaned.begin());
+                if (!cleaned.empty()) out->caption = cleaned;
+            }
+        }
+    }
+
+    // Lyrics after </think>
+    if (!lyrics_after.empty()) {
+        size_t s = lyrics_after.find_first_not_of(" \t\n\r");
+        if (s != std::string::npos)
+            lyrics_after = lyrics_after.substr(s);
+        size_t lp = lyrics_after.find("# Lyric\n");
+        if (lp != std::string::npos && lp < 64)
+            lyrics_after = lyrics_after.substr(lp + 8);
+        while (!lyrics_after.empty() &&
+               (lyrics_after.back() == ' ' || lyrics_after.back() == '\n' || lyrics_after.back() == '\r'))
+            lyrics_after.pop_back();
+        if (!lyrics_after.empty())
+            out->lyrics = lyrics_after;
+    }
+
+    return (out->bpm > 0 || out->duration > 0);
+}
+
+// Build deterministic CoT YAML from metadata.
+// Ported from ref-acestep/src/prompt.h:build_cot_yaml.
+// Fields are alphabetically sorted (matching Python yaml.dump sort_keys=True).
+static std::string build_cot_yaml(const AceMetadata& m) {
+    auto yaml_wrap = [](const std::string& key, const std::string& val) -> std::string {
+        std::string result = key + ":";
+        int         col    = (int)(key.size() + 1);
+        size_t      i      = 0;
+        while (i < val.size()) {
+            size_t end = val.find(' ', i);
+            if (end == std::string::npos) end = val.size();
+            std::string word = val.substr(i, end - i);
+            if (col > 80) {
+                result += "\n  ";
+                col = 2;
+            } else {
+                result += " ";
+                col += 1;
+            }
+            result += word;
+            col += (int)word.size();
+            i = (end < val.size()) ? end + 1 : val.size();
+        }
+        result += "\n";
+        return result;
+    };
+
+    std::string yaml;
+    if (m.bpm > 0)
+        yaml += "bpm: " + std::to_string(m.bpm) + "\n";
+    if (!m.caption.empty())
+        yaml += yaml_wrap("caption", m.caption);
+    if (m.duration > 0)
+        yaml += "duration: " + std::to_string((int)m.duration) + "\n";
+    if (!m.keyscale.empty())
+        yaml += "keyscale: " + m.keyscale + "\n";
+    if (!m.vocal_language.empty())
+        yaml += "language: " + m.vocal_language + "\n";
+    if (!m.timesignature.empty())
+        yaml += "timesignature: " + m.timesignature + "\n";
+    return yaml;
+}
+
+// Normalize timesignature: "4/4" → "4", "6/8" → "6".
+static std::string normalize_timesig(const std::string& ts) {
+    size_t slash = ts.find('/');
+    if (slash != std::string::npos) return ts.substr(0, slash);
+    return ts;
+}
+
+// Build Phase 2 prompt: ...assistant\n<think>\n{cot_yaml}</think>\n\n
+// Ported from ref-acestep/src/prompt.h:build_lm_prompt_with_cot.
+static std::vector<int32_t> build_phase2_prompt_tokens(
+    const qwen3::Runner& lm,
+    const AceMetadata&   m,
+    const std::string&   cot_yaml,
+    std::string*         error) {
+
+    std::vector<int32_t> ids;
+
+    auto append_text = [&](const std::string& text) -> bool {
+        std::vector<int32_t> toks;
+        if (!lm.tokenize(text, /*add_special=*/false, /*parse_special=*/false,
+                         &toks, nullptr, error))
+            return false;
+        ids.insert(ids.end(), toks.begin(), toks.end());
+        return true;
+    };
+
+    // System turn
+    ids.push_back(TOKEN_IM_START);
+    if (!append_text("system\n# Instruction\n" + std::string(LM_INSTRUCTION) + "\n\n"))
+        return {};
+    ids.push_back(TOKEN_IM_END);
+    if (!append_text("\n"))
+        return {};
+
+    // User turn
+    ids.push_back(TOKEN_IM_START);
+    if (!append_text("user\n# Caption\n" + m.caption + "\n\n# Lyric\n" + m.lyrics + "\n"))
+        return {};
+    ids.push_back(TOKEN_IM_END);
+    if (!append_text("\n"))
+        return {};
+
+    // Assistant turn with injected CoT YAML
+    ids.push_back(TOKEN_IM_START);
+    if (!append_text("assistant\n"))
+        return {};
+    ids.push_back(TOKEN_THINK);                        // raw ID: 151667
+    if (!append_text("\n" + cot_yaml))
+        return {};
+    ids.push_back(TOKEN_THINK_END);                     // raw ID: 151668
+    if (!append_text("\n\n"))
+        return {};
+
+    return ids;
 }
 
 bool AceStepSession::run_lm(const MusicRequest& req,
@@ -563,63 +828,81 @@ bool AceStepSession::run_lm(const MusicRequest& req,
         fprintf(stderr, "[ace_step] run_lm: null-text TE done\n");
     }
 
-    // (5) LM prefill with chat-template prompt.
-    //     CRITICAL: we KEEP the prefill logits — the last row predicts the
-    //     first audio code. The reference (pipeline-lm.cpp:66 + 116-117)
-    //     samples the first token directly from prefill logits. Our old code
-    //     threw them away (nullptr) and re-fed the last prompt token, which
-    //     shifted generation by one position and corrupted the KV state.
-    fprintf(stderr, "[ace_step] run_lm: LM forward_tokens prefill (n_tok=%zu)...\n", lm_prompt.size());
-    const int32_t prompt_len = static_cast<int32_t>(lm_prompt.size());
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  TWO-PHASE LM: Phase 1 (reasoning) → parse → Phase 2 (codes)
+    // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // The reference (ref-acestep/src/pipeline-lm.cpp) splits LM generation:
+    //   Phase 1: free reasoning → parse metadata (bpm, key, duration, etc.)
+    //   Phase 2: deterministic CoT YAML injection → code generation
+    //
+    // The model was trained where the code-generation prompt ALWAYS contains
+    // clean YAML between <think> and </think>. Phase 2 rebuilds this YAML
+    // deterministically from parsed metadata, ensuring in-distribution input.
+    // Generating codes after free-form (non-YAML) reasoning produces OOD input
+    // → code collapse → generic ambient audio regardless of caption.
+    //
+    // Optimization: if the user provides ALL metadata fields, Phase 1 is
+    // skipped entirely — we go straight to Phase 2 with the user's values.
+
     const int32_t vs = lm_->vocab_size();
-    std::vector<float> prefill_logits(static_cast<size_t>(prompt_len) * vs, 0.0f);
-    if (!lm_->forward_tokens(lm_prompt.data(), prompt_len, 0,
-                             prefill_logits.data(), error))
-        return false;
-    fprintf(stderr, "[ace_step] run_lm: LM prefill done (vs=%d)\n", vs);
 
-    // (6) Decode loop: generate codes at 5 Hz.
-    //     Audio code tokens are at IDs [AUDIO_CODE_BASE, AUDIO_CODE_BASE +
-    //     FSQ_CODE_COUNT) = [151669, 215669). We mask ALL other logits to
-    //     -inf (except TOKEN_IM_END = 151645 for early stop), matching
-    //     reference pipeline-lm.cpp:373-382.
-    const int32_t n_codes = std::max(1, static_cast<int32_t>(req.duration * 5.0f + 0.5f));
-    music_codes->clear();
-    music_codes->reserve(static_cast<size_t>(n_codes));
+    // ── Build base metadata from user request ──
+    AceMetadata meta;
+    meta.caption        = req.caption;
+    meta.lyrics         = req.lyrics;
+    meta.duration       = req.duration;
+    meta.bpm            = req.bpm;
+    meta.keyscale       = req.keyscale;
+    meta.timesignature  = req.timesignature.empty() ? std::string()
+                                                    : normalize_timesig(req.timesignature);
+    meta.vocal_language = req.vocal_language;
 
-    fprintf(stderr, "[ace_step] run_lm: decode loop (n_codes=%d, AUDIO_CODE_BASE=%d, vs=%d)\n",
-            n_codes, AUDIO_CODE_BASE, vs);
+    // Can we skip Phase 1? (all metadata provided by user)
+    const bool skip_phase1 = (meta.bpm > 0 &&
+                              !meta.keyscale.empty() &&
+                              !meta.timesignature.empty() &&
+                              !meta.vocal_language.empty() &&
+                              meta.duration > 0 &&
+                              !meta.caption.empty());
 
-    // RNG for stochastic sampling (seeded for reproducibility)
+    // ── Constants & helpers ──
     PhiloxRng rng{req.seed != 0 ? req.seed : 42};
 
-    // Helper: mask logits so only [AUDIO_CODE_BASE, AUDIO_CODE_BASE+FSQ_CODE_COUNT)
-    // and TOKEN_IM_END have finite values. Everything else → -1e9f.
-    // This matches reference pipeline-lm.cpp:373-382.
+    Params sp_reason;
+    sp_reason.temperature = req.temperature;
+    sp_reason.top_p       = req.top_p;
+    sp_reason.do_sample   = req.temperature > 0.0f;
+    Params sp_codes = sp_reason;
+
     auto mask_to_codes = [](float* logits, int32_t vocab_size) {
-        // Mask everything below AUDIO_CODE_BASE except TOKEN_IM_END
         for (int32_t v = 0; v < AUDIO_CODE_BASE && v < vocab_size; v++) {
             if (v != TOKEN_IM_END)
                 logits[v] = -1e9f;
         }
-        // Mask everything above the code range
         for (int32_t v = AUDIO_CODE_BASE + FSQ_CODE_COUNT; v < vocab_size; v++) {
             logits[v] = -1e9f;
         }
     };
 
-    // Sample one code from masked logits. Returns the FSQ code index [0, 64000)
-    // or -1 if TOKEN_IM_END was chosen (stop).
+    auto mask_codes_out = [](float* logits, int32_t vocab_size) {
+        for (int32_t v = AUDIO_CODE_BASE; v < AUDIO_CODE_BASE + FSQ_CODE_COUNT && v < vocab_size; v++) {
+            logits[v] = -1e9f;
+        }
+    };
+
+    auto sample_free = [&](float* logits, int32_t vocab_size,
+                           const Params& sp, PhiloxRng* prng) -> int32_t {
+        return sample_token(logits, vocab_size, sp, nullptr, 0, prng);
+    };
+
     auto sample_code = [&](float* logits, int32_t vocab_size,
                            const Params& sp, PhiloxRng* prng) -> int32_t {
-        // Build compact logits: [EOS, code_0, code_1, ..., code_63999]
-        // Matching reference pipeline-lm.cpp:490-500 (compact_logits).
         const int32_t compact_V = FSQ_CODE_COUNT + 1;
         std::vector<float> compact(compact_V);
         compact[0] = logits[TOKEN_IM_END];
         for (int32_t c = 0; c < FSQ_CODE_COUNT; c++)
             compact[c + 1] = logits[AUDIO_CODE_BASE + c];
-
         const int32_t compact_tok = sample_token(compact.data(), compact_V, sp,
                                                   nullptr, 0, prng);
         if (compact_tok == 0)
@@ -627,58 +910,317 @@ bool AceStepSession::run_lm(const MusicRequest& req,
         return compact_tok - 1;  // FSQ code index
     };
 
-    Params sp;
-    sp.temperature = req.temperature;
-    sp.top_p       = req.top_p;
-    sp.do_sample   = req.temperature > 0.0f;
+    // ════════════════════════════════════════════════════════════════════════
+    //  Phase 1: Free Reasoning (infer missing metadata)
+    // ════════════════════════════════════════════════════════════════════════
+    // The model generates <think>, reasoning text (genre analysis, BPM, key,
+    // etc.), then </think>. We collect the tokens, detokenize, and parse the
+    // YAML-like metadata fields. User-provided values take priority — Phase 1
+    // only gap-fills fields the user left empty.
+    if (!skip_phase1) {
+        fprintf(stderr, "[ace_step] run_lm: Phase 1 — free reasoning (inferring "
+                        "missing metadata)...\n");
+        const int32_t p1_len = static_cast<int32_t>(lm_prompt.size());
+        std::vector<float> p1_logits(static_cast<size_t>(p1_len) * vs, 0.0f);
+        if (!lm_->forward_tokens(lm_prompt.data(), p1_len, 0,
+                                 p1_logits.data(), error))
+            return false;
+        fprintf(stderr, "[ace_step] run_lm: Phase 1 prefill done (%d tokens)\n", p1_len);
 
-    // First code: sample from the LAST ROW of prefill logits.
-    // prefill_logits is (prompt_len, vs) row-major.
+        // Free reasoning until </think> or safety limit
+        std::vector<int32_t> reasoning_tokens;
+        const int32_t max_reasoning_tokens = 2048;
+
+        // First token from prefill logits (last row)
+        float* last_row = &p1_logits[static_cast<size_t>(p1_len - 1) * vs];
+        mask_codes_out(last_row, vs);
+        int32_t prev = sample_free(last_row, vs, sp_reason, &rng);
+        reasoning_tokens.push_back(prev);
+        fprintf(stderr, "[ace_step] run_lm: reasoning tok[0]=%d", prev);
+        if (prev == TOKEN_THINK)     fprintf(stderr, " (<think>)");
+        if (prev == TOKEN_THINK_END) fprintf(stderr, " (</think>)");
+        fprintf(stderr, "\n");
+
+        bool got_think_end = (prev == TOKEN_THINK_END || prev == TOKEN_IM_END);
+        if (prev == TOKEN_IM_END) {
+            fprintf(stderr, "[ace_step] run_lm: WARNING — LM emitted EOS before "
+                            "reasoning, using default metadata\n");
+            got_think_end = true;
+        }
+
+        int32_t n_pos = p1_len;
+        while (!got_think_end) {
+            if (n_pos - p1_len >= max_reasoning_tokens) {
+                fprintf(stderr, "[ace_step] run_lm: reasoning exceeded %d tokens, "
+                                "stopping\n", max_reasoning_tokens);
+                break;
+            }
+
+            std::vector<float> logits(static_cast<size_t>(vs));
+            if (!lm_->forward_tokens(&prev, 1, n_pos, logits.data(), error))
+                return false;
+            n_pos++;
+
+            mask_codes_out(logits.data(), vs);
+            int32_t tok = sample_free(logits.data(), vs, sp_reason, &rng);
+            reasoning_tokens.push_back(tok);
+
+            if (tok == TOKEN_THINK_END || tok == TOKEN_IM_END) {
+                got_think_end = true;
+                fprintf(stderr, "[ace_step] run_lm: </think> at pos %d (reasoning "
+                                "took %zu tokens)\n", n_pos, reasoning_tokens.size());
+            }
+            prev = tok;
+        }
+
+        // Detokenize reasoning → text
+        std::string reasoning_text;
+        for (auto tok : reasoning_tokens) {
+            std::string piece;
+            if (lm_->token_to_piece(tok, &piece))
+                reasoning_text += piece;
+        }
+        fprintf(stderr, "[ace_step] run_lm: Phase 1 reasoning text:\n%s\n",
+                reasoning_text.c_str());
+
+        // Parse reasoning → metadata, gap-fill (user values take priority)
+        AceMetadata parsed;
+        parse_cot_text(reasoning_text, &parsed);
+        if (meta.bpm == 0 && parsed.bpm > 0)
+            meta.bpm = parsed.bpm;
+        if (meta.duration <= 0 && parsed.duration > 0)
+            meta.duration = parsed.duration;
+        if (meta.keyscale.empty() && !parsed.keyscale.empty())
+            meta.keyscale = parsed.keyscale;
+        if (meta.timesignature.empty() && !parsed.timesignature.empty())
+            meta.timesignature = normalize_timesig(parsed.timesignature);
+        if ((meta.vocal_language.empty() || meta.vocal_language == "unknown") &&
+            !parsed.vocal_language.empty())
+            meta.vocal_language = parsed.vocal_language;
+        // Use parsed lyrics if user provided none
+        if (meta.lyrics.empty() && !parsed.lyrics.empty())
+            meta.lyrics = parsed.lyrics;
+
+        fprintf(stderr, "[ace_step] run_lm: Phase 1 parsed: bpm=%d duration=%.0f "
+                        "keyscale='%s' timesig='%s' lang='%s'\n",
+                parsed.bpm, parsed.duration, parsed.keyscale.c_str(),
+                parsed.timesignature.c_str(), parsed.vocal_language.c_str());
+    } else {
+        fprintf(stderr, "[ace_step] run_lm: skipping Phase 1 (all metadata provided)\n");
+    }
+
+    // Apply defaults for any remaining missing fields
+    if (meta.duration <= 0) meta.duration = 120.0f;
+    if (meta.duration > 600) meta.duration = 600.0f;
+    if (meta.vocal_language.empty()) meta.vocal_language = "unknown";
+
+    fprintf(stderr, "[ace_step] run_lm: merged metadata: bpm=%d duration=%.0f "
+                    "keyscale='%s' timesig='%s' lang='%s'\n",
+            meta.bpm, meta.duration, meta.keyscale.c_str(),
+            meta.timesignature.c_str(), meta.vocal_language.c_str());
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Phase 2: Code Generation with Injected CoT
+    // ════════════════════════════════════════════════════════════════════════
+    // Build deterministic CoT YAML from merged metadata. This YAML is injected
+    // between <think> and </think> in the Phase 2 prompt, exactly matching the
+    // format the model was trained on. The model starts generating codes
+    // immediately after </think>\n\n — codes_phase = true from the first token.
+    std::string cot_yaml = build_cot_yaml(meta);
+    fprintf(stderr, "[ace_step] run_lm: Phase 2 CoT YAML:\n%s", cot_yaml.c_str());
+
+    std::vector<int32_t> phase2_prompt = build_phase2_prompt_tokens(
+        *lm_, meta, cot_yaml, error);
+    if (phase2_prompt.empty()) {
+        if (error && error->empty())
+            *error = "ACE-Step: failed to build Phase 2 prompt";
+        return false;
+    }
+
+    // RESET KV cache — Phase 2 is a completely new forward pass.
+    // The model never sees its own free-form reasoning during code generation;
+    // it only sees the clean, deterministic YAML.
+    lm_->clear_kv_cache();
+
+    // CFG: prepare unconditional Phase 2 prompt on secondary context.
+    // The uncond prompt has empty CoT (<think>\n\n</think>) and bare user
+    // content (no Caption/Lyric wrappers) — matches training CFG dropout.
+    const bool use_cfg = req.lm_cfg_scale > 1.0f + 1e-6f;
+    int32_t uncond_p2_len = 0;
+    std::vector<float> uncond_p2_logits;
+    if (use_cfg) {
+        if (!lm_->has_secondary_context()) {
+            if (!lm_->init_secondary_context(error)) return false;
+            fprintf(stderr, "[ace_step] run_lm: initialized secondary LM context for CFG\n");
+        }
+        lm_->clear_secondary_kv_cache();
+        std::vector<int32_t> uncond_prompt = build_lm_uncond_prompt_tokens(
+            *lm_, /*negative_prompt=*/"", error);
+        if (uncond_prompt.empty()) {
+            if (error && error->empty())
+                *error = "ACE-Step: failed to build uncond LM prompt";
+            return false;
+        }
+        uncond_p2_len = static_cast<int32_t>(uncond_prompt.size());
+        uncond_p2_logits.assign(
+            static_cast<size_t>(uncond_p2_len) * vs, 0.0f);
+        if (!lm_->forward_tokens_secondary(uncond_prompt.data(),
+                                           uncond_p2_len, 0,
+                                           uncond_p2_logits.data(), error))
+            return false;
+        fprintf(stderr, "[ace_step] run_lm: uncond Phase 2 prefill done "
+                        "(len=%d, cfg_scale=%.2f)\n", uncond_p2_len, req.lm_cfg_scale);
+    }
+
+    // Prefill Phase 2 on cond context
+    const int32_t p2_len = static_cast<int32_t>(phase2_prompt.size());
+    std::vector<float> p2_logits(static_cast<size_t>(p2_len) * vs, 0.0f);
+    if (!lm_->forward_tokens(phase2_prompt.data(), p2_len, 0,
+                             p2_logits.data(), error))
+        return false;
+    fprintf(stderr, "[ace_step] run_lm: Phase 2 prefill done (%d tokens)\n", p2_len);
+
+    // ── Sample codes (codes_phase = true from the very first token) ──
+    const int32_t n_codes = std::max(1, static_cast<int32_t>(meta.duration * 5.0f + 0.5f));
+    music_codes->clear();
+    music_codes->reserve(static_cast<size_t>(n_codes));
+    fprintf(stderr, "[ace_step] run_lm: Phase 2 code generation (n_codes=%d, "
+                    "CFG=%s)\n", n_codes, use_cfg ? "ON" : "OFF");
+
+    int32_t prev_token;
+    int32_t n_pos = p2_len;
+    int32_t uncond_n_pos = uncond_p2_len;
+
+    // First code from Phase 2 prefill logits (last row)
     {
-        float* last_row = &prefill_logits[static_cast<size_t>(prompt_len - 1) * vs];
+        float* last_row = &p2_logits[static_cast<size_t>(p2_len - 1) * vs];
+
+        // CFG combine for code[0]
+        if (use_cfg) {
+            const float* uncond_last = &uncond_p2_logits[
+                static_cast<size_t>(uncond_p2_len - 1) * vs];
+            const float scale = req.lm_cfg_scale;
+            for (int32_t v = 0; v < vs; v++)
+                last_row[v] = uncond_last[v] + scale * (last_row[v] - uncond_last[v]);
+        }
+
+        // Diagnostic: top-5 codes for first token
+        {
+            std::vector<std::pair<float, int32_t>> code_logits;
+            code_logits.reserve(FSQ_CODE_COUNT);
+            for (int32_t c = 0; c < FSQ_CODE_COUNT; c++)
+                code_logits.push_back({last_row[AUDIO_CODE_BASE + c], c});
+            std::partial_sort(code_logits.begin(), code_logits.begin() + 5,
+                              code_logits.end(), [](auto& a, auto& b) {
+                                  return a.first > b.first;
+                              });
+            fprintf(stderr, "[ace_step] logits[code0]: EOS=%.3f top5=",
+                    last_row[TOKEN_IM_END]);
+            for (int k = 0; k < 5; k++)
+                fprintf(stderr, "[c%d=%.2f]", code_logits[k].second,
+                        code_logits[k].first);
+            fprintf(stderr, "\n");
+        }
+
         mask_to_codes(last_row, vs);
-        const int32_t chosen = sample_code(last_row, vs, sp, &rng);
+        int32_t chosen = sample_code(last_row, vs, sp_codes, &rng);
         if (chosen < 0) {
-            fprintf(stderr, "[ace_step] run_lm: WARNING: LM emitted EOS before "
-                            "any codes — generating silence placeholder\n");
-            // HARD ERROR: EOS before any codes means the model didn't generate
-            // anything. This should never happen with a valid chat-template prompt.
-            if (error) *error = "ACE-Step: LM emitted EOS (TOKEN_IM_END) before generating "
-                                "any audio codes — prompt format mismatch";
+            if (error) *error = "ACE-Step: LM emitted EOS before generating "
+                                "any audio codes";
             return false;
         }
         music_codes->push_back(chosen);
+        prev_token = AUDIO_CODE_BASE + chosen;
         fprintf(stderr, "[ace_step] run_lm: code[0/%d]=%d (tok=%d)\n",
-                n_codes, chosen, AUDIO_CODE_BASE + chosen);
+                n_codes, chosen, prev_token);
     }
 
-    // Remaining codes: feed previous code token, get logits for next.
-    int32_t prev_token = AUDIO_CODE_BASE + music_codes->back();
-    for (int32_t s = 1; s < n_codes; s++) {
-        const int32_t n_pos = prompt_len + s - 1;  // position of prev_token
-
+    // Generate remaining codes
+    while (static_cast<int32_t>(music_codes->size()) < n_codes) {
         std::vector<float> logits(static_cast<size_t>(vs));
         if (!lm_->forward_tokens(&prev_token, 1, n_pos, logits.data(), error))
             return false;
+        n_pos++;
 
-        // logits is (1, vs) — the prediction for the token at n_pos + 1
+        // CFG: forward on secondary (uncond) context and combine logits
+        if (use_cfg) {
+            std::vector<float> uncond_logits(static_cast<size_t>(vs), 0.0f);
+            if (!lm_->forward_tokens_secondary(&prev_token, 1, uncond_n_pos,
+                                               uncond_logits.data(), error))
+                return false;
+            uncond_n_pos++;
+            const float scale = req.lm_cfg_scale;
+            for (int32_t v = 0; v < vs; v++)
+                logits[v] = uncond_logits[v] + scale * (logits[v] - uncond_logits[v]);
+        }
+
+        // Diagnostic: top-5 code logits for first 12 codes
+        size_t cur_idx = music_codes->size();
+        if (cur_idx < 12) {
+            std::vector<std::pair<float, int32_t>> code_logits;
+            code_logits.reserve(FSQ_CODE_COUNT);
+            for (int32_t c = 0; c < FSQ_CODE_COUNT; c++)
+                code_logits.push_back({logits[AUDIO_CODE_BASE + c], c});
+            std::partial_sort(code_logits.begin(), code_logits.begin() + 5,
+                              code_logits.end(), [](auto& a, auto& b) {
+                                  return a.first > b.first;
+                              });
+            fprintf(stderr, "[ace_step] logits[%zu]: EOS=%.3f top5=", cur_idx,
+                    logits[TOKEN_IM_END]);
+            for (int k = 0; k < 5; k++) {
+                fprintf(stderr, "[c%d=%.2f]", code_logits[k].second,
+                        code_logits[k].first);
+            }
+            fprintf(stderr, "\n");
+        }
+
         mask_to_codes(logits.data(), vs);
-        const int32_t chosen = sample_code(logits.data(), vs, sp, &rng);
+        int32_t chosen = sample_code(logits.data(), vs, sp_codes, &rng);
 
         if (chosen < 0) {
-            fprintf(stderr, "[ace_step] run_lm: LM emitted EOS at step %d/%d\n",
-                    s, n_codes);
-            break;  // early stop — model finished generating
+            fprintf(stderr, "[ace_step] run_lm: LM emitted EOS at code %zu/%d\n",
+                    music_codes->size(), n_codes);
+            break;
         }
 
         music_codes->push_back(chosen);
         prev_token = AUDIO_CODE_BASE + chosen;
-        if (s < 3 || s == n_codes - 1) {
-            fprintf(stderr, "[ace_step] run_lm: code[%d/%d]=%d (tok=%d)\n",
-                    s, n_codes, chosen, prev_token);
+        size_t idx = music_codes->size() - 1;
+        if (idx < 3 || idx == static_cast<size_t>(n_codes - 1)) {
+            fprintf(stderr, "[ace_step] run_lm: code[%zu/%d]=%d (tok=%d)\n",
+                    idx, n_codes, chosen, prev_token);
         }
     }
     fprintf(stderr, "[ace_step] run_lm: decode loop done (%zu codes)\n", music_codes->size());
+
+    // ── Diagnostic: code distribution + dump to file ──
+    // Most codes should be different (high entropy). If 90% of codes are the
+    // same value, the LM has collapsed and audio will be a drone regardless
+    // of caption.
+    {
+        std::unordered_map<int32_t, int> hist;
+        for (int32_t c : *music_codes) hist[c]++;
+        int max_count = 0; int32_t max_code = -1;
+        for (auto& kv : hist) {
+            if (kv.second > max_count) { max_count = kv.second; max_code = kv.first; }
+        }
+        fprintf(stderr, "[ace_step] run_lm: code histogram: %zu unique codes, "
+                        "most-frequent code=%d (%.1f%% = %d/%zu)\n",
+                hist.size(), max_code,
+                100.0 * max_count / music_codes->size(),
+                max_count, music_codes->size());
+        // Dump all codes for offline analysis
+        if (const char* p = std::getenv("ACE_STEP_DUMP_CODES")) {
+            FILE* f = std::fopen(p, "wb");
+            if (f) {
+                uint32_t n = (uint32_t)music_codes->size();
+                std::fwrite(&n, sizeof(n), 1, f);
+                std::fwrite(music_codes->data(), sizeof(int32_t), n, f);
+                std::fclose(f);
+                fprintf(stderr, "[ace_step] dumped %u codes to %s\n", n, p);
+            }
+        }
+    }
 
     // HARD ERROR: need at least 1 code to produce any audio.
     if (music_codes->empty()) {
