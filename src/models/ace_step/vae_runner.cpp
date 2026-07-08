@@ -1492,9 +1492,14 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
         const size_t pcm_total = static_cast<size_t>(n_frames) * UPSAMPLE * 2;
         pcm->assign(pcm_total, 0.0f);
         const size_t ov_pcm = static_cast<size_t>(OVERLAP_FRAMES) * UPSAMPLE;
+        // HALF-Hann window: goes 0 → 1 (monotonically increasing).
+        // A FULL Hann (2π) goes 0 → 1 → 0, which makes BOTH tiles
+        // silent at overlap boundaries — the source of the crackle.
+        // The half-Hann ensures fade-in goes 0→1 and, with the reversed
+        // fade-out index, fade-out goes 1→0.  Their sum is always > 0.
         std::vector<float> hann_w(ov_pcm);
         for (size_t i = 0; i < ov_pcm; i++) {
-            hann_w[i] = 0.5f * (1.0f - std::cos(2.0f * 3.14159265358979f * i /
+            hann_w[i] = 0.5f * (1.0f - std::cos(3.14159265358979f * i /
                                 static_cast<float>(ov_pcm - 1)));
         }
         std::vector<float> wsum(pcm_total, 0.0f);

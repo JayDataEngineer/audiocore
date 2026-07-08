@@ -133,9 +133,12 @@
 
   // Per-variant defaults. Turbo = 8-step flow-matching (fast), Base = 50-step
   // (full quality). Guidance: upstream defaults to 1.0 (no CFG) for both.
+  // Guidance (CFG scale) controls how strongly the model follows the
+  // caption/lyrics.  1.0 = no CFG (caption largely ignored).  3.0+ gives
+  // strong caption adherence.  Turbo with 8 steps can handle 3.0–7.5.
   const MUSIC_DEFAULTS = {
-    turbo: { steps: 8,  guidance: 1.0 },
-    base:  { steps: 50, guidance: 1.0 },
+    turbo: { steps: 8,  guidance: 3.0 },
+    base:  { steps: 50, guidance: 7.5 },
     sft:   { steps: 50, guidance: 7.5 },
   };
   function music_variant_of(id) {
@@ -165,7 +168,7 @@
     if (sInput && (force || !sInput.dataset.userTouched)) sInput.value = d.steps;
     if (gInput && (force || !gInput.dataset.userTouched)) gInput.value = d.guidance;
     const gh = $("#mus-guid-hint");
-    if (gh) gh.textContent = (v === "turbo") ? "(turbo: low CFG)" : "(CFG strength)";
+    if (gh) gh.textContent = (v === "turbo") ? "(higher = follows caption more)" : "(CFG strength)";
   }
 
   function set_engine_dot(id, state) {
