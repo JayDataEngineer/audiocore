@@ -127,7 +127,42 @@
   let MODELS = [];
   let ACTIVE_TTS = null;
   let ACTIVE_VD  = null;
-  let ACTIVE_MUSIC = null;
+  let ACTIVE_MUSIC = null;       // currently-selected music model id
+  let MUSIC_MODELS = [];         // all available ACE-Step model ids
+
+  // Per-variant defaults. Turbo = 8-step flow-matching (fast), Base = 50-step
+  // (full quality). Guidance: upstream defaults to 1.0 (no CFG) for both.
+  const MUSIC_DEFAULTS = {
+    turbo: { steps: 8,  guidance: 1.0 },
+    base:  { steps: 50, guidance: 1.0 },
+    sft:   { steps: 50, guidance: 7.5 },
+  };
+  function music_variant_of(id) {
+    const lid = (id || "").toLowerCase();
+    if (lid.indexOf("turbo") >= 0) return "turbo";
+    if (lid.indexOf("base")  >= 0) return "base";
+    if (lid.indexOf("sft")   >= 0) return "sft";
+    return "turbo";  // safe default — short horizon
+  }
+  function music_label_for(id) {
+    const v = music_variant_of(id);
+    const map = {
+      turbo: "⚡ Turbo",
+      base:  "🎚️ Base",
+      sft:   "🎯 SFT",
+    };
+    return (map[v] || id) + "  ·  " + MUSIC_DEFAULTS[v].steps + " steps";
+  }
+  function apply_music_defaults(id, { force = false } = {}) {
+    const v = music_variant_of(id);
+    const d = MUSIC_DEFAULTS[v];
+    const sInput = $("#mus-steps");
+    const gInput = $("#mus-guid");
+    if (sInput && (force || !sInput.dataset.userTouched)) sInput.value = d.steps;
+    if (gInput && (force || !gInput.dataset.userTouched)) gInput.value = d.guidance;
+    const gh = $("#mus-guid-hint");
+    if (gh) gh.textContent = (v === "turbo") ? "(turbo: low CFG)" : "(CFG strength)";
+  }
 
   function set_engine_dot(id, state) {
     const el = $("#" + id);
@@ -151,6 +186,7 @@
       }
 
       // Pick models by family/heuristic
+      MUSIC_MODELS = [];
       for (const m of MODELS) {
         const f = (m.family || "").toLowerCase();
         const id = (m.id || "").toLowerCase();
@@ -161,10 +197,32 @@
                    id.indexOf("cv") >= 0)
             ACTIVE_TTS = m.id;
         }
-        if (f.indexOf("ace") >= 0 || id.indexOf("ace") >= 0)
-          ACTIVE_MUSIC = m.id;
+        if (f.indexOf("ace") >= 0 || id.indexOf("ace") >= 0) {
+          MUSIC_MODELS.push(m.id);
+          // Prefer turbo as the initial selection (faster iteration).
+          if (ACTIVE_MUSIC == null || id.indexOf("turbo") >= 0)
+            ACTIVE_MUSIC = m.id;
+        }
         if (f.indexOf("moss") >= 0 && ACTIVE_TTS == null)
           ACTIVE_TTS = m.id;
+      }
+
+      // Populate the music model picker (turbo vs base, etc.).
+      const musSel = $("#mus-model");
+      if (musSel) {
+        musSel.innerHTML = "";
+        if (!MUSIC_MODELS.length) {
+          musSel.innerHTML = '<option value="">— no music model loaded —</option>';
+        } else {
+          for (const id of MUSIC_MODELS) {
+            const o = document.createElement("option");
+            o.value = id;
+            o.textContent = music_label_for(id);
+            musSel.appendChild(o);
+          }
+          musSel.value = ACTIVE_MUSIC;
+          apply_music_defaults(ACTIVE_MUSIC, { force: true });
+        }
       }
 
       badge.textContent = MODELS.length + " model" + (MODELS.length === 1 ? "" : "s");
@@ -172,7 +230,7 @@
       set_engine_dot("engine-tts",   ACTIVE_TTS   ? "ready" : "");
       set_engine_dot("engine-vd",    ACTIVE_VD    ? "ready" : "");
       set_engine_dot("engine-music", ACTIVE_MUSIC ? "ready" : "");
-      console.log({ ACTIVE_TTS, ACTIVE_VD, ACTIVE_MUSIC, MODELS });
+      console.log({ ACTIVE_TTS, ACTIVE_VD, ACTIVE_MUSIC, MUSIC_MODELS, MODELS });
     } catch (e) {
       $("#model-badge").textContent = "offline";
       $("#model-badge").className = "badge err";
@@ -763,6 +821,31 @@
   }
   $("#mus-mode").addEventListener("change", sync_music_mode_rows);
   sync_music_mode_rows();
+
+  // Model picker: update ACTIVE_MUSIC and adapt steps/guidance defaults to
+  // the chosen variant (turbo=8 steps, base=50 steps). User-set values are
+  // preserved across switches — only untouched fields auto-adjust.
+  $("#mus-model").addEventListener("change", (e) => {
+    ACTIVE_MUSIC = e.target.value;
+    apply_music_defaults(ACTIVE_MUSIC, { force: false });
+    console.log("music model →", ACTIVE_MUSIC);
+  });
+
+  // Caption preset chips: one-click genre/mood fill.
+  $$("#mus-presets .chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      $("#mus-caption").value = chip.dataset.caption;
+      $("#mus-caption").focus();
+    });
+  });
+
+  // Track manual edits to steps/guidance so switching models doesn't clobber
+  // deliberate user choices.
+  ["mus-steps", "mus-guid"].forEach((id) => {
+    const el = $("#" + id);
+    if (el) el.addEventListener("input", () => { el.dataset.userTouched = "1"; });
+  });
+
   $("#mus-m0").addEventListener("input", (e) => {
     $("#mus-m0-val").textContent = parseFloat(e.target.value).toFixed(2);
     sync_slider_fill(e.target);

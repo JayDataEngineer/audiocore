@@ -383,6 +383,13 @@
         </div>
 
         <div class="form-row">
+          <label>Model</label>
+          <select id="mus-model" class="grow">
+            <option value="">loading…</option>
+          </select>
+        </div>
+
+        <div class="form-row">
           <label>Mode</label>
           <select id="mus-mode" class="grow">
             <option value="text_to_music" selected>🎵 Text-to-Music — generate from scratch</option>
@@ -392,6 +399,18 @@
           </select>
         </div>
 
+        <div class="preset-chips" id="mus-presets">
+          <button class="chip" data-caption="lo-fi hip hop, mellow piano, vinyl crackle, jazz drums">🎹 Lo-fi</button>
+          <button class="chip" data-caption="epic orchestral trailer, big drums, soaring strings, heroic brass">🎺 Epic</button>
+          <button class="chip" data-caption="dreamy synthwave, retro 80s, analog pads, slow pulse">🌆 Synthwave</button>
+          <button class="chip" data-caption="upbeat jazz, saxophone, walking bass, brushed drums">🎷 Jazz</button>
+          <button class="chip" data-caption="ambient cinematic, soft pads, distant choir, ethereal">🌌 Ambient</button>
+          <button class="chip" data-caption="acoustic folk, fingerpicked guitar, warm vocals, intimate">🎸 Folk</button>
+          <button class="chip" data-caption="edm house, four-on-the-floor, deep bass, plucky lead">🥁 House</button>
+          <button class="chip" data-caption="epic rock, distorted guitars, driving drums, anthemic">🤘 Rock</button>
+          <button class="chip" data-caption="k-pop, bright synths, punchy drums, catchy melody">✨ K-pop</button>
+        </div>
+
         <div class="form-row">
           <label>Caption <span class="hint">(genre / mood)</span></label>
           <input type="text" id="mus-caption" class="grow"
@@ -399,7 +418,7 @@
                  placeholder="e.g. 'epic orchestral trailer, big drums'">
         </div>
         <div class="form-row">
-          <label>Lyrics <span class="hint">(optional)</span></label>
+          <label>Lyrics <span class="hint">(optional · encoded by 8-layer lyric transformer)</span></label>
           <textarea id="mus-lyrics" rows="3" placeholder="[verse]&#10;Words sung by the lead vocal…"></textarea>
         </div>
 
