@@ -55,8 +55,10 @@ public:
     // One DiT forward pass: given noise latent x_t and timestep t, predict v.
     //   x_t:    [T_patches, hidden_size] float32 — current noisy latent
     //   t:      scalar timestep (0..1)
-    //   cond:   [T_cond, encoder_hidden] float32 — text encoder output
+    //   cond:   [T_cond, encoder_hidden] float32 — text encoder output (full forward)
     //   cond_nc:[T_cond, encoder_hidden] float32 — null-text encoder (CFG uncond)
+    //   lyric:  [T_lyric, encoder_hidden] float32 — raw TE embedding lookup for lyrics
+    //   lyric_nc: [T_lyric_nc, encoder_hidden] float32 — null lyric (CFG uncond)
     //   refer_audio: [T_refer, 64] float32 — silence_latent slice (for timbre enc)
     //                If null, the timbre encoder is skipped (degraded mode).
     //   T_refer: number of refer_audio frames (1 for text2music per upstream
@@ -65,6 +67,8 @@ public:
     bool forward(const float* x_t, float t,
                  const float* cond, int32_t T_cond, int32_t cond_hidden,
                  const float* cond_nc, int32_t T_cond_nc,
+                 const float* lyric, int32_t T_lyric, int32_t lyric_hidden,
+                 const float* lyric_nc, int32_t T_lyric_nc,
                  const float* refer_audio, int32_t T_refer,
                  float guidance_scale, int32_t n_patches,
                  float* output, std::string* error);

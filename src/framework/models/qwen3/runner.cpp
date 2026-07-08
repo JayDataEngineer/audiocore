@@ -8,6 +8,7 @@
 #include "audiocore/models/qwen3/runner.h"
 
 #include "llama.h"
+#include "llama-model.h"  // internal: for tok_embd access in embed_lookup
 
 #include "audiocore/framework/io/gguf_reader.h"
 #include "audiocore/framework/sampling/sampler.h"
@@ -348,6 +349,105 @@ const float* Runner::get_logits_ith(int32_t i) const {
     return llama_get_logits_ith(ctx_, i);
 }
 
+bool Runner::embed_lookup(const int32_t* token_ids, int32_t n_tokens,
+                          float* output, std::string* error) {
+    // Raw token-embedding lookup — NO transformer forward pass.
+    // Accesses the model's token_embd.weight tensor directly and extracts
+    // the embedding row for each token ID. Matches the reference
+    // qwen3_embed_lookup in cond-enc.h.
+    if (!model_) {
+        if (error) *error = "embed_lookup: model not loaded";
+        return false;
+    }
+    if (n_tokens <= 0) return true;
+
+    // Access the model's token embedding tensor via internal header.
+    // llama_model::tok_embd is a ggml_tensor* holding the full vocab table.
+    const auto* internal_model = reinterpret_cast<const llama_model*>(model_);
+    const ggml_tensor* tok_embd = internal_model->tok_embd;
+    if (!tok_embd) {
+        if (error) *error = "embed_lookup: model has no tok_embd tensor";
+        return false;
+    }
+
+    const int32_t n_embd = (int32_t) tok_embd->ne[0];  // hidden_size
+    const int32_t n_vocab = (int32_t) tok_embd->ne[1]; // vocab size
+
+    // Read the embedding table from the backend buffer.
+    // For quantized models, dequantize each row as we read it.
+    // Allocate a temporary buffer for one row at a time to save memory.
+    std::vector<uint8_t> row_bytes;
+    const size_t row_size = ggml_row_size(tok_embd->type, n_embd);
+
+    // If the tensor is f32, we can read directly; otherwise dequantize.
+    if (tok_embd->type == GGML_TYPE_F32) {
+        // Direct read — each row is n_embd * sizeof(float) bytes
+        for (int32_t i = 0; i < n_tokens; i++) {
+            int32_t tid = token_ids[i];
+            if (tid < 0 || tid >= n_vocab) {
+                if (error) *error = "embed_lookup: token id " + std::to_string(tid) + " out of range";
+                return false;
+            }
+            ggml_backend_tensor_get(tok_embd, output + (size_t)i * n_embd,
+                                    (size_t)tid * n_embd * sizeof(float),
+                                    n_embd * sizeof(float));
+        }
+    } else {
+        // Quantized — read full tensor to f32 then pick rows.
+        // For efficiency, cache the dequantized table on first call.
+        static thread_local std::vector<float> embd_table_f32;
+        static thread_local int32_t cached_n_vocab = 0;
+        static thread_local int32_t cached_n_embd = 0;
+
+        if (cached_n_vocab != n_vocab || cached_n_embd != n_embd || embd_table_f32.empty()) {
+            embd_table_f32.resize((size_t)n_vocab * n_embd);
+            // Dequantize using a ggml graph on the CPU backend.
+            size_t ctx_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+            struct ggml_init_params gp = {ctx_size, nullptr, true};
+            struct ggml_context* ctx = ggml_init(gp);
+
+            ggml_tensor* dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_vocab);
+            ggml_set_name(dst, "token_embd_f32");
+
+            ggml_backend_t backend = ggml_backend_cpu_init();
+            if (!ggml_backend_alloc_ctx_tensors(ctx, backend)) {
+                if (error) *error = "embed_lookup: failed to alloc ctx tensors";
+                ggml_free(ctx);
+                return false;
+            }
+
+            // Build a copy graph: dst = tok_embd (with type conversion)
+            struct ggml_cgraph* gf = ggml_new_graph(ctx);
+            ggml_tensor* cvt = ggml_cpy(ctx, const_cast<ggml_tensor*>(tok_embd), dst);
+            ggml_build_forward_expand(gf, cvt);
+            ggml_backend_graph_compute(backend, gf);
+            ggml_backend_tensor_get(dst, embd_table_f32.data(), 0,
+                                    (size_t)n_vocab * n_embd * sizeof(float));
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+
+            cached_n_vocab = n_vocab;
+            cached_n_embd = n_embd;
+
+            fprintf(stderr, "[Runner] embed_lookup: cached %d×%d embedding table (%.1f MB)\n",
+                    n_vocab, n_embd, (double)(n_vocab * n_embd * sizeof(float)) / (1024*1024));
+        }
+
+        for (int32_t i = 0; i < n_tokens; i++) {
+            int32_t tid = token_ids[i];
+            if (tid < 0 || tid >= n_vocab) {
+                if (error) *error = "embed_lookup: token id " + std::to_string(tid) + " out of range";
+                return false;
+            }
+            memcpy(output + (size_t)i * n_embd,
+                   embd_table_f32.data() + (size_t)tid * n_embd,
+                   n_embd * sizeof(float));
+        }
+    }
+
+    return true;
+}
+
 bool Runner::tokenize(const std::string& text, bool add_special,
                       bool parse_special, std::vector<int32_t>* tokens,
                       int32_t* needed, std::string* error) const {
@@ -601,6 +701,133 @@ bool Runner::load_talker_extras(const std::string& gguf_path,
     return true;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  WDELTA: Base → CustomVoice weight patching
+//
+//  See header docstring for the full rationale. Summary: load_extras(Talker)
+//  on a CV talker produces CV-flavored text_proj biases and codec_embd rows
+//  (the 9 preset speaker tokens). For the CV talker to accept a continuous
+//  ECAPA embedding at the speaker slot — while keeping its instruct-tuned
+//  transformer norms — we overwrite just the embedding-pathway buffers with
+//  Base's versions. Other tensors (attn/ffn/norm weights in libllama) are
+//  left untouched; those carry CV's instruction-following behavior.
+// ═══════════════════════════════════════════════════════════════════════════
+bool Runner::apply_wdelta_patch(const std::string& base_gguf_path,
+                                 std::string* error) {
+    if (!has_text_embd_) {
+        if (error) *error = "apply_wdelta_patch: talker extras not loaded";
+        return false;
+    }
+
+    GgufReader reader;
+    std::string load_err;
+    if (!reader.load(base_gguf_path, &load_err)) {
+        if (error) *error = "wdelta: failed to open base GGUF '" +
+                            base_gguf_path + "': " + load_err;
+        return false;
+    }
+
+    // Helper: materialize a tensor from Base, validate its element count
+    // matches the destination buffer, and memcpy over it.
+    auto swap_f32 = [&](const char* name, float* dst, size_t dst_n,
+                        const char* what) -> bool {
+        if (!dst) {
+            if (error) *error = std::string("wdelta: destination ") + what +
+                                " is null (load_extras did not allocate it)";
+            return false;
+        }
+        size_t got_n = 0;
+        float* src = materialize_f32(reader, name, &got_n);
+        if (!src) {
+            if (error) *error = std::string("wdelta: base GGUF missing '") +
+                                name + "' for " + what;
+            return false;
+        }
+        if (got_n != dst_n) {
+            if (error) *error = std::string("wdelta: ") + what +
+                                " dimension mismatch (base=" +
+                                std::to_string(got_n) +
+                                " vs cv=" + std::to_string(dst_n) + ")";
+            delete[] src;
+            return false;
+        }
+        std::memcpy(dst, src, dst_n * sizeof(float));
+        delete[] src;
+        return true;
+    };
+
+    // Validate embedding pathway dim first — Base must produce the same
+    // hidden size as the CV talker we already loaded. Without this guard,
+    // a 0.6B Base patch over a 1.7B CV (or vice versa) would corrupt memory.
+    const TensorStorage* tok_embd = reader.find("token_embd.weight");
+    if (!tok_embd || tok_embd->n_dims < 2) {
+        if (error) *error = "wdelta: base GGUF has no token_embd.weight";
+        return false;
+    }
+    const int32_t base_embd_dim = static_cast<int32_t>(tok_embd->ne[0]);
+    if (base_embd_dim != codec_embd_dim_) {
+        if (error) *error = "wdelta: hidden size mismatch (base n_embd=" +
+                            std::to_string(base_embd_dim) + " vs cv=" +
+                            std::to_string(codec_embd_dim_) +
+                            "). Pick a Base GGUF that matches the CV size.";
+        return false;
+    }
+
+    // The 5-tensor swap. Order matches load_talker_extras so a partial
+    // failure partway through leaves us closer to the CV state than to a
+    // half-patched chimera (text_proj overwritten but codec_embd untouched
+    // is more recoverable than the reverse, since text_proj biases are the
+    // smaller delta).
+    //
+    // 1) text_proj.0.weight [2048, 2048]
+    // 2) text_proj.0.bias   [2048]
+    // 3) text_proj.1.weight [1024 or 2048, 2048]
+    // 4) text_proj.1.bias   [1024 or 2048]
+    // 5) token_embd.weight  (codec_embedding) [codec_vocab, n_embd]
+    //
+    // Compute dst sizes from the SAME shapes load_talker_extras used so we
+    // don't drift if the converter changes layout later.
+    const int32_t text_dim_in  = text_embd_dim_;   // 2048 (always)
+    const int32_t proj_dim_out = hidden_size_;     // 1024 (0.6B) or 2048 (1.7B)
+
+    if (text_proj_0_w_) {
+        if (!swap_f32("text_proj.0.weight", text_proj_0_w_,
+                       static_cast<size_t>(text_dim_in) * text_dim_in,
+                       "text_proj.0.weight")) return false;
+    }
+    if (text_proj_0_b_) {
+        if (!swap_f32("text_proj.0.bias", text_proj_0_b_,
+                       static_cast<size_t>(text_dim_in),
+                       "text_proj.0.bias")) return false;
+    }
+    if (text_proj_1_w_) {
+        if (!swap_f32("text_proj.1.weight", text_proj_1_w_,
+                       static_cast<size_t>(text_dim_in) * proj_dim_out,
+                       "text_proj.1.weight")) return false;
+    }
+    if (text_proj_1_b_) {
+        if (!swap_f32("text_proj.1.bias", text_proj_1_b_,
+                       static_cast<size_t>(proj_dim_out),
+                       "text_proj.1.bias")) return false;
+    }
+    if (codec_embd_) {
+        // codec_vocab may differ between CV (3072) and Base (3072) — same
+        // for all 0.6B/1.7B variants we ship. The dimension check in
+        // swap_f32 will catch a mismatch if a future model deviates.
+        const size_t codec_n = static_cast<size_t>(codec_vocab_) *
+                               static_cast<size_t>(codec_embd_dim_);
+        if (!swap_f32("token_embd.weight", codec_embd_, codec_n,
+                       "token_embd (codec_embedding)")) return false;
+    }
+
+    std::fprintf(stderr,
+        "qwen3::Runner: WDELTA patch applied from %s\n"
+        "  (text_proj biases + codec_embedding overwritten with Base;\n"
+        "   transformer attn/ffn/norm weights retain CV's instruct tuning)\n",
+        base_gguf_path.c_str());
+    return true;
+}
+
 bool Runner::load_predictor_extras(const std::string& gguf_path,
                                     int n_fine_books, std::string* error) {
     n_fine_books_ = n_fine_books;
@@ -672,11 +899,21 @@ bool Runner::load_predictor_extras(const std::string& gguf_path,
     if (small_to_mtp_w_) {
         const TensorStorage* ts = reader.find("small_to_mtp.weight");
         if (ts && ts->n_dims >= 2) {
-            // ggml shape convention: ne[0] = innermost (input/features),
-            // ne[1] = outermost (output/rows). The Linear is stored as
-            // [in_features, out_features] (column-major) = ne[0]=in, ne[1]=out.
-            small_to_mtp_in_  = static_cast<int32_t>(ts->ne[0]);
-            small_to_mtp_out_ = static_cast<int32_t>(ts->ne[1]);
+            // The converter (convert_qwen3tts.cpp add_tensor_2d) stores
+            // PyTorch nn.Linear weights in their native [out, in] row-major
+            // layout. In ggml ne convention that maps to ne[0]=in_features
+            // (innermost, contiguous) and ne[1]=out_features.
+            //
+            // For 1.7B: weight shape is [out=1024, in=2048] in PyTorch →
+            //   ne[0] = in_features  = 2048
+            //   ne[1] = out_features = 1024
+            // which matches the bias length (1024).
+            //
+            // (Earlier code had these swapped, projecting 1024 → 2048
+            //  instead of 2048 → 1024 and producing garbage fine codebooks
+            //  on 1.7B. Verified correct via bias length = 1024.)
+            small_to_mtp_in_  = static_cast<int32_t>(ts->ne[0]);  // PyTorch in_features
+            small_to_mtp_out_ = static_cast<int32_t>(ts->ne[1]);  // PyTorch out_features
         }
         // Safety fallback: if shape lookup failed, assume square (0.6B case).
         if (small_to_mtp_in_ == 0 || small_to_mtp_out_ == 0) {

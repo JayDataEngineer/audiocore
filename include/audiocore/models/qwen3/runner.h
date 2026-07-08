@@ -142,6 +142,35 @@ public:
     int32_t      codec_vocab()     const { return codec_vocab_; }
     const float* codec_head()      const { return codec_head_; }
 
+    // ── WDELTA: Base→CustomVoice weight patching ──────────────────────────
+    //
+    // After load_extras(ExtraKind::Talker) has materialized this runner's
+    // text_proj_*_ and codec_embd_ buffers from a CustomVoice (CV) talker
+    // GGUF, calling apply_wdelta_patch(base_gguf_path) OVERWRITES those
+    // buffers with the corresponding tensors from a sibling Base talker GGUF.
+    //
+    // Why: CV and Base share 99.99% of transformer weights (cosine > 0.9999
+    // on all attn/ffn matrices) but differ sharply on:
+    //   - text_proj.{0,1}.bias      (CV trained on discrete speaker tokens;
+    //                                Base trained on continuous ECAPA vectors)
+    //   - token_embd.weight         (9 preset speaker tokens are near-zero in
+    //                                Base, identity-bearing rows in CV)
+    // After the patch, the CV talker accepts a continuous ECAPA embedding at
+    // the speaker slot (Base's embedding pathway) WHILE RETAINING its own
+    // transformer norms (which carry the instruct-tuning that makes emotion
+    // control strong rather than "soft"). The 4-feature pipeline unlocked:
+    //   (a) speaker embedding  +  (b) instruct emotion
+    //   (c) text prompt        +  (d) high quality
+    // — the gap that the Mastrapasqua `qwen3-tts` engine closes via its
+    // `.qvoice WOVR` section, ported here for our GGUF stack. See
+    // docs/QWEN3-TTS-GAPS.md §A4 and blog/cross-model-voice-analysis.md.
+    //
+    // Returns true on success. *error receives a message on failure. Safe
+    // to call multiple times — later calls re-overwrite with whatever the
+    // base GGUF contains.
+    bool apply_wdelta_patch(const std::string& base_gguf_path,
+                            std::string* error = nullptr);
+
     // ── Predictor extras (load_extras(ExtraKind::Predictor)) ──────────────
 
     bool has_mtp() const { return has_mtp_; }
@@ -221,6 +250,16 @@ public:
     // Low-level access to decoder results. Pointers valid until next decode.
     const float* get_embeddings_ith(int32_t i) const;
     const float* get_logits_ith(int32_t i) const;
+
+    // Raw token-embedding table lookup — NO transformer forward pass.
+    // Reads the `token_embd.weight` tensor from the loaded model and extracts
+    // the embedding row for each token ID. Used by ACE-Step's lyric encoder,
+    // which takes raw embeddings (not post-forward hidden states) as input
+    // (matching upstream qwen3_embed_lookup in cond-enc.h).
+    //   token_ids: (n_tokens,) int32
+    //   output:    (n_tokens, hidden_size) row-major float32
+    bool embed_lookup(const int32_t* token_ids, int32_t n_tokens,
+                      float* output, std::string* error = nullptr);
 
     // Clear all KV cache entries. Must be called before starting a new
     // inference sequence when reusing the same Runner across requests.

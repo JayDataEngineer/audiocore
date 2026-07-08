@@ -346,16 +346,18 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     //     the TE/LM receive OOD input and conditioning collapses to near-zero
     //     prompt sensitivity (verified: identical audio for different prompts).
     std::string prompt = format_sft_prompt(req.caption, req.lyrics, req.duration);
-    // Lyrics are encoded separately through the TE and routed to the lyric
-    // encoder. We currently only feed the SFT-formatted text to the TE/LM —
-    // the lyric-encoder path is a TODO (unlocked when req.lyrics is non-empty
-    // AND the lyric encoder port lands).
-    std::string lyrics_formatted;
-    if (!req.lyrics.empty()) {
-        lyrics_formatted = format_lyrics(req.lyrics);
-        // Append lyrics to the LM prompt so the LM can condition on them.
-        prompt += lyrics_formatted;
-    }
+
+    // (1b) Generate the lyric string. Upstream ALWAYS generates a lyric string,
+    //      even for text2music without lyrics — the default is
+    //      "# Languages\nunknown\n\n# Lyric\n<|endoftext|>". This is tokenized
+    //      separately and embedded via raw token-embedding lookup (NOT a full
+    //      TE forward pass) for the DiT's lyric encoder (8-layer transformer).
+    //      Without the lyric conditioning path, the DiT cross-attention has
+    //      the wrong sequence length and produces degraded "frantic clicking"
+    //      output (verified: divergence at layer0_after_cross_attn).
+    std::string lyrics_str = req.lyrics.empty()
+        ? format_lyrics("", "unknown")
+        : format_lyrics(req.lyrics);
 
     fprintf(stderr, "[ace_step] run_lm: tokenizing (caption='%s', dur=%.1f)...\n",
             req.caption.c_str(), req.duration);
@@ -383,6 +385,44 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                                      te_cond_.data(), error))
         return false;
     fprintf(stderr, "[ace_step] run_lm: TE forward_get_embeddings done\n");
+
+    // (3b) Lyric encoding: tokenize the lyric string and get raw token
+    //      embeddings (NOT a full forward pass — just the embedding table
+    //      lookup). The DiT's lyric encoder (8-layer transformer) processes
+    //      these raw embeddings. Matches upstream qwen3_embed_lookup.
+    {
+        fprintf(stderr, "[ace_step] run_lm: lyric tokenize+embed_lookup...\n");
+        std::vector<int32_t> lyric_tok;
+        if (!te_->tokenize(lyrics_str, /*add_special=*/true, /*parse_special=*/true,
+                           &lyric_tok, nullptr, error))
+            return false;
+        lyric_cond_len_ = static_cast<int32_t>(lyric_tok.size());
+        lyric_cond_.resize(static_cast<size_t>(lyric_cond_len_) * te_hs);
+        if (lyric_cond_len_ > 0) {
+            if (!te_->embed_lookup(lyric_tok.data(), lyric_cond_len_,
+                                   lyric_cond_.data(), error))
+                return false;
+        }
+        fprintf(stderr, "[ace_step] run_lm: lyric embed_lookup done (n_tok=%d)\n",
+                lyric_cond_len_);
+
+        // Null lyric for CFG: use empty lyric tokens. The raw embedding of
+        // the BOS/EOS tokens serves as the unconditional lyric path. When
+        // lyric_cond_ is empty, the DiT skips the lyric encoder entirely for
+        // CFG uncond (matching upstream: null_condition_emb broadcast).
+        std::vector<int32_t> null_lyric_tok;
+        if (!te_->tokenize("", true, true, &null_lyric_tok, nullptr, error))
+            return false;
+        const int32_t n_null_lyric = static_cast<int32_t>(null_lyric_tok.size());
+        if (n_null_lyric > 0) {
+            lyric_uncond_.resize(static_cast<size_t>(n_null_lyric) * te_hs);
+            if (!te_->embed_lookup(null_lyric_tok.data(), n_null_lyric,
+                                   lyric_uncond_.data(), error))
+                return false;
+        } else {
+            lyric_uncond_.clear();
+        }
+    }
 
     // (4) Null-text TE embedding for CFG (DiT side)
     {
@@ -885,9 +925,19 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
         // is OOD and produces industrial-machinery DiT output.
         const int32_t T_refer = silence_ptr ? 1 : 0;
         const float* refer_audio = silence_ptr;
+
+        // Lyric conditioning pointers (always populated — even for
+        // text2music without lyrics, upstream encodes a default lyric string).
+        const float* lyric_ptr = lyric_cond_.empty() ? nullptr : lyric_cond_.data();
+        int32_t      T_lyric   = lyric_cond_len_;
+        const float* lyric_unc = lyric_uncond_.empty() ? nullptr : lyric_uncond_.data();
+        int32_t      T_lyric_unc = static_cast<int32_t>(lyric_uncond_.size() / enc_hs);
+
         if (!dit_runner_->forward(hidden.data(), t,
                                   cond_ptr, T_cond, enc_hs,
                                   uncond_ptr, T_uncond,
+                                  lyric_ptr, T_lyric, enc_hs,
+                                  lyric_unc, T_lyric_unc,
                                   refer_audio, T_refer,
                                   effective_gs,
                                   S_patches,

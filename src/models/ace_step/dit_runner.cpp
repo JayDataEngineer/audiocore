@@ -547,6 +547,174 @@ static ggml_tensor* timbre_encode(ggml_context* ctx,
     return cls;
 }
 
+// ── Lyric encoder ────────────────────────────────────────────────────────────
+// 8-layer bidirectional transformer that processes raw TE token embeddings
+// for the lyric conditioning path. Matches encoder.lyric_encoder in the DiT
+// GGUF. Input: [1024, S_lyric] (raw TE embeddings via embed_lookup). Output:
+// [2048, S_lyric].
+//
+// Architecture (cond-enc.h:188-215):
+//   1. Linear embed: [1024, S] → [2048, S] (embed_tokens.weight + bias)
+//   2. 8 transformer layers (alternating sliding-window/full attention)
+//   3. Final RMS norm
+//
+// The lyric encoder ALWAYS runs, even for text2music without lyrics —
+// upstream encodes "# Languages\nunknown\n\n# Lyric\n<|endoftext|>" as the
+// default lyric string, producing ~11 tokens of conditioning. Without this,
+// the cross-attention has 2 fewer tokens (wrong sequence length), corrupting
+// the K/V projections and causing the "frantic clicking" output.
+static ggml_tensor* lyric_encode(ggml_context* ctx,
+                                   ggml_context* ext_ctx,
+                                   const float* lyric_data,
+                                   int S_lyric, int te_hidden,
+                                   int H, int nh, int nk, int hd,
+                                   float rope_theta,
+                                   std::vector<DiTInputUpload>& inputs) {
+    constexpr int kNumLyricLayers = 8;
+
+    auto el_w = ggml_get_tensor(ext_ctx, "encoder.lyric_encoder.embed_tokens.weight");
+    auto el_b = ggml_get_tensor(ext_ctx, "encoder.lyric_encoder.embed_tokens.bias");
+
+    // Load lyric_data [te_hidden, S_lyric]
+    ggml_tensor* input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, te_hidden, S_lyric);
+    ggml_set_name(input, "lyric_in");
+    ggml_set_input(input);
+    inputs.push_back({input, lyric_data,
+                      static_cast<size_t>(te_hidden) * S_lyric * sizeof(float)});
+
+    // Project to H: weight [H, te_hidden] @ x [te_hidden, S] → [H, S]
+    ggml_tensor* hidden = ggml_mul_mat(ctx, el_w, input);
+    if (el_b) hidden = ggml_add(ctx, hidden, ggml_repeat(ctx, el_b, hidden));
+
+    // Position IDs [0..S_lyric-1]
+    ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S_lyric);
+    ggml_set_name(pos, "lyric_pos");
+    ggml_set_input(pos);
+    {
+        static thread_local std::vector<int32_t> pos_buf;
+        pos_buf.resize(static_cast<size_t>(S_lyric));
+        for (int i = 0; i < S_lyric; i++) pos_buf[i] = i;
+        inputs.push_back({pos, pos_buf.data(),
+                          static_cast<size_t>(S_lyric) * sizeof(int32_t)});
+    }
+
+    // Sliding-window attention mask (bidirectional, |i-j| <= 128).
+    // Applied to EVEN layers; ODD layers use full attention.
+    constexpr int kSlideWindow = 128;
+    ggml_tensor* slide_mask = nullptr;
+    static thread_local std::vector<ggml_fp16_t> mask_buf;
+    if (S_lyric > 1) {
+        slide_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, S_lyric, S_lyric);
+        ggml_set_name(slide_mask, "lyric_slide_mask");
+        ggml_set_input(slide_mask);
+        const ggml_fp16_t kZero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t kNegInf = ggml_fp32_to_fp16(-INFINITY);
+        mask_buf.assign(static_cast<size_t>(S_lyric) * S_lyric, kZero);
+        for (int i = 0; i < S_lyric; i++) {
+            for (int j = 0; j < S_lyric; j++) {
+                int d = i - j; if (d < 0) d = -d;
+                mask_buf[static_cast<size_t>(i) * S_lyric + j] =
+                    (d <= kSlideWindow) ? kZero : kNegInf;
+            }
+        }
+        inputs.push_back({slide_mask, mask_buf.data(),
+                          static_cast<size_t>(S_lyric) * S_lyric * sizeof(ggml_fp16_t)});
+    }
+
+    // 8 transformer layers
+    for (int i = 0; i < kNumLyricLayers; i++) {
+        char buf[160];
+
+        // ── pre-LN self-attention ──
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.input_layernorm.weight", i);
+        ggml_tensor* ln_w = ggml_get_tensor(ext_ctx, buf);
+        ggml_tensor* h = ggml_rms_norm(ctx, hidden, 1e-6f);
+        h = ggml_mul(ctx, h, ggml_repeat(ctx, ln_w, h));
+
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.self_attn.q_proj.weight", i);
+        auto q_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.self_attn.k_proj.weight", i);
+        auto k_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.self_attn.v_proj.weight", i);
+        auto v_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.self_attn.o_proj.weight", i);
+        auto o_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.self_attn.q_norm.weight", i);
+        auto qn_w = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.self_attn.k_norm.weight", i);
+        auto kn_w = ggml_get_tensor(ext_ctx, buf);
+
+        auto q = ggml_mul_mat(ctx, q_w, h);
+        auto k = ggml_mul_mat(ctx, k_w, h);
+        auto v = ggml_mul_mat(ctx, v_w, h);
+
+        q = apply_qk_norm(ctx, q, hd, nh, qn_w);
+        k = apply_qk_norm(ctx, k, hd, nk, kn_w);
+
+        q = ggml_reshape_3d(ctx, q, hd, nh, S_lyric);
+        k = ggml_reshape_3d(ctx, k, hd, nk, S_lyric);
+        v = ggml_reshape_3d(ctx, v, hd, nk, S_lyric);
+
+        auto rope = [&](ggml_tensor* t) {
+            return ggml_rope_ext(ctx, t, pos, nullptr,
+                                  hd, 2, 0,
+                                  rope_theta, 1.0f, 0.0f, 1.0f,
+                                  0.0f, 0.0f);
+        };
+        q = rope(q);
+        k = rope(k);
+
+        auto rsh = [&](ggml_tensor* t, int n_h) {
+            return ggml_cont(ctx, ggml_permute(ctx, t, 0, 2, 1, 3));
+        };
+        q = rsh(q, nh);
+        k = rsh(k, nk);
+        v = rsh(v, nk);
+
+        float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+        ggml_tensor* layer_mask = (slide_mask && (i % 2 == 0)) ? slide_mask : nullptr;
+        auto a = ggml_flash_attn_ext(ctx, q, k, v, layer_mask, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(a, GGML_PREC_F32);
+        a = ggml_reshape_2d(ctx, a, nh * hd, S_lyric);
+        a = ggml_mul_mat(ctx, o_w, a);
+        hidden = ggml_add(ctx, hidden, a);   // residual
+
+        // ── post-LN SwiGLU MLP ──
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.post_attention_layernorm.weight", i);
+        ggml_tensor* post_ln_w = ggml_get_tensor(ext_ctx, buf);
+        h = ggml_rms_norm(ctx, hidden, 1e-6f);
+        h = ggml_mul(ctx, h, ggml_repeat(ctx, post_ln_w, h));
+
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.mlp.gate_proj.weight", i);
+        auto gw = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.mlp.up_proj.weight", i);
+        auto uw = ggml_get_tensor(ext_ctx, buf);
+        std::snprintf(buf, sizeof(buf),
+                      "encoder.lyric_encoder.layers.%d.mlp.down_proj.weight", i);
+        auto dw = ggml_get_tensor(ext_ctx, buf);
+        auto mlp_out = swiglu_mlp(ctx, h, gw, uw, dw);
+        hidden = ggml_add(ctx, hidden, mlp_out);
+    }
+
+    // Final RMSNorm
+    auto final_ln_w = ggml_get_tensor(ext_ctx, "encoder.lyric_encoder.norm.weight");
+    hidden = ggml_rms_norm(ctx, hidden, 1e-6f);
+    hidden = ggml_mul(ctx, hidden, ggml_repeat(ctx, final_ln_w, hidden));
+
+    // Return [H, S_lyric] — NO pooling, all tokens go into the conditioning.
+    return hidden;
+}
+
 // ── Single forward: build graph + compute ────────────────────────────────────
 static bool run_one_forward(
     const DitConfig& cfg, ggml_context* ext_ctx,
@@ -554,6 +722,7 @@ static bool run_one_forward(
     const float* x_t, int32_t T, int32_t H,
     const float* temb, int temb_dim,
     const float* cond_data, int ct_len, int cond_hidden,
+    const float* lyric_data, int lyric_len, int lyric_hidden,
     const float* refer_audio, int T_refer,
     float* result,
     const std::vector<std::vector<float>>& ss_table_f32,
@@ -745,7 +914,25 @@ static bool run_one_forward(
         return false;
     }
 
-    // (B) Text projection: TE_text_hs [1024, T_text] → [2048, T_text].
+    // (B) Lyric encoder: raw TE embeddings [1024, S_lyric] → [2048, S_lyric].
+    //     ALWAYS runs, even for text2music without lyrics — upstream encodes
+    //     "# Languages\nunknown\n\n# Lyric\n<|endoftext|>" by default,
+    //     producing ~11 conditioning tokens. Without the lyric path, the
+    //     cross-attention sequence length is wrong and K/V projections diverge.
+    //     CFG uncond branch passes lyric_data=null; lyrics are dropped to 0 tokens.
+    ggml_tensor* lyric_proj = nullptr;
+    if (lyric_data && lyric_len > 0) {
+        int64_t lh = (lyric_hidden > 0) ? lyric_hidden : 1024;
+        lyric_proj = lyric_encode(ctx, ext_ctx, lyric_data, lyric_len,
+                                  static_cast<int>(lh),
+                                  H, nh, nk, hd, theta, inputs);
+        if (!lyric_proj) {
+            if (error) *error = "DiT: lyric_encode returned null (missing tensor?)";
+            return false;
+        }
+    }
+
+    // (C) Text projection: TE_text_hs [1024, T_text] → [2048, T_text].
     //     CFG uncond branch passes cond_data=null; in that case null_condition_emb
     //     is already at encoder_hidden dim (2048), so use it directly as text_proj
     //     without going through text_projector (which maps 1024→2048 — wrong dim).
@@ -769,10 +956,19 @@ static bool run_one_forward(
         text_proj = ggml_reshape_2d(ctx, nce, 2048, 1);  // [2048, 1]
     }
 
-    // (C) Pack [timbre | text] → encoder_hidden_states [2048, T_packed]
-    //     Upstream _pack_sequences concatenates then sorts valid tokens first.
-    //     For unpadded single-batch, just concat (timbre first per upstream).
-    ggml_tensor* packed = ggml_concat(ctx, timbre_tok, text_proj, 1);
+    // (D) Pack [lyric | timbre | text] → encoder_hidden_states [2048, T_packed]
+    //     Upstream cond-enc.h:354 pack order: lyric, timbre[0:1], text_proj.
+    //     For CFG uncond (no lyrics), pack [timbre | text] — lyrics dropped.
+    //     For text2music (lyrics present), pack [lyric | timbre | text].
+    ggml_tensor* packed;
+    if (lyric_proj) {
+        // [lyric | timbre | text]
+        ggml_tensor* lt = ggml_concat(ctx, lyric_proj, timbre_tok, 1);
+        packed = ggml_concat(ctx, lt, text_proj, 1);
+    } else {
+        // [timbre | text]
+        packed = ggml_concat(ctx, timbre_tok, text_proj, 1);
+    }
 
     // (D) condition_embedder: [2048, T_packed] → [H_dit, T_packed]
     ggml_tensor* ce_out = ggml_mul_mat(ctx, cew, packed);
@@ -1177,6 +1373,8 @@ bool DiTRunner::forward(
     const float* x_t, float t,
     const float* cond, int32_t T_cond, int32_t cond_hidden,
     const float* cond_nc, int32_t T_cond_nc,
+    const float* lyric, int32_t T_lyric, int32_t lyric_hidden,
+    const float* lyric_nc, int32_t T_lyric_nc,
     const float* refer_audio, int32_t T_refer,
     float guidance_scale, int32_t n_patches,
     float* output, std::string* error)
@@ -1222,6 +1420,7 @@ bool DiTRunner::forward(
         return run_one_forward(cfg_, ext_ctx_, cuda_backend_, x_t, T, H,
                                 temb.data(), temb_dim,
                                 cond, T_cond, cond_hidden,
+                                lyric, T_lyric, lyric_hidden,
                                 refer_audio, T_refer,
                                 output,
                                 ss_table_f32_, global_ss_f32_, error);
@@ -1234,6 +1433,7 @@ bool DiTRunner::forward(
     if (!run_one_forward(cfg_, ext_ctx_, cuda_backend_, x_t, T, H,
                           temb.data(), temb_dim,
                           cond, T_cond, cond_hidden,
+                          lyric, T_lyric, lyric_hidden,
                           refer_audio, T_refer,
                           c_out.data(),
                           ss_table_f32_, global_ss_f32_, error)) {
@@ -1241,11 +1441,14 @@ bool DiTRunner::forward(
         return false;
     }
 
-    const float* uc = (cond_nc && T_cond_nc > 0) ? cond_nc : nullptr;
-    int uc_len = (cond_nc && T_cond_nc > 0) ? T_cond_nc : 0;
+    const float* uc       = (cond_nc && T_cond_nc > 0) ? cond_nc : nullptr;
+    int          uc_len   = (cond_nc && T_cond_nc > 0) ? T_cond_nc : 0;
+    const float* ul       = (lyric_nc && T_lyric_nc > 0) ? lyric_nc : nullptr;
+    int          ul_len   = (lyric_nc && T_lyric_nc > 0) ? T_lyric_nc : 0;
     if (!run_one_forward(cfg_, ext_ctx_, cuda_backend_, x_t, T, H,
                           temb.data(), temb_dim,
                           uc, uc_len, cond_hidden,
+                          ul, ul_len, lyric_hidden,
                           refer_audio, T_refer,
                           u_out.data(),
                           ss_table_f32_, global_ss_f32_, error)) {

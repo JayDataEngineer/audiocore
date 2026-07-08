@@ -156,6 +156,14 @@ private:
     std::vector<float> te_cond_;       // TE hidden states: [T_text, encoder_hidden]
     std::vector<float> te_uncond_;     // null-text TE hidden (for CFG)
     int32_t            te_cond_len_ = 0;   // T_text
+    // Lyric conditioning: raw TE embedding lookup (NOT full forward) for the
+    // lyric string. ALWAYS populated, even for text2music without lyrics —
+    // upstream encodes "# Languages\nunknown\n\n# Lyric\n<|endoftext|>" by
+    // default, producing ~11 conditioning tokens. Without this, the DiT
+    // cross-attention sequence length is wrong and output quality degrades.
+    std::vector<float> lyric_cond_;     // [T_lyric, encoder_hidden]
+    std::vector<float> lyric_uncond_;   // null lyric (for CFG)
+    int32_t            lyric_cond_len_ = 0;  // T_lyric
     int32_t            fsq_code_offset_ = 0;  // base offset for audio code tokens in LM vocab
 
     // For repaint/completion: VAE-encoded input audio latent [T, 64]

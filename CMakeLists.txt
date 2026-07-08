@@ -117,6 +117,10 @@ add_library(audiocore_framework STATIC
     src/models/kokoro_tts/internal/src/util.cpp
     src/models/kokoro_tts/internal/src/models/loaders.cpp
     src/models/kokoro_tts/session.cpp
+    # Silero VAD v6.2 (0xShug0/audio.cpp port — graph code pending):
+    src/models/silero_vad/loader.cpp
+    src/models/silero_vad/session.cpp
+    src/models/silero_vad/runtime.cpp
     # HTTP server factory (routes + WAV encoders). Linked into the
     # audiocore_server binary AND into the e2e HTTP test, so both share the
     # same routing code path.
@@ -161,6 +165,8 @@ target_include_directories(audiocore_framework
         third_party
         third_party/llama.cpp/include
         third_party/llama.cpp/ggml/include
+        third_party/llama.cpp/src
+        third_party/llama.cpp/ggml/src
         third_party/httplib
         third_party/nlohmann
     PRIVATE
