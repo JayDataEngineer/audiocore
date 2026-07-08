@@ -295,41 +295,76 @@ static void bf16_to_f32_buf_local(const void* src, float* dst, int32_t n) {
 //
 // 1. Tokenize caption (+ optional lyrics).
 // 2. TE encode → hidden states cached for DiT conditioning.
-// 3. LM prefill with text tokens.
-// 4. LM autoregressive decode at 5 Hz (no CFG on LM during step 1 — quality
-//    comes from the DiT-side CFG in step 2).  Each LM token in the code
-//    vocabulary range [vocab_size − 64000, vocab_size) is a music code.
+// 3. LM prefill with chat-template prompt (Qwen3 <|im_start|> format).
+// 4. LM autoregressive decode at 5 Hz.  Audio code tokens are in
+//    [AUDIO_CODE_BASE, AUDIO_CODE_BASE + FSQ_CODE_COUNT). All non-code
+//    logits (except EOS = TOKEN_IM_END) are masked to -inf, matching
+//    reference pipeline-lm.cpp:373-382.
 
-// SFT prompt template — matches pipeline_ace_step.py:SFT_GEN_PROMPT exactly.
-//   "# Instruction\n{instruction}\n\n# Caption\n{prompt}\n\n# Metas\n{metas}<|endoftext|>\n"
-// Training-time template; without it the TE/LM see OOD input and conditioning
-// is weak (verified: identical-sounding outputs for different prompts).
-static std::string format_sft_prompt(const std::string& caption,
-                                     const std::string& lyrics,
-                                     float audio_duration) {
-    // When LM codes are present (always true in our pipeline), the reference
-    // uses the COVER instruction (task-types.h:73):
-    //   "Generate audio semantic tokens based on the given conditions:"
-    // The TEXT2MUSIC instruction ("Fill the audio semantic mask...") is only
-    // used when there are NO audio codes — pure silence-source DiT.
-    // Using COVER instruction matches what the model was trained with when
-    // the detokenized codes serve as source context.
-    const std::string instruction =
-        "Generate audio semantic tokens based on the given conditions:";
+// ── Qwen3 special token IDs (ACE-Step LM vocabulary) ──────────────────────
+// These are FIXED IDs in the Qwen3 tokenizer, not computed from vocab_size.
+// Matches ref-acestep/src/prompt.h:16-21.
+static constexpr int32_t TOKEN_IM_START  = 151644;
+static constexpr int32_t TOKEN_IM_END    = 151645;   // EOS / turn end
+static constexpr int32_t TOKEN_THINK     = 151667;
+static constexpr int32_t TOKEN_THINK_END = 151668;
+static constexpr int32_t AUDIO_CODE_BASE = 151669;   // first audio code token ID
+static constexpr int32_t FSQ_CODE_COUNT  = 64000;     // valid FSQ codes (levels [8,8,8,5,5,5])
 
-    // Metadata string. Upstream _build_metadata_string defaults unset fields
-    // to "N/A"; the duration uses "{int(d)} seconds".
+// LM_INSTRUCTION — matches ref-acestep/src/task-types.h:51
+static constexpr const char* LM_INSTRUCTION =
+    "Generate audio semantic tokens based on the given conditions:";
+
+// Text-encoder prompt (for TE/DiT cross-attention). This is the
+// "instruction + caption + metas" format used by the text encoder.
+// Matches ref-acestep/src/pipeline-synth-ops.cpp:422-430 (build_prompt_strings).
+static std::string format_te_prompt(const std::string& caption,
+                                    const std::string& lyrics,
+                                    float audio_duration) {
+    const std::string& instruction = LM_INSTRUCTION;
     int dur_int = (audio_duration > 0.0f) ? static_cast<int>(audio_duration) : 30;
     std::string metas = "- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n"
                         "- duration: " + std::to_string(dur_int) + " seconds\n";
-
-    std::string text = "# Instruction\n" + instruction + "\n\n"
-                       "# Caption\n" + caption + "\n\n"
-                       "# Metas\n" + metas + "<|endoftext|>\n";
-    return text;
+    return std::string("# Instruction\n") + instruction + "\n\n"
+           "# Caption\n" + caption + "\n\n"
+           "# Metas\n" + metas + "<|endoftext|>\n";
 }
 
-// Lyrics formatting (only used when req.lyrics is non-empty). Matches upstream
+// LM prompt in Qwen3 chat template format.
+// Matches ref-acestep/src/prompt.h:270-296 (build_lm_prompt_with_cot).
+//
+//   <|im_start|>system\n# Instruction\n{LM_INSTRUCTION}\n\n<|im_end|>\n
+//   <|im_start|>user\n# Caption\n{caption}\n\n# Lyric\n{lyrics}\n<|im_end|>\n
+//   <|im_start|>assistant\n<think>\n{cot_yaml}</think>\n\n
+//
+// The CoT YAML is a simple metadata block. The reference generates this in
+// Phase 1 (caption enrichment) but for text2music we derive it directly from
+// the request. The assistant turn ends with </think> so the LM immediately
+// enters codes_phase — matching reference Phase 2 (pipeline-lm.cpp:343).
+static std::string format_lm_prompt(const std::string& caption,
+                                    const std::string& lyrics,
+                                    float audio_duration) {
+    int dur_int = (audio_duration > 0.0f) ? static_cast<int>(audio_duration) : 30;
+
+    // Build CoT YAML (matches ref build_cot_yaml — prompt.h:241-262)
+    std::string cot;
+    if (!caption.empty()) {
+        // YAML block scalar for caption
+        cot += "caption: |\n  " + caption + "\n";
+    }
+    cot += "duration: " + std::to_string(dur_int) + "\n";
+
+    // Chat template with special tokens as TEXT — the tokenizer with
+    // parse_special=true will convert <|im_start|>, <|im_end|>, <think>,
+    // </think> to their single-token IDs.
+    std::string prompt;
+    prompt += "<|im_start|>system\n# Instruction\n" + std::string(LM_INSTRUCTION) + "\n\n<|im_end|>\n";
+    prompt += "<|im_start|>user\n# Caption\n" + caption + "\n\n# Lyric\n" + lyrics + "\n<|im_end|>\n";
+    prompt += "<|im_start|>assistant\n<think>\n" + cot + "</think>\n\n";
+    return prompt;
+}
+
+// Lyrics formatting for the DiT lyric encoder. Matches upstream
 // _format_lyrics: "# Languages\n{lang}\n\n# Lyric\n{lyrics}<|endoftext|>"
 static std::string format_lyrics(const std::string& lyrics,
                                  const std::string& lang = "en") {
@@ -346,12 +381,13 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     if (lm_) lm_->clear_kv_cache();
     if (te_) te_->clear_kv_cache();
 
-    // (1) Assemble the text prompt using the SFT template.
-    //     Upstream _format_prompt wraps the caption + metadata in
-    //     SFT_GEN_PROMPT (Instruction/Caption/Metas). Without this template
-    //     the TE/LM receive OOD input and conditioning collapses to near-zero
-    //     prompt sensitivity (verified: identical audio for different prompts).
-    std::string prompt = format_sft_prompt(req.caption, req.lyrics, req.duration);
+    // (1) Build SEPARATE prompts for TE and LM.
+    //     The TE gets the instruction+caption+metas format (for DiT
+    //     cross-attention). The LM gets the Qwen3 chat template format
+    //     (<|im_start|>system/user/assistant turns) that it was trained with.
+    //     Using the TE prompt for the LM produces OOD input → garbage codes.
+    std::string te_prompt = format_te_prompt(req.caption, req.lyrics, req.duration);
+    std::string lm_prompt_str = format_lm_prompt(req.caption, req.lyrics, req.duration);
 
     // (1b) Generate the lyric string. Upstream ALWAYS generates a lyric string,
     //      even for text2music without lyrics — the default is
@@ -367,20 +403,28 @@ bool AceStepSession::run_lm(const MusicRequest& req,
 
     fprintf(stderr, "[ace_step] run_lm: tokenizing (caption='%s', dur=%.1f)...\n",
             req.caption.c_str(), req.duration);
-    // Tokenize the text prompt for the TE. The reference's bpe_encode does NOT
-    // add BOS (only EOS via <|endoftext|> parsing). We use add_special=true
-    // because our TE (llama.cpp Qwen3) expects BOS for correct position
-    // embeddings. The cross-attention correlation is 0.9995 regardless of
-    // BOS presence — the TE forward output is robust to this difference.
+    // Tokenize the TE prompt (add_special=true for BOS; parse_special=true
+    // so <|endoftext|> becomes its single-token ID).
     std::vector<int32_t> te_tokens;
-    if (!te_->tokenize(prompt, /*add_special=*/true, /*parse_special=*/true,
+    if (!te_->tokenize(te_prompt, /*add_special=*/true, /*parse_special=*/true,
                        &te_tokens, nullptr, error))
         return false;
 
+    // Tokenize the LM prompt. parse_special=true is CRITICAL: <|im_start|>,
+    // <|im_end|>, <think>, </think> must become their single-token IDs
+    // (151644, 151645, 151667, 151668). add_special=false because the chat
+    // template already includes all needed markers — adding BOS would
+    // prepend an extra token the model doesn't expect.
     std::vector<int32_t> lm_prompt;
-    if (!lm_->tokenize(prompt, /*add_special=*/true, /*parse_special=*/true,
+    if (!lm_->tokenize(lm_prompt_str, /*add_special=*/false, /*parse_special=*/true,
                        &lm_prompt, nullptr, error))
         return false;
+
+    fprintf(stderr, "[ace_step] run_lm: LM prompt (%zu tokens), last 5 toks:",
+            lm_prompt.size());
+    for (int i = std::max(0, (int)lm_prompt.size() - 5); i < (int)lm_prompt.size(); i++)
+        fprintf(stderr, " %d", lm_prompt[i]);
+    fprintf(stderr, "\n");
 
     if (te_tokens.empty() || lm_prompt.empty()) {
         if (error) *error = "ACE-Step: tokenization produced empty result";
@@ -453,61 +497,128 @@ bool AceStepSession::run_lm(const MusicRequest& req,
         fprintf(stderr, "[ace_step] run_lm: null-text TE done\n");
     }
 
-    // (5) LM prefill with text tokens (populates KV cache for positions 0..N-1)
+    // (5) LM prefill with chat-template prompt.
+    //     CRITICAL: we KEEP the prefill logits — the last row predicts the
+    //     first audio code. The reference (pipeline-lm.cpp:66 + 116-117)
+    //     samples the first token directly from prefill logits. Our old code
+    //     threw them away (nullptr) and re-fed the last prompt token, which
+    //     shifted generation by one position and corrupted the KV state.
     fprintf(stderr, "[ace_step] run_lm: LM forward_tokens prefill (n_tok=%zu)...\n", lm_prompt.size());
     const int32_t prompt_len = static_cast<int32_t>(lm_prompt.size());
-    if (!lm_->forward_tokens(lm_prompt.data(), prompt_len, 0, nullptr, error))
+    const int32_t vs = lm_->vocab_size();
+    std::vector<float> prefill_logits(static_cast<size_t>(prompt_len) * vs, 0.0f);
+    if (!lm_->forward_tokens(lm_prompt.data(), prompt_len, 0,
+                             prefill_logits.data(), error))
         return false;
-    fprintf(stderr, "[ace_step] run_lm: LM prefill done\n");
+    fprintf(stderr, "[ace_step] run_lm: LM prefill done (vs=%d)\n", vs);
 
-    // (6) Decode loop: generate N codes at 5 Hz
+    // (6) Decode loop: generate codes at 5 Hz.
+    //     Audio code tokens are at IDs [AUDIO_CODE_BASE, AUDIO_CODE_BASE +
+    //     FSQ_CODE_COUNT) = [151669, 215669). We mask ALL other logits to
+    //     -inf (except TOKEN_IM_END = 151645 for early stop), matching
+    //     reference pipeline-lm.cpp:373-382.
     const int32_t n_codes = std::max(1, static_cast<int32_t>(req.duration * 5.0f + 0.5f));
     music_codes->clear();
     music_codes->reserve(static_cast<size_t>(n_codes));
 
-    const int32_t code_vocab_size = 64000;
-    const int32_t code_start = std::max(0, lm_->vocab_size() - code_vocab_size);
-
-    // Start token: the last prompt token (typically EOS/BOS).  The LM will
-    // predict the first code token from this context.
-    int32_t prev_token = lm_prompt.back();
-
-    fprintf(stderr, "[ace_step] run_lm: starting decode loop (n_codes=%d, vs=%d, code_start=%d)...\n",
-            n_codes, lm_->vocab_size(), code_start);
+    fprintf(stderr, "[ace_step] run_lm: decode loop (n_codes=%d, AUDIO_CODE_BASE=%d, vs=%d)\n",
+            n_codes, AUDIO_CODE_BASE, vs);
 
     // RNG for stochastic sampling (seeded for reproducibility)
     PhiloxRng rng{req.seed != 0 ? req.seed : 42};
 
-    for (int32_t s = 0; s < n_codes; s++) {
-        const int32_t n_pos = prompt_len + s;
+    // Helper: mask logits so only [AUDIO_CODE_BASE, AUDIO_CODE_BASE+FSQ_CODE_COUNT)
+    // and TOKEN_IM_END have finite values. Everything else → -1e9f.
+    // This matches reference pipeline-lm.cpp:373-382.
+    auto mask_to_codes = [](float* logits, int32_t vocab_size) {
+        // Mask everything below AUDIO_CODE_BASE except TOKEN_IM_END
+        for (int32_t v = 0; v < AUDIO_CODE_BASE && v < vocab_size; v++) {
+            if (v != TOKEN_IM_END)
+                logits[v] = -1e9f;
+        }
+        // Mask everything above the code range
+        for (int32_t v = AUDIO_CODE_BASE + FSQ_CODE_COUNT; v < vocab_size; v++) {
+            logits[v] = -1e9f;
+        }
+    };
 
-        const int32_t vs = lm_->vocab_size();
+    // Sample one code from masked logits. Returns the FSQ code index [0, 64000)
+    // or -1 if TOKEN_IM_END was chosen (stop).
+    auto sample_code = [&](float* logits, int32_t vocab_size,
+                           const Params& sp, PhiloxRng* prng) -> int32_t {
+        // Build compact logits: [EOS, code_0, code_1, ..., code_63999]
+        // Matching reference pipeline-lm.cpp:490-500 (compact_logits).
+        const int32_t compact_V = FSQ_CODE_COUNT + 1;
+        std::vector<float> compact(compact_V);
+        compact[0] = logits[TOKEN_IM_END];
+        for (int32_t c = 0; c < FSQ_CODE_COUNT; c++)
+            compact[c + 1] = logits[AUDIO_CODE_BASE + c];
+
+        const int32_t compact_tok = sample_token(compact.data(), compact_V, sp,
+                                                  nullptr, 0, prng);
+        if (compact_tok == 0)
+            return -1;  // EOS
+        return compact_tok - 1;  // FSQ code index
+    };
+
+    Params sp;
+    sp.temperature = req.temperature;
+    sp.top_p       = req.top_p;
+    sp.do_sample   = req.temperature > 0.0f;
+
+    // First code: sample from the LAST ROW of prefill logits.
+    // prefill_logits is (prompt_len, vs) row-major.
+    {
+        float* last_row = &prefill_logits[static_cast<size_t>(prompt_len - 1) * vs];
+        mask_to_codes(last_row, vs);
+        const int32_t chosen = sample_code(last_row, vs, sp, &rng);
+        if (chosen < 0) {
+            fprintf(stderr, "[ace_step] run_lm: WARNING: LM emitted EOS before "
+                            "any codes — generating silence placeholder\n");
+            // HARD ERROR: EOS before any codes means the model didn't generate
+            // anything. This should never happen with a valid chat-template prompt.
+            if (error) *error = "ACE-Step: LM emitted EOS (TOKEN_IM_END) before generating "
+                                "any audio codes — prompt format mismatch";
+            return false;
+        }
+        music_codes->push_back(chosen);
+        fprintf(stderr, "[ace_step] run_lm: code[0/%d]=%d (tok=%d)\n",
+                n_codes, chosen, AUDIO_CODE_BASE + chosen);
+    }
+
+    // Remaining codes: feed previous code token, get logits for next.
+    int32_t prev_token = AUDIO_CODE_BASE + music_codes->back();
+    for (int32_t s = 1; s < n_codes; s++) {
+        const int32_t n_pos = prompt_len + s - 1;  // position of prev_token
+
         std::vector<float> logits(static_cast<size_t>(vs));
-
         if (!lm_->forward_tokens(&prev_token, 1, n_pos, logits.data(), error))
             return false;
 
-        const float* code_logits = logits.data() + code_start;
+        // logits is (1, vs) — the prediction for the token at n_pos + 1
+        mask_to_codes(logits.data(), vs);
+        const int32_t chosen = sample_code(logits.data(), vs, sp, &rng);
 
-        // Sample within the code vocabulary via the unified audiocore::sampler.
-        // temperature <= 0 selects the greedy argmax path; otherwise temp +
-        // top-p nucleus filtering + multinomial draw.
-        Params sp;
-        sp.temperature = req.temperature;
-        sp.top_p       = req.top_p;
-        sp.do_sample   = req.temperature > 0.0f;
-        const int32_t chosen = sample_token(code_logits, code_vocab_size, sp,
-                                            /*prev_tokens=*/nullptr, /*n_prev=*/0,
-                                            &rng);
+        if (chosen < 0) {
+            fprintf(stderr, "[ace_step] run_lm: LM emitted EOS at step %d/%d\n",
+                    s, n_codes);
+            break;  // early stop — model finished generating
+        }
 
         music_codes->push_back(chosen);
-        prev_token = code_start + chosen;
+        prev_token = AUDIO_CODE_BASE + chosen;
         if (s < 3 || s == n_codes - 1) {
             fprintf(stderr, "[ace_step] run_lm: code[%d/%d]=%d (tok=%d)\n",
                     s, n_codes, chosen, prev_token);
         }
     }
     fprintf(stderr, "[ace_step] run_lm: decode loop done (%zu codes)\n", music_codes->size());
+
+    // HARD ERROR: need at least 1 code to produce any audio.
+    if (music_codes->empty()) {
+        if (error) *error = "ACE-Step: LM produced zero audio codes";
+        return false;
+    }
 
     // (7) FSQ detokenize the LM codes → 25 Hz source latent for the DiT.
     //     The reference pipeline (pipeline-synth.cpp:321-324,

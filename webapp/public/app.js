@@ -137,9 +137,9 @@
   // caption/lyrics.  1.0 = no CFG (caption largely ignored).  3.0+ gives
   // strong caption adherence.  Turbo with 8 steps can handle 3.0–7.5.
   const MUSIC_DEFAULTS = {
-    turbo: { steps: 8,  guidance: 3.0 },
-    base:  { steps: 50, guidance: 7.5 },
-    sft:   { steps: 50, guidance: 7.5 },
+    turbo: { steps: 8,  guidance: 1.0 },
+    base:  { steps: 50, guidance: 1.0 },
+    sft:   { steps: 50, guidance: 1.0 },
   };
   function music_variant_of(id) {
     const lid = (id || "").toLowerCase();
@@ -967,7 +967,7 @@
           lyrics:   $("#mus-lyrics").value.trim(),
           duration: parseFloat($("#mus-dur").value) || 30,
           steps:    parseInt($("#mus-steps").value, 10) || 50,
-          guidance_scale: parseFloat($("#mus-guid").value) || 7.5,
+          guidance_scale: parseFloat($("#mus-guid").value) || 1.0,
         };
         if (seed_i && seed_i > 0) body.seed = seed_i;
         if (src_b64) {

@@ -54,7 +54,7 @@ struct MusicRequest {
     std::string lyrics;              // optional lyrics text
     float       duration     = 30.0f; // seconds
     int32_t     seed         = 0;
-    float       guidance_scale = 7.5f;
+    float       guidance_scale = 1.0f;
     int32_t     n_diffusion_steps = 0;  // 0 → variant default (turbo=8, sft=50)
     float       temperature  = 0.0f;   // LM sampling temp (0=argmax, >0=stochastic)
     float       top_p        = 1.0f;   // LM nucleus sampling threshold
