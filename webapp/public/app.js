@@ -91,7 +91,7 @@
   }
 
   // ── Tab switching ──────────────────────────────────────────────────
-  const TAB_IDS = ["design", "maker", "synthesize", "music", "voices", "clips"];
+  const TAB_IDS = ["design", "maker", "synthesize", "music", "sfx", "voices", "clips"];
 
   function activate_tab(target, { persist = true } = {}) {
     $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === target));
@@ -129,6 +129,7 @@
   let ACTIVE_VD  = null;
   let ACTIVE_MUSIC = null;       // currently-selected music model id
   let MUSIC_MODELS = [];         // all available ACE-Step model ids
+  let ACTIVE_SFX = null;         // MOSS-SoundEffect v2 model id
 
   // Per-variant defaults. Turbo = 8-step flow-matching (fast), Base = 50-step
   // (full quality). Guidance: upstream defaults to 1.0 (no CFG) for both.
@@ -185,6 +186,7 @@
         set_engine_dot("engine-tts", "");
         set_engine_dot("engine-vd", "");
         set_engine_dot("engine-music", "");
+        set_engine_dot("engine-sfx", "");
         return;
       }
 
@@ -208,6 +210,9 @@
         }
         if (f.indexOf("moss") >= 0 && ACTIVE_TTS == null)
           ACTIVE_TTS = m.id;
+        if ((f.indexOf("moss_sfx") >= 0 || id.indexOf("sfx") >= 0) &&
+            m.loaded !== false)
+          ACTIVE_SFX = m.id;
       }
 
       // Apply default steps/guidance for whatever model is loaded.
@@ -218,6 +223,7 @@
       set_engine_dot("engine-tts",   ACTIVE_TTS   ? "ready" : "");
       set_engine_dot("engine-vd",    ACTIVE_VD    ? "ready" : "");
       set_engine_dot("engine-music", ACTIVE_MUSIC ? "ready" : "");
+      set_engine_dot("engine-sfx",   ACTIVE_SFX   ? "ready" : "");
       render_model_manager();
     } catch (e) {
       $("#model-badge").textContent = "offline";
@@ -225,13 +231,14 @@
       set_engine_dot("engine-tts", "");
       set_engine_dot("engine-vd", "");
       set_engine_dot("engine-music", "");
+      set_engine_dot("engine-sfx", "");
     }
   }
 
   // Mark a dot as "active" while a request is in flight, then back to ready.
   function with_engine_dot(id, promise) {
     set_engine_dot(id, "active");
-    return promise.finally(() => set_engine_dot(id, ACTIVE_TTS || ACTIVE_VD || ACTIVE_MUSIC ? "ready" : ""));
+    return promise.finally(() => set_engine_dot(id, ACTIVE_TTS || ACTIVE_VD || ACTIVE_MUSIC || ACTIVE_SFX ? "ready" : ""));
   }
 
   // ── Voice Design tab ───────────────────────────────────────────────
@@ -1080,6 +1087,74 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   });
 
+  // ── SFX tab (MOSS Sound Effects) ───────────────────────────────────
+  let sfx_last_blob = null;
+
+  // SFX preset chips: one-click prompt fill.
+  $$("#sfx-presets .chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      $("#sfx-text").value = chip.dataset.prompt;
+      $("#sfx-text").focus();
+    });
+  });
+
+  $("#sfx-btn").addEventListener("click", async () => {
+    const st = $("#sfx-status");
+    const btn = $("#sfx-btn");
+    if (!ACTIVE_SFX) {
+      status(st, "No SFX model loaded. Load moss-sfx-v2 from the \u{1F4E6} Models tab.", "err");
+      return;
+    }
+    const text = $("#sfx-text").value.trim();
+    if (!text) { status(st, "Describe the sound effect first.", "err"); return; }
+
+    const duration = parseFloat($("#sfx-dur").value) || 5;
+    // moss_sfx_v2 uses duration_tokens (1 token ≈ 0.08s)
+    const duration_tokens = Math.round(duration / 0.08);
+
+    btn.disabled = true; btn.textContent = "Generating…";
+    status(st, "Generating sound effect…", "loading");
+    clear_player($("#sfx-player"));
+
+    try {
+      const p = fetch("/v1/audio/speech", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: ACTIVE_SFX,
+          input: text,
+          mode: "tts",
+          duration_tokens: duration_tokens,
+        }),
+      }).then(async (r) => {
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.error || "SFX failed (" + r.status + ")");
+        }
+        return r.blob();
+      });
+      const blob = await with_engine_dot("engine-sfx", p);
+      sfx_last_blob = blob;
+      const url = URL.createObjectURL(blob);
+      set_player($("#sfx-player"), url,
+        "sfx · " + text.substring(0, 40) + " · " + (blob.size / 1024).toFixed(1) + " KB");
+      $("#sfx-download").disabled = false;
+      status(st, "Done.", "ok");
+    } catch (err) {
+      status(st, "Error: " + err.message, "err");
+    }
+    btn.disabled = false; btn.textContent = "🔊 Generate SFX";
+  });
+
+  $("#sfx-download").addEventListener("click", () => {
+    if (!sfx_last_blob) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(sfx_last_blob);
+    a.download = "sfx_" + Date.now() + ".wav";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+
   // ── Voices library ─────────────────────────────────────────────────
   let VOICES_CACHE = [];
   let CLIPS_CACHE  = [];
@@ -1236,6 +1311,154 @@
     await upload_files("/v1/voices/upload", files, $("#voice-status"), () => load_voices());
     $("#voice-upload-file").value = "";
   });
+
+  // ── PCA Voice Space Analysis ───────────────────────────────────────
+  const PCA_COLORS = ["#e74c3c","#3498db","#2ecc71","#f39c12","#9b59b6",
+                       "#1abc9c","#e67e22","#34495e","#e84393","#00cec9"];
+
+  $("#pca-btn").addEventListener("click", async () => {
+    const st = $("#pca-status");
+    const btn = $("#pca-btn");
+    const nComp = parseInt($("#pca-ncomp").value, 10) || 10;
+    const nClu  = parseInt($("#pca-nclu").value, 10) || 5;
+    btn.disabled = true; btn.textContent = "Analyzing…";
+    status(st, "Running PCA + K-means on all voices…", "loading");
+    try {
+      const r = await fetch("/v1/voices/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          components: nComp, clusters: nClu, save_dirs: true,
+        }),
+      });
+      const data = await r.json();
+      if (data.error) { status(st, data.error, "err"); return; }
+      render_pca(data);
+      const cumPct = (data.cumulative_variance[data.n_components - 1] * 100).toFixed(1);
+      const dirNote = data.saved_dirs && data.saved_dirs.length
+        ? " · " + data.saved_dirs.length + " .dir steering vectors saved for Voice Maker"
+        : "";
+      status(st, data.n_voices + " voices · " + data.n_components + " PCs explain " +
+             cumPct + "% variance · " + data.n_clusters + " clusters" + dirNote, "ok");
+    } catch (e) {
+      status(st, "Error: " + e.message, "err");
+    }
+    btn.disabled = false; btn.textContent = "📊 Analyze";
+  });
+
+  function render_pca(data) {
+    const voices = data.voices;
+    const plotEl = $("#pca-plot");
+    const detEl  = $("#pca-details");
+
+    // ── Scatter plot (PC1 × PC2, coloured by cluster) ──
+    const pc1 = voices.map(v => v.pc[0]);
+    const pc2 = voices.map(v => v.pc[1] || 0);
+    const min1 = Math.min(...pc1), max1 = Math.max(...pc1);
+    const min2 = Math.min(...pc2), max2 = Math.max(...pc2);
+    const W = 560, H = 420, PAD = 50;
+    const range1 = max1 - min1 + 0.01;
+    const range2 = max2 - min2 + 0.01;
+    const sx = v => PAD + ((v - min1) / range1) * (W - 2 * PAD);
+    const sy = v => H - PAD - ((v - min2) / range2) * (H - 2 * PAD);
+
+    let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
+              '" style="max-width:100%;background:var(--bg-card);border-radius:8px">';
+    // Axes
+    svg += '<line x1="' + PAD + '" y1="' + (H - PAD) + '" x2="' + (W - PAD) +
+           '" y2="' + (H - PAD) + '" stroke="var(--border)" stroke-width="1.5"/>';
+    svg += '<line x1="' + PAD + '" y1="' + PAD + '" x2="' + PAD + '" y2="' + (H - PAD) +
+           '" stroke="var(--border)" stroke-width="1.5"/>';
+    // Axis labels
+    const var1 = ((data.explained_variance_ratio[0] || 0) * 100).toFixed(1);
+    const var2 = ((data.explained_variance_ratio[1] || 0) * 100).toFixed(1);
+    svg += '<text x="' + (W / 2) + '" y="' + (H - 12) + '" text-anchor="middle" ' +
+           'fill="var(--text-dim)" font-size="13">PC1 (' + var1 + '%)</text>';
+    svg += '<text x="16" y="' + (H / 2) + '" text-anchor="middle" fill="var(--text-dim)" ' +
+           'font-size="13" transform="rotate(-90 16 ' + (H / 2) + ')">PC2 (' + var2 + '%)</text>';
+    // Zero lines (if in range)
+    if (min1 < 0 && max1 > 0) {
+      const zx = sx(0);
+      svg += '<line x1="' + zx + '" y1="' + PAD + '" x2="' + zx + '" y2="' + (H - PAD) +
+             '" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="3,3" opacity="0.4"/>';
+    }
+    if (min2 < 0 && max2 > 0) {
+      const zy = sy(0);
+      svg += '<line x1="' + PAD + '" y1="' + zy + '" x2="' + (W - PAD) + '" y2="' + zy +
+             '" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="3,3" opacity="0.4"/>';
+    }
+    // Points
+    for (const v of voices) {
+      const cx = sx(v.pc[0]).toFixed(1);
+      const cy = sy(v.pc[1] || 0).toFixed(1);
+      const color = PCA_COLORS[v.cluster % PCA_COLORS.length];
+      svg += '<circle cx="' + cx + '" cy="' + cy + '" r="5" fill="' + color +
+             '" opacity="0.85" stroke="var(--bg-card)" stroke-width="1"/>';
+      const label = v.name.replace(/\.voice$/, "");
+      svg += '<text x="' + (parseFloat(cx) + 7) + '" y="' + (parseFloat(cy) + 4) +
+             '" font-size="9" fill="var(--text-dim)">' + esc(label) + "</text>";
+    }
+    // Legend
+    const clusters = [...new Set(voices.map(v => v.cluster))].sort();
+    let lx = W - PAD - 60;
+    for (const c of clusters) {
+      const color = PCA_COLORS[c % PCA_COLORS.length];
+      svg += '<rect x="' + lx + '" y="' + (PAD - 25) + '" width="10" height="10" fill="' +
+             color + '" rx="2"/>';
+      svg += '<text x="' + (lx + 14) + '" y="' + (PAD - 16) + '" font-size="10" fill="var(--text-dim)">C' +
+             c + "</text>";
+      lx += 45;
+    }
+    svg += "</svg>";
+    plotEl.innerHTML = svg;
+
+    // ── PC extremes table ──
+    let html = '<div style="overflow-x:auto;margin-top:1em">';
+    html += '<table style="width:100%;font-size:13px;border-collapse:collapse">';
+    html += '<thead><tr style="text-align:left;border-bottom:2px solid var(--border)">' +
+            '<th style="padding:6px">PC</th>' +
+            '<th style="padding:6px">Variance</th>' +
+            '<th style="padding:6px">Cumulative</th>' +
+            '<th style="padding:6px">− Negative end</th>' +
+            '<th style="padding:6px">+ Positive end</th>' +
+            "</tr></thead><tbody>";
+    for (let i = 0; i < data.n_components; i++) {
+      const ext = data.pc_extremes[i];
+      const v = (data.explained_variance_ratio[i] * 100).toFixed(1);
+      const cv = (data.cumulative_variance[i] * 100).toFixed(1);
+      html += '<tr style="border-bottom:1px solid var(--border)">' +
+              '<td style="padding:6px;font-weight:600">PC' + (i + 1) + "</td>" +
+              '<td style="padding:6px">' + v + "%</td>" +
+              '<td style="padding:6px">' + cv + "%</td>" +
+              '<td style="padding:6px">' + esc(ext.negative_end) + "</td>" +
+              '<td style="padding:6px">' + esc(ext.positive_end) + "</td>" +
+              "</tr>";
+    }
+    html += "</tbody></table></div>";
+
+    // Cluster breakdown
+    html += '<div style="margin-top:1em;display:flex;flex-wrap:wrap;gap:0.5em">';
+    for (const c of clusters) {
+      const members = voices.filter(v => v.cluster === c).map(v => v.name.replace(/\.voice$/, ""));
+      const color = PCA_COLORS[c % PCA_COLORS.length];
+      html += '<div style="border:1px solid var(--border);border-radius:8px;padding:0.5em 0.75em">' +
+              '<div style="font-weight:600;margin-bottom:0.25em">' +
+              '<span style="display:inline-block;width:10px;height:10px;background:' + color +
+              ';border-radius:2px;margin-right:4px"></span>Cluster ' + c +
+              " (" + members.length + ")</div>" +
+              '<div style="font-size:11px;color:var(--text-dim)">' + esc(members.join(", ")) + "</div>" +
+              "</div>";
+    }
+    html += "</div>";
+
+    if (data.saved_dirs && data.saved_dirs.length) {
+      html += '<p class="hint" style="margin-top:0.75em">💡 ' +
+              data.saved_dirs.length + " steering directions saved (" +
+              esc(data.saved_dirs.join(", ")) +
+              "). Use them in Voice Maker → Apply steering vector to push any voice along these axes.</p>";
+    }
+    detEl.innerHTML = html;
+  }
 
   // ── Clips library ──────────────────────────────────────────────────
   function apply_clip_filter() {
@@ -1503,6 +1726,7 @@
         maker:  "#mk-shape-preview",
         synthesize: "#syn-btn",
         music:  "#mus-btn",
+        sfx:    "#sfx-btn",
       };
       const sel = map[active];
       if (sel) { e.preventDefault(); $(sel)?.click(); }
@@ -1511,8 +1735,8 @@
 
     if (typing) return;
 
-    // 1–6: tabs
-    if (/^[1-6]$/.test(e.key)) {
+    // 1–7: tabs
+    if (/^[1-7]$/.test(e.key)) {
       const idx = parseInt(e.key, 10) - 1;
       if (TAB_IDS[idx]) { e.preventDefault(); activate_tab(TAB_IDS[idx]); }
       return;

@@ -43,6 +43,7 @@
       <span class="engine-dot" id="engine-tts"  title="Speech / TTS engine">TTS</span>
       <span class="engine-dot" id="engine-vd"   title="Voice Design engine">VD</span>
       <span class="engine-dot" id="engine-music" title="Music engine">Music</span>
+      <span class="engine-dot" id="engine-sfx"   title="Sound Effects engine">SFX</span>
     </div>
     <span class="badge" id="model-badge">connecting…</span>
   </div>
@@ -56,9 +57,10 @@
   <button class="tab"        data-tab="maker"      role="tab"><span class="tab-emoji">🎛️</span> Voice Maker<span class="tab-key">2</span></button>
   <button class="tab"        data-tab="synthesize" role="tab"><span class="tab-emoji">🗣️</span> Synthesize<span class="tab-key">3</span></button>
   <button class="tab"        data-tab="music"      role="tab"><span class="tab-emoji">🎵</span> Music<span class="tab-key">4</span></button>
-  <button class="tab"        data-tab="voices"     role="tab"><span class="tab-emoji">🎭</span> Voices<span class="tab-key">5</span></button>
-  <button class="tab"        data-tab="clips"      role="tab"><span class="tab-emoji">🎬</span> Clips<span class="tab-key">6</span></button>
-  <button class="tab"        data-tab="models"     role="tab"><span class="tab-emoji">📦</span> Models<span class="tab-key">7</span></button>
+  <button class="tab"        data-tab="sfx"        role="tab"><span class="tab-emoji">🔊</span> SFX<span class="tab-key">5</span></button>
+  <button class="tab"        data-tab="voices"     role="tab"><span class="tab-emoji">🎭</span> Voices<span class="tab-key">6</span></button>
+  <button class="tab"        data-tab="clips"      role="tab"><span class="tab-emoji">🎬</span> Clips<span class="tab-key">7</span></button>
+  <button class="tab"        data-tab="models"     role="tab"><span class="tab-emoji">📦</span> Models<span class="tab-key">8</span></button>
 </nav>
 
 <main class="shell">
@@ -479,6 +481,57 @@
     </div>
   </section>
 
+  <!-- ════════════════ SFX (MOSS Sound Effects) ════════════════ -->
+  <section class="panel" id="tab-sfx">
+    <div class="panel-grid">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>Sound Effects</h2>
+            <p class="card-sub">Text → audio via MOSS-SoundEffect v2 (flow-matching DiT + DAC VAE). Describe any sound and generate it.</p>
+          </div>
+        </div>
+
+        <div class="preset-chips" id="sfx-presets">
+          <button type="button" class="chip" data-prompt="heavy thunder crack with rain pouring on a metal roof">⛈️ Thunder</button>
+          <button type="button" class="chip" data-prompt="dog barking loudly outdoors, multiple barks">🐕 Dog Bark</button>
+          <button type="button" class="chip" data-prompt="door creaking open slowly, old wooden door">🚪 Door Creak</button>
+          <button type="button" class="chip" data-prompt="glass shattering on the floor, sharp crash">💥 Glass Break</button>
+          <button type="button" class="chip" data-prompt="crowd cheering and clapping at a concert">👏 Crowd</button>
+          <button type="button" class="chip" data-prompt="alarm clock ringing, persistent electronic beep">⏰ Alarm</button>
+          <button type="button" class="chip" data-prompt="waves crashing on the beach, ocean sounds">🌊 Ocean</button>
+          <button type="button" class="chip" data-prompt="fire crackling in a fireplace, warm campfire">🔥 Fire</button>
+        </div>
+
+        <textarea id="sfx-text" rows="3"
+          placeholder="Describe the sound effect you want…">heavy thunder crack with rain pouring on a metal roof</textarea>
+
+        <div class="form-row">
+          <label>Duration <span class="hint">(seconds)</span></label>
+          <input type="number" id="sfx-dur" value="5" min="1" max="30" step="1" class="num">
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="sfx-btn" type="button">🔊 Generate SFX</button>
+          <button class="btn btn-ghost" id="sfx-download" type="button" disabled>⬇️ Download</button>
+        </div>
+        <div class="status" id="sfx-status"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Preview</h2></div>
+        <div class="player-area" id="sfx-player">
+          <div class="player-empty">
+            <div class="eq-bars" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div>Generated sound effects appear here</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- ════════════════ VOICES LIBRARY ════════════════ -->
   <section class="panel" id="tab-voices">
     <div class="card">
@@ -502,6 +555,26 @@
       <div class="voices-grid" id="voices-list">
         <div class="empty"><div class="empty-icon">🎭</div><div class="empty-title">Loading voices…</div></div>
       </div>
+    </div>
+
+    <!-- PCA Voice Space Analysis -->
+    <div class="card" style="margin-top: 1em;">
+      <div class="card-head">
+        <div>
+          <h2>📊 Voice Space Analysis</h2>
+          <p class="card-sub">PCA decomposes the embedding space into principal axes of variation. Each axis captures a voice characteristic (e.g. gender, age). Save axes as <code>.dir</code> files to use them as steering vectors in Voice Maker.</p>
+        </div>
+        <div style="display:flex;gap:0.5em;align-items:center">
+          <label class="hint">PCs</label>
+          <input type="number" id="pca-ncomp" value="10" min="2" max="30" class="num" style="width:60px">
+          <label class="hint">Clusters</label>
+          <input type="number" id="pca-nclu" value="5" min="2" max="10" class="num" style="width:60px">
+          <button class="btn btn-primary" id="pca-btn" type="button">📊 Analyze</button>
+        </div>
+      </div>
+      <div class="status" id="pca-status"></div>
+      <div id="pca-plot"></div>
+      <div id="pca-details"></div>
     </div>
   </section>
 

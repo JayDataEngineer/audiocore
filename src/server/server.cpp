@@ -1530,6 +1530,69 @@ std::shared_ptr<httplib::Server> build_server(
                 resp["norm"] = norm;
                 res.set_content(resp.dump(), "application/json");
             });
+
+            // POST /v1/voices/analyze — PCA + K-means cluster analysis of all
+            // .voice files.  Calls scripts/pca_voices.py and returns JSON with
+            // voice projections, cluster assignments, PC extremes, and
+            // explained-variance ratios.  Optionally saves principal-component
+            // directions as .dir files for use as steering vectors.
+            //   { components?: 10, clusters?: 5, save_dirs?: false }
+            svr->Post("/v1/voices/analyze",
+                      [voices_dir](const httplib::Request& req, httplib::Response& res) {
+                json body;
+                try { body = json::parse(req.body); } catch (...) { body = json::object(); }
+                int n_comp = body.value("components", 10);
+                int n_clu  = body.value("clusters", 5);
+                bool save_dirs = body.value("save_dirs", false);
+
+                // Locate pca_voices.py by walking up from voices_dir.
+                namespace fs = std::filesystem;
+                std::string script_path;
+                for (fs::path p = fs::path(voices_dir); !p.empty();
+                     p = p.parent_path()) {
+                    auto candidate = p / "scripts" / "pca_voices.py";
+                    if (fs::exists(candidate)) {
+                        script_path = candidate.string();
+                        break;
+                    }
+                }
+                if (script_path.empty()) {
+                    res.status = 500;
+                    json e = {{"error", "scripts/pca_voices.py not found — "
+                                        "ensure the script exists in the project tree"}};
+                    res.set_content(e.dump(), "application/json");
+                    return;
+                }
+
+                // Build command and capture stdout.
+                std::ostringstream cmd;
+                cmd << "python3 '" << script_path << "'"
+                    << " --voices-dir '" << voices_dir << "'"
+                    << " --components " << n_comp
+                    << " --clusters " << n_clu
+                    << " --json";
+                if (save_dirs) cmd << " --save-dirs";
+
+                FILE* pipe = popen(cmd.str().c_str(), "r");
+                if (!pipe) {
+                    res.status = 500;
+                    json e = {{"error", "failed to start python3"}};
+                    res.set_content(e.dump(), "application/json");
+                    return;
+                }
+                std::string output;
+                char buf[4096];
+                while (fgets(buf, sizeof(buf), pipe)) output += buf;
+                int rc = pclose(pipe);
+                if (rc != 0) {
+                    res.status = 500;
+                    json e = {{"error", "pca_voices.py exited " + std::to_string(rc)},
+                              {"output", output}};
+                    res.set_content(e.dump(), "application/json");
+                    return;
+                }
+                res.set_content(output, "application/json");
+            });
         }
     }
 
