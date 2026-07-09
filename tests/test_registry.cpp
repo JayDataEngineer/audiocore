@@ -14,7 +14,7 @@ namespace {
 // A throwaway family so we can register/create without loading real weights.
 class DummySession : public Session {
 public:
-    std::string family_name() const override { return "dummy"; }
+    std::string family() const override { return "dummy"; }
     bool load(const std::string&, const LoadOptions&, const BackendConfig&,
               std::string* = nullptr) override { return true; }
 };
@@ -30,7 +30,7 @@ AUDIOCORE_TEST(register_then_create_returns_session) {
     reg.register_family("dummy_under_test", make_dummy);
     auto sess = reg.create("dummy_under_test");
     AUDIOCORE_CHECK(sess != nullptr);
-    AUDIOCORE_CHECK_EQ(sess->family_name(), std::string("dummy"));
+    AUDIOCORE_CHECK_EQ(sess->family(), std::string("dummy"));
 }
 
 AUDIOCORE_TEST(create_unknown_family_returns_null) {
@@ -48,7 +48,7 @@ AUDIOCORE_TEST(reregister_overwrites_factory) {
     });
     class OtherSession : public Session {
     public:
-        std::string family_name() const override { return "other"; }
+        std::string family() const override { return "other"; }
         bool load(const std::string&, const LoadOptions&, const BackendConfig&,
                   std::string* = nullptr) override { return true; }
     };
@@ -57,7 +57,7 @@ AUDIOCORE_TEST(reregister_overwrites_factory) {
     });
     auto sess = reg.create("dummy_overwrite");
     AUDIOCORE_CHECK(sess != nullptr);
-    AUDIOCORE_CHECK_EQ(sess->family_name(), std::string("other"));
+    AUDIOCORE_CHECK_EQ(sess->family(), std::string("other"));
 }
 
 AUDIOCORE_TEST(list_contains_registered_family) {

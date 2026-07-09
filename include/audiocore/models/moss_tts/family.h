@@ -68,7 +68,7 @@ struct MossConfig {
 class MossSession : public Session {
 public:
     ~MossSession() override;
-    std::string family_name() const override { return "moss_tts"; }
+    std::string family() const override { return "moss_tts"; }
     bool load(const std::string& model_path,
               const LoadOptions& opts,
               const BackendConfig& backend_cfg,

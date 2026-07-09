@@ -1,5 +1,11 @@
 // session.h — loaded model + task session.
 //
+// Session IS-A IOfflineTaskSession. There is one session hierarchy, not two.
+// Family implementations (Qwen3TtsSession, AceStepSession, MossSession, etc.)
+// inherit from Session, which provides load() + family() + run_tts() +
+// run_music() + compute_embedding(). The server holds IOfflineTaskSession*
+// and calls through the virtual interface — no adapter layer.
+//
 // One Session per (model_path, load_options) pair. Owns the WeightLoader,
 // the Backend, and whatever graph / KV cache / codec state the family
 // needs. Multiple concurrent requests on the same Session serialize
@@ -11,10 +17,12 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "audiocore/framework/core/backend.h"
 #include "audiocore/framework/io/weight_loader.h"
+#include "audiocore/framework/runtime/registry.h"  // IOfflineTaskSession
 
 namespace audiocore {
 
@@ -26,12 +34,26 @@ struct LoadOptions {
     std::unordered_map<std::string, std::string> extras;
 };
 
-class Session {
+// Session is the concrete base for every family implementation. It inherits
+// the task interface from IOfflineTaskSession so the server can hold
+// IOfflineTaskSession* directly — no adapter, no forwarding, one hierarchy.
+class Session : public IOfflineTaskSession {
 public:
-    virtual ~Session() = default;
+    // --- ITaskSession overrides ---
+    // family() is the identity method; subclasses must implement it.
+    // task_kind() defaults to Tts; families that do something else override.
+    VoiceTaskKind task_kind() const override { return VoiceTaskKind::Tts; }
 
-    // family_name is what FamilyRegistry used to construct this instance.
-    virtual std::string family_name() const = 0;
+    // --- IOfflineTaskSession overrides (default implementations) ---
+    // These mirror the old virtuals with default "not supported" behavior.
+    // Families override the ones they implement.
+    bool run_tts(const void* request, void* response,
+                 std::string* error = nullptr) override { return false; }
+    bool run_music(const void* request, void* response,
+                   std::string* error = nullptr) override { return false; }
+    using IOfflineTaskSession::compute_embedding;  // inherit default impl
+
+    // --- Session-only methods (not part of IOfflineTaskSession) ---
 
     // Load weights via a WeightLoader chosen by file magic. The session
     // then asks the loader for the tensors it needs (by name) and builds
@@ -41,39 +63,12 @@ public:
                       const BackendConfig& backend_cfg,
                       std::string* error = nullptr) = 0;
 
-    // Task entry points. Not every family implements every task — MOSS
-    // implements tts/clon/sfx, ACE-Step implements music generation. The
-    // server dispatches by task name → method.
-    //
-    // Concrete I/O structs live in
-    // include/audiocore/framework/runtime/tasks.h. TtsRequest/TtsResponse
-    // are shared across every TTS family; MusicRequest/MusicResponse are
-    // defined in ace_step/family.h (the only music family).
-    //
-    // Scope: TTS + music generation + VAD. ASR / transcription is explicitly
-    // out of scope — those go through CrispASR / whisper.cpp upstream, not
-    // here.
-    virtual bool run_tts(const void* request, void* response,
-                         std::string* error = nullptr)   { return false; }
-    virtual bool run_music(const void* request, void* response,
-                           std::string* error = nullptr) { return false; }
-
     // Voice Activity Detection. Optional — only the silero_vad family
     // implements this currently (MarbleNet VAD will slot in here too when
     // ported). Same void*-erasure pattern as run_tts / run_music: caller
     // casts to VadRequest/VadResponse from tasks.h.
     virtual bool run_vad(const void* request, void* response,
                          std::string* error = nullptr)   { return false; }
-
-    // Compute a speaker embedding from a reference WAV, for later reuse via
-    // TtsRequest.speaker_embedding (the voice-caching pattern: compute once,
-    // save, reuse across many calls). Currently only qwen3_tts implements
-    // this (ECAPA-TDNN encoder); other families return empty + error.
-    virtual std::vector<float> compute_embedding(const std::string& wav_path,
-                                                  std::string* error = nullptr) {
-        if (error) *error = "compute_embedding not supported by this family";
-        return {};
-    }
 
     bool loaded() const { return loaded_; }
 

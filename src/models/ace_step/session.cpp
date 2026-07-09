@@ -310,7 +310,7 @@ static constexpr int32_t TOKEN_IM_END    = 151645;   // EOS / turn end
 static constexpr int32_t TOKEN_THINK     = 151667;
 static constexpr int32_t TOKEN_THINK_END = 151668;
 static constexpr int32_t AUDIO_CODE_BASE = 151669;   // first audio code token ID
-static constexpr int32_t FSQ_CODE_COUNT  = 64000;     // valid FSQ codes (levels [8,8,8,5,5,5])
+static constexpr int32_t FSQ_CODE_COUNT  = 65535;     // AUDIO_CODE_COUNT — match ref-acestep/src/prompt.h:21
 
 // LM_INSTRUCTION — matches ref-acestep/src/task-types.h:51
 static constexpr const char* LM_INSTRUCTION =
@@ -786,9 +786,6 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                                                     : normalize_timesig(req.timesignature);
     meta.vocal_language = req.vocal_language;
 
-    // Save original user caption for genre detection (before Phase 1 enrichment)
-    const std::string original_caption = req.caption;
-
     // Can we skip Phase 1? (all metadata provided by user)
     const bool skip_phase1 = (meta.bpm > 0 &&
                               !meta.keyscale.empty() &&
@@ -932,269 +929,17 @@ bool AceStepSession::run_lm(const MusicRequest& req,
         if (meta.lyrics.empty() && !parsed.lyrics.empty())
             meta.lyrics = parsed.lyrics;
 
-        // ── Caption enrichment (use_cot_caption=true, reference default) ──
-        // The reference (request.cpp:36) defaults use_cot_caption=true, meaning
-        // the LM's Phase 1 enriched caption REPLACES the user's original for
-        // Phase 2 code generation and the TE prompt. This is critical for
-        // short captions like "ROCK" — the Phase 1 reasoning expands it to a
-        // detailed description ("An energetic and raw instrumental rock track
-        // driven by a dual electric guitar attack...") which the LM uses to
-        // generate genre-appropriate codes. Without this, "ROCK" produces
-        // generic/ambient codes because the short caption lacks the detail
-        // the model needs to map to specific audio patterns.
-        //
-        // The reference's caption preservation (pipeline-lm.cpp:779-785):
-        // the LM may enrich the caption but never silently delete it. If
-        // the enriched caption is empty, keep the original.
-        //
-        // LYRICS-AWARE FIX: The Q8_0 LM's Phase 1 reasoning frequently
-        // generates "instrumental" descriptions even when the user provides
-        // lyrics — it doesn't attend to the # Lyric section. This causes the
-        // enriched caption to say "instrumental", which tells Phase 2 and the
-        // DiT to produce instrumental audio (no vocals). When the user provides
-        // lyrics, we MUST ensure the enriched caption mentions vocals:
-        //   1. Remove the word "instrumental" from the enriched caption
-        //   2. If no vocal-related keyword exists, append "with vocals"
+        // ── Caption: keep user's original (no enrichment) ──
+        // The user provides their own detailed caption. Phase 1 is used ONLY
+        // for metadata inference (bpm, keyscale, timesig, duration, language).
+        // The user's caption is passed directly to Phase 2 and the DiT without
+        // any LM-generated enrichment. Users who want richer prompts can use
+        // an external AI to expand their caption before pasting it in.
         if (!parsed.caption.empty()) {
-            fprintf(stderr, "[ace_step] run_lm: caption enrichment:\n"
-                            "  original:   '%s'\n"
+            fprintf(stderr, "[ace_step] run_lm: Phase 1 enriched caption (NOT used):\n"
+                            "  user's:     '%s'\n"
                             "  phase1 gen: '%s'\n",
                     meta.caption.c_str(), parsed.caption.c_str());
-            meta.caption = parsed.caption;
-        } else {
-            fprintf(stderr, "[ace_step] run_lm: Phase 1 produced no caption; "
-                            "keeping user's original: '%s'\n",
-                    meta.caption.c_str());
-
-            // ── MANUAL CAPTION ENRICHMENT (short caption fallback) ──────
-            // The Q8_0 LM's Phase 1 reasoning frequently fails to generate
-            // a caption for short inputs like "rock" or "metal". Without a
-            // detailed description, Phase 2 generates generic/electronic codes
-            // regardless of genre. When the user's caption is short (< 80 chars)
-            // and Phase 1 didn't enrich it, we manually expand it with genre-
-            // specific instrument descriptions. This gives Phase 2 enough context
-            // to generate genre-appropriate codes.
-            if (meta.caption.size() < 80) {
-                std::string lower = meta.caption;
-                for (auto& ch : lower) ch = (char)tolower(ch);
-
-                std::string genre_desc;
-                auto has = [&](const std::string& kw) {
-                    return lower.find(kw) != std::string::npos;
-                };
-
-                // When lyrics are provided, append "singing the lyrics" to make
-                // the vocal directive explicit and match the training distribution.
-                const char* vocal_suffix = !meta.lyrics.empty()
-                    ? " singing the lyrics" : "";
-
-                if (has("metal") || has("metalcore") || has("deathcore")) {
-                    genre_desc = "A heavy metal track with high-gain distorted "
-                                 "electric guitars playing aggressive riffs, fast "
-                                 "double-kick drums, heavy bass guitar, and intense "
-                                 "powerful vocals" + std::string(vocal_suffix);
-                } else if (has("rock") || has("punk") || has("grunge")) {
-                    genre_desc = "An energetic rock track with distorted electric "
-                                 "guitars playing power chords and riffs, driving "
-                                 "drum beats, bass guitar, and powerful vocals"
-                                 + std::string(vocal_suffix);
-                } else if (has("edm") || has("electronic") || has("house") ||
-                           has("techno") || has("trance") || has("dubstep")) {
-                    genre_desc = "An electronic dance track with synthesizers, "
-                                 "punchy drum beats, bass drops, and energetic "
-                                 "vocal hooks" + std::string(vocal_suffix);
-                } else if (has("jazz")) {
-                    genre_desc = "A jazz track with saxophone, piano, double bass, "
-                                 "brush drums, and smooth vocals"
-                                 + std::string(vocal_suffix);
-                } else if (has("classical") || has("orchestral")) {
-                    genre_desc = "A classical piece with strings, woodwinds, brass, "
-                                 "and orchestral percussion";
-                } else if (has("country") || has("folk") || has("acoustic")) {
-                    genre_desc = "A country folk track with acoustic guitar, fiddle, "
-                                 "banjo, gentle drums, and warm vocals"
-                                 + std::string(vocal_suffix);
-                } else if (has("blues")) {
-                    genre_desc = "A blues track with electric guitar, harmonica, "
-                                 "bass, drums, and soulful vocals"
-                                 + std::string(vocal_suffix);
-                } else if (has("hip") || has("rap") || has("r&b") || has("soul")) {
-                    genre_desc = "A hip-hop R&B track with beats, bass, synthesizers, "
-                                 "and rhythmic vocals" + std::string(vocal_suffix);
-                } else if (has("pop")) {
-                    genre_desc = "A pop song with catchy melody, synthesizers, "
-                                 "drum machine, bass, and clear vocals"
-                                 + std::string(vocal_suffix);
-                } else if (has("ambient") || has("chill") || has("lo-fi")) {
-                    genre_desc = "An ambient chill track with soft synthesizers, "
-                                 "gentle piano, light percussion, and dreamy vocals"
-                                 + std::string(vocal_suffix);
-                } else if (has("reggae")) {
-                    genre_desc = "A reggae track with off-beat guitar chords, bass, "
-                                 "drums, and laid-back vocals"
-                                 + std::string(vocal_suffix);
-                } else if (has("funk")) {
-                    genre_desc = "A funk track with syncopated bass, wah guitar, "
-                                 "horns, drums, and energetic vocals"
-                                 + std::string(vocal_suffix);
-                }
-
-                if (!genre_desc.empty()) {
-                    meta.caption = genre_desc;
-                    fprintf(stderr, "[ace_step] run_lm: manual caption enrichment: "
-                                    "'%s'\n", meta.caption.c_str());
-
-                    // ── GENRE-APPROPRIATE METADATA ──────────────────────
-                    // Phase 1's metadata is often wrong for short captions
-                    // (e.g. bpm=100 timesig=2 for "rock"). Set genre-appropriate
-                    // defaults that match the enriched caption. These are only
-                    // applied when the USER didn't provide them — user values
-                    // always take priority.
-                    auto set_meta_if_user_blank = [&](int32_t bpm_val,
-                                                       const char* key_str,
-                                                       const char* ts_str) {
-                        if (req.bpm == 0) {
-                            meta.bpm = bpm_val;
-                        }
-                        if (req.keyscale.empty()) {
-                            meta.keyscale = key_str;
-                        }
-                        if (req.timesignature.empty()) {
-                            meta.timesignature = ts_str;
-                        }
-                    };
-
-                    if (has("metal") || has("metalcore") || has("deathcore")) {
-                        set_meta_if_user_blank(140, "D minor", "4");
-                    } else if (has("rock") || has("punk") || has("grunge")) {
-                        set_meta_if_user_blank(128, "E minor", "4");
-                    } else if (has("edm") || has("electronic") || has("house") ||
-                               has("techno") || has("trance") || has("dubstep")) {
-                        set_meta_if_user_blank(128, "A minor", "4");
-                    } else if (has("jazz")) {
-                        set_meta_if_user_blank(120, "Bb major", "4");
-                    } else if (has("classical") || has("orchestral")) {
-                        set_meta_if_user_blank(90, "C major", "4");
-                    } else if (has("country") || has("folk") || has("acoustic")) {
-                        set_meta_if_user_blank(100, "G major", "4");
-                    } else if (has("blues")) {
-                        set_meta_if_user_blank(100, "A minor", "4");
-                    } else if (has("hip") || has("rap") || has("r&b") || has("soul")) {
-                        set_meta_if_user_blank(90, "F# minor", "4");
-                    } else if (has("pop")) {
-                        set_meta_if_user_blank(120, "C major", "4");
-                    } else if (has("reggae")) {
-                        set_meta_if_user_blank(80, "Bb major", "4");
-                    } else if (has("funk")) {
-                        set_meta_if_user_blank(110, "D minor", "4");
-                    }
-                    fprintf(stderr, "[ace_step] run_lm: genre-aware metadata: "
-                                    "bpm=%d keyscale='%s' timesig='%s'\n",
-                            meta.bpm, meta.keyscale.c_str(),
-                            meta.timesignature.c_str());
-                }
-            }
-        }
-
-        // ── LYRICS-AWARE VOCAL ENFORCEMENT (always runs) ──────────────────────
-        // The Q8_0 LM's Phase 1 reasoning frequently generates "instrumental"
-        // descriptions even when the user provides lyrics — it doesn't attend to
-        // the # Lyric section. Whether the caption came from Phase 1 enrichment
-        // or the user's original input, when lyrics are present we MUST ensure
-        // the caption explicitly mentions vocals so Phase 2 code generation and
-        // the DiT both produce vocal content:
-        //   1. Remove the word "instrumental" (case-insensitive)
-        //   2. If no vocal-related keyword remains, append an explicit vocal
-        //      directive
-        if (!meta.lyrics.empty()) {
-            std::string c = meta.caption;
-            std::string lower = c;
-            for (auto& ch : lower) ch = (char)tolower(ch);
-
-            // Remove every occurrence of "instrumental"
-            {
-                const std::string kInstr = "instrumental";
-                size_t pos = 0;
-                while ((pos = lower.find(kInstr, pos)) != std::string::npos) {
-                    c.erase(pos, kInstr.size());
-                    lower.erase(pos, kInstr.size());
-                }
-                // Collapse double spaces and trim leading punctuation/space
-                for (size_t i = 0; i + 1 < c.size(); ) {
-                    if (c[i] == ' ' && c[i+1] == ' ') {
-                        c.erase(i, 1);
-                        lower.erase(i, 1);
-                    } else { i++; }
-                }
-                while (!c.empty() && (c.front() == ' ' || c.front() == ',' ||
-                                      c.front() == '-' || c.front() == '.')) {
-                    c.erase(0, 1); lower.erase(0, 1);
-                }
-                while (!c.empty() && (c.back()  == ' ' || c.back()  == ',' ||
-                                      c.back()  == '-')) {
-                    c.pop_back(); lower.pop_back();
-                }
-            }
-
-            // Recompute lower AFTER modifications, then check for vocal keywords.
-            // Use WORD-BOUNDARY matching to avoid false positives:
-            //   "rap" must NOT match "rapid", "wrap"
-            //   "sing" must NOT match "single", "bursting"
-            //   "voice" must NOT match "voices" (which is fine, actually)
-            // A keyword matches if it's surrounded by non-alphanumeric chars
-            // (or string start/end).
-            lower = c;
-            for (auto& ch : lower) ch = (char)tolower(ch);
-            auto is_word_boundary = [](const std::string& s, size_t pos) {
-                if (pos == 0 || pos >= s.size()) return true;
-                char c = s[pos];
-                return !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));
-            };
-            auto contains_word = [&](const std::string& haystack,
-                                     const std::string& needle) -> bool {
-                if (needle.empty()) return false;
-                size_t pos = 0;
-                while ((pos = haystack.find(needle, pos)) != std::string::npos) {
-                    bool left_ok  = (pos == 0) ||
-                                    !((haystack[pos-1] >= 'a' && haystack[pos-1] <= 'z') ||
-                                      (haystack[pos-1] >= '0' && haystack[pos-1] <= '9'));
-                    size_t right_pos = pos + needle.size();
-                    bool right_ok = (right_pos >= haystack.size()) ||
-                                    !((haystack[right_pos] >= 'a' && haystack[right_pos] <= 'z') ||
-                                      (haystack[right_pos] >= '0' && haystack[right_pos] <= '9'));
-                    if (left_ok && right_ok) return true;
-                    pos++;
-                }
-                return false;
-            };
-            bool has_vocal_kw = false;
-            for (const char* kw : {"vocal", "vocals", "sing", "sings",
-                                   "singing", "singer", "singers",
-                                   "voice", "voices", "chorus", "choir",
-                                   "rap", "rapping", "rapper",
-                                   "shout", "shouting",
-                                   "spoken", "whisper", "whispering",
-                                   "chant", "chanting"}) {
-                if (contains_word(lower, kw)) {
-                    has_vocal_kw = true;
-                    fprintf(stderr, "[ace_step] run_lm: vocal keyword found: "
-                                    "'%s'\n", kw);
-                    break;
-                }
-            }
-            if (!has_vocal_kw) {
-                // Avoid double period if caption already ends with "."
-                if (!c.empty() && c.back() == '.') {
-                    c += " Featuring a singer performing the provided lyrics with vocals";
-                } else {
-                    c += ". Featuring a singer performing the provided lyrics with vocals";
-                }
-            }
-            fprintf(stderr, "[ace_step] run_lm: lyrics-aware caption fix:\n"
-                            "  before: '%s'\n"
-                            "  after:  '%s'\n",
-                    meta.caption.c_str(), c.c_str());
-            meta.caption = c;
         }
 
         fprintf(stderr, "[ace_step] run_lm: Phase 1 parsed: bpm=%d duration=%.0f "
@@ -1214,63 +959,6 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                     "keyscale='%s' timesig='%s' lang='%s'\n",
             meta.bpm, meta.duration, meta.keyscale.c_str(),
             meta.timesignature.c_str(), meta.vocal_language.c_str());
-
-    // ── GENRE-AWARE METADATA OVERRIDE (always runs) ──────────────────────
-    // Phase 1's metadata inference is often wrong for short captions
-    // (e.g. bpm=100, keyscale='B♭ minor' for "metal" — should be bpm=140,
-    // D minor). When the user didn't provide explicit metadata AND the
-    // original caption is short enough to benefit from genre defaults,
-    // override with genre-appropriate values. This ensures the CoT YAML
-    // and TE prompt have correct musical context regardless of Phase 1's
-    // quality. User-provided values ALWAYS take priority.
-    if (original_caption.size() < 80) {
-        std::string gl = original_caption;
-        for (auto& ch : gl) ch = (char)tolower(ch);
-        auto ghas = [&](const std::string& kw) { return gl.find(kw) != std::string::npos; };
-
-        int32_t genre_bpm = 0;
-        const char* genre_key = nullptr;
-        const char* genre_ts = "4";
-        bool genre_found = false;
-
-        if (ghas("metal") || ghas("metalcore") || ghas("deathcore")) {
-            genre_bpm = 140; genre_key = "D minor"; genre_found = true;
-        } else if (ghas("rock") || ghas("punk") || ghas("grunge")) {
-            genre_bpm = 128; genre_key = "E minor"; genre_found = true;
-        } else if (ghas("edm") || ghas("electronic") || ghas("house") ||
-                   ghas("techno") || ghas("trance") || ghas("dubstep")) {
-            genre_bpm = 128; genre_key = "A minor"; genre_found = true;
-        } else if (ghas("jazz")) {
-            genre_bpm = 120; genre_key = "Bb major"; genre_found = true;
-        } else if (ghas("country") || ghas("folk") || ghas("acoustic")) {
-            genre_bpm = 100; genre_key = "G major"; genre_found = true;
-        } else if (ghas("blues")) {
-            genre_bpm = 100; genre_key = "A minor"; genre_found = true;
-        } else if (ghas("hip") || ghas("rap") || ghas("r&b") || ghas("soul")) {
-            genre_bpm = 90; genre_key = "F# minor"; genre_found = true;
-        } else if (ghas("pop")) {
-            genre_bpm = 120; genre_key = "C major"; genre_found = true;
-        } else if (ghas("reggae")) {
-            genre_bpm = 80; genre_key = "Bb major"; genre_found = true;
-        } else if (ghas("funk")) {
-            genre_bpm = 110; genre_key = "D minor"; genre_found = true;
-        }
-
-        if (genre_found) {
-            if (req.bpm == 0 && meta.bpm != genre_bpm) {
-                meta.bpm = genre_bpm;
-            }
-            if (req.keyscale.empty() && genre_key) {
-                meta.keyscale = genre_key;
-            }
-            if (req.timesignature.empty()) {
-                meta.timesignature = genre_ts;
-            }
-            fprintf(stderr, "[ace_step] run_lm: genre-aware metadata override: "
-                            "bpm=%d keyscale='%s' timesig='%s'\n",
-                    meta.bpm, meta.keyscale.c_str(), meta.timesignature.c_str());
-        }
-    }
 
     // ════════════════════════════════════════════════════════════════════════
     //  TE Encoding (DEFERRED from above — now uses enriched metadata)
@@ -1411,13 +1099,6 @@ bool AceStepSession::run_lm(const MusicRequest& req,
     fprintf(stderr, "[ace_step] run_lm: Phase 2 prefill done (%d tokens)\n", p2_len);
 
     // ── Sample codes (codes_phase = true from the very first token) ──
-    // CRITICAL: Re-seed the RNG before Phase 2. Phase 1's free-form reasoning
-    // consumes random numbers from the shared RNG, which shifts Phase 2's
-    // sampling distribution. This makes the same seed produce DIFFERENT codes
-    // depending on whether Phase 1 ran. By re-seeding here, Phase 2 is fully
-    // deterministic for a given seed regardless of Phase 1's execution.
-    rng = PhiloxRng{req.seed != 0 ? req.seed : 42};
-
     const int32_t n_codes = std::max(1, static_cast<int32_t>(meta.duration * 5.0f + 0.5f));
     music_codes->clear();
     music_codes->reserve(static_cast<size_t>(n_codes));
@@ -1527,39 +1208,6 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                         code_logits[k].first);
             }
             fprintf(stderr, "\n");
-        }
-
-        // ── Anti-collapse: quadratic count-based repetition penalty ──────
-        // The Q8_0 quantized LM has a tendency to collapse to a single
-        // "default" code after ~10 steps (verified: seeds 42/12345/777 all
-        // collapse to one code at 60-72% frequency). Code logits are in the
-        // 60-70 range, so a small linear penalty (2.0*count) is insufficient
-        // — the collapsing code still wins after subtracting 16.0 from 65.0.
-        //
-        // QUADRATIC penalty: penalty = min(60, 3.0 * count²)
-        //   1 occurrence →  3.0  (mild — allows musical patterns)
-        //   2 occurrences → 12.0 (strong — discourages triplets)
-        //   3 occurrences → 27.0 (very strong — prevents quadruplets)
-        //   4 occurrences → 48.0 (near-ban)
-        //   5+ occurrences → 60.0 (total ban — logit drops from ~65 to ~5)
-        //
-        // Window size 12 (was 8) catches longer repetition cycles.
-        {
-            const int32_t n_codes_so_far = static_cast<int32_t>(music_codes->size());
-            const int32_t window = std::min(12, n_codes_so_far);
-            // Count occurrences of each code in the window
-            std::unordered_map<int32_t, int> code_count;
-            for (int32_t k = 0; k < window; k++) {
-                int32_t recent_code = (*music_codes)[n_codes_so_far - 1 - k];
-                code_count[recent_code]++;
-            }
-            // Apply quadratic penalty proportional to occurrence count
-            for (auto& kv : code_count) {
-                int32_t idx = AUDIO_CODE_BASE + kv.first;
-                float cnt = static_cast<float>(kv.second);
-                float penalty = std::min(60.0f, 3.0f * cnt * cnt);
-                logits[idx] -= penalty;
-            }
         }
 
         mask_to_codes(logits.data(), vs);

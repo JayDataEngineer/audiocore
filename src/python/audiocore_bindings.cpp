@@ -111,8 +111,8 @@ public:
         return {std::move(resp.pcm_mono), resp.sampling_rate};
     }
 
-    std::string family_name() const {
-        return session_->family_name();
+    std::string family() const {
+        return session_->family();
     }
 
     // Compute a speaker embedding from a WAV file, for the voice-caching
@@ -189,7 +189,7 @@ PYBIND11_MODULE(audiocore, m) {
              "ECAPA-TDNN vector — bypasses reference_audio load + ECAPA. "
              "Voice-caching pattern: compute once, reuse across many calls.")
 
-        .def("family_name", &PythonSession::family_name,
+        .def("family", &PythonSession::family,
              "Get the model family name.")
 
         .def("compute_embedding", &PythonSession::compute_embedding,

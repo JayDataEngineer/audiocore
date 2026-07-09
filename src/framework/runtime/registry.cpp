@@ -42,36 +42,16 @@ FamilyRegistrar::FamilyRegistrar(const std::string& name, FamilyFactory factory)
     FamilyRegistry::instance().register_family(name, std::move(factory));
 }
 
-// ── Adapter: wrap an existing family's Session into the new interfaces ─────
+// ── LoadedModel: owns a Session, exposes it via IOfflineTaskSession* ───────
+// No adapter needed — Session IS-A IOfflineTaskSession. The model owns the
+// session; create_session() returns a non-owning pointer. The caller must
+// keep the ILoadedModel alive for as long as it uses the session pointer.
 
 namespace {
 
-class OfflineSessionAdapter final : public IOfflineTaskSession {
+class LoadedModel final : public ILoadedModel {
 public:
-    OfflineSessionAdapter(Session* session, std::string family)
-        : session_(session), family_(std::move(family)) {}
-
-    std::string family() const override { return family_; }
-    VoiceTaskKind task_kind() const override { return VoiceTaskKind::Tts; }
-
-    bool run_tts(const void* request, void* response,
-                 std::string* error) override {
-        return session_->run_tts(request, response, error);
-    }
-
-    bool run_music(const void* request, void* response,
-                   std::string* error) override {
-        return session_->run_music(request, response, error);
-    }
-
-private:
-    Session* session_;
-    std::string family_;
-};
-
-class LoadedModelAdapter final : public ILoadedModel {
-public:
-    LoadedModelAdapter(
+    LoadedModel(
         std::unique_ptr<Session> session,
         ModelMetadata metadata,
         CapabilitySet capabilities)
@@ -82,7 +62,7 @@ public:
     const ModelMetadata& metadata() const noexcept override { return metadata_; }
     const CapabilitySet& capabilities() const noexcept override { return capabilities_; }
 
-    std::unique_ptr<IOfflineTaskSession> create_session(
+    IOfflineTaskSession* create_session(
         const TaskSpec& task,
         const SessionOptions& options) const override;
 
@@ -214,7 +194,7 @@ public:
         // Infer capabilities from inspect().
         auto ins = inspect(request);
 
-        return std::make_unique<LoadedModelAdapter>(
+        return std::make_unique<LoadedModel>(
             std::move(session), std::move(meta), std::move(ins.capabilities));
     }
 
@@ -224,14 +204,14 @@ private:
 
 }  // namespace
 
-// Out-of-line definition now that both LoadedModelAdapter and
-// OfflineSessionAdapter are complete types.
-std::unique_ptr<IOfflineTaskSession> LoadedModelAdapter::create_session(
+// Session IS-A IOfflineTaskSession — just return the raw pointer.
+// Lifetime is guaranteed by the ILoadedModel that owns the session.
+IOfflineTaskSession* LoadedModel::create_session(
     const TaskSpec& task,
     const SessionOptions& options) const {
     (void)task;
     (void)options;
-    return std::make_unique<OfflineSessionAdapter>(session_.get(), metadata_.family);
+    return session_.get();
 }
 
 // ── ModelRegistry implementation ──────────────────────────────────────────

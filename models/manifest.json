@@ -42,47 +42,235 @@
         }
       },
       "variants": {
-        "moss-tts-q4-k-m": {
-          "display": "MOSS-TTS 8B (Q4_K_M)",
+        "moss-tts-f16": {
+          "display": "MOSS-TTS v1.5 8B (F16, converted from upstream)",
           "params_b": 8,
-          "min_vram_gb": 8,
+          "min_vram_gb": 18,
           "files": [
             {
-              "name": "backbone_gguf",
-              "filename": "MOSS_TTS_Q4_K_M.gguf",
+              "name": "codec_shard_1",
+              "filename": "model-00001-of-00002.safetensors",
               "source": {
                 "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS-GGUF",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
                 "revision": "main",
-                "filename": "MOSS_TTS_Q4_K_M.gguf"
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_shard_2",
+              "filename": "model-00002-of-00002.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_index",
+              "filename": "model.safetensors.index.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_config",
+              "filename": "config.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "upstream_shard_1",
+              "filename": "model-00001-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_shard_2",
+              "filename": "model-00002-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_shard_3",
+              "filename": "model-00003-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_shard_4",
+              "filename": "model-00004-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_index",
+              "filename": "model.safetensors.index.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "upstream_config",
+              "filename": "config.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
               }
             }
           ],
-          "extras": {
-            "moss_tts_q8_0_alt_repo": {
-              "provider": "huggingface",
-              "repo": "SecondSelf/MOSS-TTS-GGUF",
-              "revision": "main",
-              "filename": "moss-tts-q8_0.gguf"
-            },
-            "sidecar_v15_q4_km": {
-              "_comment": "Pre-built sidecar pair from smcleod/MOSS-TTS-v1.5-GGUF \u2014 backbone in X.gguf, codec+audio embeddings+LM heads in X.extras.gguf (moss.* KV namespace). Loaded as-is by audiocore; no converter needed.",
-              "provider": "huggingface",
-              "repo": "smcleod/MOSS-TTS-v1.5-GGUF",
-              "revision": "main",
-              "filename": "MOSS-TTS-v1.5-Q4_K_M.gguf",
-              "sidecar": "MOSS-TTS-v1.5-Q4_K_M.extras.gguf"
-            },
-            "sidecar_v15_q8_0_mirror": {
-              "provider": "huggingface",
-              "repo": "ilintar/moss-tts-gguf",
-              "revision": "main",
-              "filename_pattern": "moss-tts-q8_0*.gguf"
-            }
-          },
+          "status_note": "Downloads original upstream safetensors from OpenMOSS-Team/MOSS-TTS + codec from OpenMOSS-Team/MOSS-Audio-Tokenizer. convert_moss_tts.py extracts the Qwen3 backbone, runs llama.cpp's convert_hf_to_gguf.py, then writes a sidecar .extras.gguf with audio embeddings + LM heads + codec tensors. Quantize the backbone afterward with llama-quantize.",
           "server_config": {
             "family": "moss_tts",
-            "path": "${MODELS_DIR}/moss_tts/MOSS_TTS_Q4_K_M.gguf"
+            "path": "${MODELS_DIR}/moss_tts/moss-tts-f16/"
+          }
+        },
+        "moss-tts-q4-k-m": {
+          "display": "MOSS-TTS v1.5 8B (Q4_K_M, converted from upstream)",
+          "params_b": 8,
+          "min_vram_gb": 10,
+          "files": [
+            {
+              "name": "codec_shard_1",
+              "filename": "model-00001-of-00002.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_shard_2",
+              "filename": "model-00002-of-00002.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_index",
+              "filename": "model.safetensors.index.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_config",
+              "filename": "config.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "upstream_shard_1",
+              "filename": "model-00001-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_shard_2",
+              "filename": "model-00002-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_shard_3",
+              "filename": "model-00003-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_shard_4",
+              "filename": "model-00004-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_index",
+              "filename": "model.safetensors.index.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "upstream_config",
+              "filename": "config.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-TTS",
+                "revision": "main",
+                "subpath": ""
+              }
+            }
+          ],
+          "server_config": {
+            "family": "moss_tts",
+            "path": "${MODELS_DIR}/moss_tts/moss-tts-q4-k-m/"
           }
         },
         "moss-audio-tokenizer-onnx": {
@@ -122,13 +310,54 @@
           ],
           "files": [
             {
-              "name": "firstclass_gguf",
-              "filename": "moss-voicegen-q8_0.gguf",
+              "name": "codec_shard_1",
+              "filename": "model-00001-of-00002.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_shard_2",
+              "filename": "model-00002-of-00002.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_index",
+              "filename": "model.safetensors.index.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "upstream_model",
+              "filename": "model.safetensors",
               "source": {
                 "provider": "huggingface",
                 "repo": "OpenMOSS-Team/MOSS-VoiceGenerator",
                 "revision": "main",
-                "notes": "Convert from HF safetensors via pwilkin/openmoss/scripts/convert_hf_to_gguf.py: python scripts/convert_hf_to_gguf.py --moss-tts OpenMOSS-Team/MOSS-VoiceGenerator --codec OpenMOSS-Team/MOSS-Audio-Tokenizer --output weights/moss-voicegen.gguf --llama-cpp-dir /path/to/llama.cpp; then quantize: llama-quantize --token-embedding-type f16 weights/moss-voicegen.gguf weights/moss-voicegen-q8_0.gguf Q8_0"
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_config",
+              "filename": "config.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-VoiceGenerator",
+                "revision": "main",
+                "subpath": ""
               }
             }
           ],
@@ -146,23 +375,107 @@
           ],
           "files": [
             {
-              "name": "firstclass_gguf",
-              "filename": "moss-sfx.gguf",
+              "name": "codec_shard_1",
+              "filename": "model-00001-of-00002.safetensors",
               "source": {
                 "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
                 "revision": "main",
-                "notes": "Convert from HF safetensors via pwilkin/openmoss/scripts/convert_hf_to_gguf.py: python scripts/convert_hf_to_gguf.py --moss-tts OpenMOSS-Team/MOSS-SoundEffect --codec OpenMOSS-Team/MOSS-Audio-Tokenizer --output weights/moss-sfx/moss-sfx.gguf --llama-cpp-dir /path/to/llama.cpp --scratch-dir /tmp/moss-sfx-scratch"
+                "subpath": ""
               }
             },
             {
-              "name": "extras_gguf",
-              "filename": "moss-sfx.extras.gguf",
+              "name": "codec_shard_2",
+              "filename": "model-00002-of-00002.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_index",
+              "filename": "model.safetensors.index.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "codec_config",
+              "filename": "config.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "upstream_shard_1",
+              "filename": "model-00001-of-00004.safetensors",
               "source": {
                 "provider": "huggingface",
                 "repo": "OpenMOSS-Team/MOSS-SoundEffect",
                 "revision": "main",
-                "notes": "Sidecar produced alongside the backbone by convert_hf_to_gguf.py. Contains 16 audio embedding tables + 17 LM heads + codec tensors."
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_shard_2",
+              "filename": "model-00002-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_shard_3",
+              "filename": "model-00003-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_shard_4",
+              "filename": "model-00004-of-00004.safetensors",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
+                "revision": "main",
+                "subpath": ""
+              },
+              "post_process": "convert_moss_tts"
+            },
+            {
+              "name": "upstream_index",
+              "filename": "model.safetensors.index.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
+                "revision": "main",
+                "subpath": ""
+              }
+            },
+            {
+              "name": "upstream_config",
+              "filename": "config.json",
+              "source": {
+                "provider": "huggingface",
+                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
+                "revision": "main",
+                "subpath": ""
               }
             }
           ],
@@ -821,7 +1134,7 @@
       "modes": {
         "text_to_sfx": {
           "status": "wired",
-          "notes": "Flow-matching 1.3B DiT → DAC VAE decoder → PCM mono. 10s output, 50-step Euler. Requires mse2-dit.gguf + mse2-vae.gguf; qwen3-te.gguf optional."
+          "notes": "Flow-matching 1.3B DiT \u2192 DAC VAE decoder \u2192 PCM mono. 10s output, 50-step Euler. Requires mse2-dit.gguf + mse2-vae.gguf; qwen3-te.gguf optional."
         }
       },
       "variants": {

@@ -1,11 +1,16 @@
 #include <atomic>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <unordered_map>
 #include <vector>
 
@@ -19,6 +24,7 @@
 #include "audiocore/models/moss_tts/family.h"
 #include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/server/server.h"
+#include "audiocore/server/acestep_proxy.h"
 
 namespace {
 
@@ -57,6 +63,16 @@ struct ServerConfig {
     std::string model_dir;
     std::string clips_dir;
     std::vector<ConfigModel> models;
+    // Reference ace-server proxy configuration.
+    struct AceProxyCfg {
+        std::string server_url = "http://localhost:8085";
+        std::string binary;      // path to ace-server executable
+        std::string models_dir;  // directory of GGUF files for ace-server
+        std::string library_dir; // LD_LIBRARY_PATH for ace-server
+        std::vector<std::string> extra_args;
+    };
+    bool has_proxy = false;
+    AceProxyCfg proxy;
 };
 
 bool load_config(const std::string& path, ServerConfig& out) {
@@ -101,6 +117,19 @@ bool load_config(const std::string& path, ServerConfig& out) {
                 return false;
             }
             out.models.push_back(std::move(cm));
+        }
+    }
+    // Parse acestep_proxy config (reference ace-server subprocess).
+    if (j.contains("acestep_proxy") && j["acestep_proxy"].is_object()) {
+        const auto& p = j["acestep_proxy"];
+        out.has_proxy = true;
+        out.proxy.server_url  = p.value("server_url", out.proxy.server_url);
+        out.proxy.binary      = p.value("binary", "");
+        out.proxy.models_dir  = p.value("models_dir", "");
+        out.proxy.library_dir = p.value("library_dir", "");
+        if (p.contains("extra_args") && p["extra_args"].is_array()) {
+            for (const auto& a : p["extra_args"])
+                out.proxy.extra_args.push_back(a.get<std::string>());
         }
     }
     return true;
@@ -222,12 +251,38 @@ int main(int argc, char** argv) {
     // This applies to ACE-Step (turbo/base/scrag), qwen3_tts
     // (CustomVoice/VoiceDesign), and any other multi-variant family.
     // Single-model families (e.g. moss_sfx) are always eager.
+    //
+    // Models with backend="acestep_proxy" are NOT loaded locally — they are
+    // proxied to the reference ace-server. They are registered in the proxy
+    // map instead of the slots map.
     auto slots = std::make_shared<
         std::unordered_map<std::string, std::shared_ptr<ModelSlot>>>();
+    auto proxies = std::make_shared<
+        std::unordered_map<std::string, audiocore::AceStepProxyConfig>>();
     // Track which families already have an eagerly-loaded representative.
     std::set<std::string> eager_families;
 
     for (const ConfigModel& m : cfg.models) {
+        // Proxy models skip local loading entirely.
+        if (m.backend == "acestep_proxy") {
+            audiocore::AceStepProxyConfig pc;
+            pc.ace_server_url = cfg.has_proxy ? cfg.proxy.server_url : "http://localhost:8085";
+            // Extract dit_variant from extras if present.
+            auto it = m.load_options.extras.find("dit_variant");
+            if (it != m.load_options.extras.end())
+                pc.dit_variant = it->second;
+            // Extract vae_override from extras if present (ScragVAE swap-in).
+            auto vit = m.load_options.extras.find("vae_override");
+            if (vit != m.load_options.extras.end())
+                pc.vae_override = vit->second;
+            (*proxies)[m.id] = pc;
+            std::fprintf(stderr,
+                "audiocore_server: proxy '%s' → ace-server (%s, dit=%s, vae=%s)\n",
+                m.id.c_str(), pc.ace_server_url.c_str(),
+                pc.dit_variant.empty() ? "auto" : pc.dit_variant.c_str(),
+                pc.vae_override.empty() ? "default" : pc.vae_override.c_str());
+            continue;
+        }
         audiocore::ModelLoadRequest req;
         req.model_path = m.path;
         req.family_hint = m.family;
@@ -250,10 +305,9 @@ int main(int argc, char** argv) {
         if (!defer) {
             try {
                 auto loaded = registry->load(req);
-                auto session = loaded->create_session(
-                    {VoiceTaskKind::Tts}, {});
                 slot->model = std::move(loaded);
-                slot->session = std::move(session);
+                slot->session = slot->model->create_session(
+                    {VoiceTaskKind::Tts}, {});
                 slot->loaded = true;
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "load failed for '%s': %s\n",
@@ -276,15 +330,202 @@ int main(int argc, char** argv) {
             "Booting anyway; /v1/audio/* will return 404 until a model is loaded.\n");
     }
 
+    // ── Start the reference ace-server subprocess (if configured) ──────────
+    // The proxy routes /v1/audio/music for backend="acestep_proxy" models to
+    // this external process. We fork/exec it with the configured GGUF
+    // directory + LD_LIBRARY_PATH, then block until /health responds.
+    pid_t ace_server_pid = -1;
+    if (cfg.has_proxy && !cfg.proxy.binary.empty()) {
+        std::fprintf(stderr,
+            "audiocore_server: starting ace-server subprocess\n"
+            "  binary     : %s\n"
+            "  models_dir : %s\n"
+            "  server_url : %s\n",
+            cfg.proxy.binary.c_str(),
+            cfg.proxy.models_dir.c_str(),
+            cfg.proxy.server_url.c_str());
+
+        ace_server_pid = fork();
+        if (ace_server_pid < 0) {
+            std::perror("fork");
+            return 1;
+        }
+        if (ace_server_pid == 0) {
+            // ── Child process ──
+            // Set LD_LIBRARY_PATH so ace-server finds its bundled ggml backend.
+            if (!cfg.proxy.library_dir.empty()) {
+                const char* old = std::getenv("LD_LIBRARY_PATH");
+                std::string lp = cfg.proxy.library_dir;
+                if (old && *old) lp += std::string(":") + old;
+                setenv("LD_LIBRARY_PATH", lp.c_str(), 1);
+            }
+            // Parse the port out of server_url to pass via --port.
+            // ace-server listens on 8085 by default; honor the configured URL.
+            std::string port_str;
+            {
+                auto colon = cfg.proxy.server_url.rfind(':');
+                if (colon != std::string::npos) {
+                    // Strip any trailing slash from the port portion.
+                    std::string tail = cfg.proxy.server_url.substr(colon + 1);
+                    auto slash = tail.find('/');
+                    port_str = slash == std::string::npos ? tail : tail.substr(0, slash);
+                }
+            }
+
+            std::vector<std::string> argv_str;
+            argv_str.push_back(cfg.proxy.binary);
+            if (!cfg.proxy.models_dir.empty()) {
+                argv_str.push_back("--models");
+                argv_str.push_back(cfg.proxy.models_dir);
+            }
+            if (!port_str.empty()) {
+                argv_str.push_back("--port");
+                argv_str.push_back(port_str);
+            }
+            for (const auto& a : cfg.proxy.extra_args)
+                argv_str.push_back(a);
+
+            std::vector<char*> argv_c;
+            argv_c.reserve(argv_str.size() + 1);
+            for (auto& s : argv_str) argv_c.push_back(&s[0]);
+            argv_c.push_back(nullptr);
+
+            // Redirect child stdout/stderr to the parent's so ace-server logs
+            // surface in our terminal alongside our own.
+            execv(cfg.proxy.binary.c_str(), argv_c.data());
+            // execv only returns on failure.
+            std::perror("execv(ace-server)");
+            std::_Exit(127);
+        }
+
+        // ── Parent: wait for ace-server /health ──
+        audiocore::AceStepProxyConfig hc;
+        hc.ace_server_url = cfg.proxy.server_url;
+        hc.timeout_seconds = 60;
+        bool healthy = false;
+        for (int attempt = 0; attempt < 120; ++attempt) {
+            // Bail early if the child died.
+            int status = 0;
+            pid_t w = waitpid(ace_server_pid, &status, WNOHANG);
+            if (w == ace_server_pid || (w == -1 && errno != EINTR)) {
+                std::fprintf(stderr,
+                    "audiocore_server: ace-server process exited (status=%d) — "
+                    "check model paths and library_dir\n", status);
+                ace_server_pid = -1;
+                break;
+            }
+            if (audiocore::acestep_proxy_health(hc)) {
+                healthy = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (healthy) {
+            std::fprintf(stderr,
+                "audiocore_server: ace-server healthy (pid=%d)\n", ace_server_pid);
+        } else if (ace_server_pid > 0) {
+            std::fprintf(stderr,
+                "audiocore_server: WARNING — ace-server did not become healthy "
+                "within 60s; proxy requests will fail until it starts.\n");
+        }
+    } else if (!proxies->empty()) {
+        // Proxies are configured but no binary — assume ace-server runs
+        // out-of-band (managed by a supervisor / separate terminal).
+        audiocore::AceStepProxyConfig hc;
+        hc.ace_server_url = cfg.has_proxy ? cfg.proxy.server_url : "http://localhost:8085";
+        if (audiocore::acestep_proxy_health(hc)) {
+            std::fprintf(stderr,
+                "audiocore_server: ace-server already running at %s\n",
+                hc.ace_server_url.c_str());
+        } else {
+            std::fprintf(stderr,
+                "audiocore_server: WARNING — %zu proxy model(s) configured but "
+                "ace-server is not reachable at %s. Start it manually or add an "
+                "\"acestep_proxy.binary\" to the config.\n",
+                proxies->size(), hc.ace_server_url.c_str());
+        }
+    }
+
     // Pass registry + model dir so the webapp can load/unload models at runtime.
     // cfg.model_dir is the discovery scan root (may be empty in single-model mode).
-    auto svr = audiocore::build_server(slots, cfg.clips_dir, registry, cfg.model_dir);
-    svr->set_logger([](const httplib::Request& req, const httplib::Response&) {
-        std::fprintf(stderr, "%s %s\n", req.method.c_str(), req.path.c_str());
+    auto svr = audiocore::build_server(slots, cfg.clips_dir, registry, cfg.model_dir, proxies);
+
+    // Logger: skip per-byte noise from static-asset GETs (the browser fetches
+    // /, /style.css, /app.js on every page load) and from /health probes
+    // (which fire periodically from the webapp). Everything else — API
+    // calls, uploads, errors — still logs one line per request.
+    svr->set_logger([](const httplib::Request& req, const httplib::Response& res) {
+        if (req.method == "GET") {
+            if (req.path == "/" || req.path == "/style.css" || req.path == "/app.js" ||
+                req.path == "/health" || req.path == "/favicon.ico") {
+                return;
+            }
+            if (req.path.rfind("/v1/clips/raw/", 0) == 0 ||
+                req.path.rfind("/v1/voices/raw/", 0) == 0) {
+                return;  // audio playback range requests would flood the log
+            }
+        }
+        // Annotate non-2xx so failures are easy to grep in production logs.
+        const int s = res.status;
+        if (s >= 400) {
+            std::fprintf(stderr, "[%d] %s %s\n", s, req.method.c_str(), req.path.c_str());
+        } else {
+            std::fprintf(stderr, "%s %s\n", req.method.c_str(), req.path.c_str());
+        }
     });
 
-    std::fprintf(stderr, "audiocore_server: listening on %s:%d\n",
+    std::fprintf(stderr, "\n  audiocore server\n");
+    std::fprintf(stderr, "  ─────────────────────────────────────────\n");
+    std::fprintf(stderr, "  version   : %s\n",
+#ifndef AUDIOCORE_VERSION
+        "0.0.0-dev"
+#else
+        AUDIOCORE_VERSION
+#endif
+    );
+    std::fprintf(stderr, "  listen    : http://%s:%d\n",
                  cfg.host.c_str(), cfg.port);
+    std::fprintf(stderr, "  webapp    : ");
+#ifdef AUDIOCORE_HAS_WEBAPP
+    std::fprintf(stderr, "embedded (/)\n");
+#else
+    std::fprintf(stderr, "not built (define ENGINE_BUILD_WEBAPP=ON)\n");
+#endif
+    std::fprintf(stderr, "  clips_dir : %s\n",
+                 cfg.clips_dir.empty() ? "(none)" : cfg.clips_dir.c_str());
+    std::fprintf(stderr, "  models    : %zu configured (%zu loaded)\n",
+                 cfg.models.size(),
+                 std::count_if(slots->begin(), slots->end(),
+                               [](const auto& kv) { return kv.second->loaded; }));
+    std::fprintf(stderr, "  (Ctrl-C to stop)\n\n");
+
+    // ── Graceful shutdown ─────────────────────────────────────────────────
+    // SIGINT/SIGTERM ask httplib to stop accepting and finish in-flight
+    // responses, then listen() returns and we exit 0. This matters in
+    // containers: the orchestrator sends SIGTERM and waits a grace period
+    // before SIGKILL — without this handler, long music/TTS generations get
+    // hard-killed and the client sees a broken connection.
+    //
+    // We can't call svr->stop() directly from the signal handler (it's not
+    // async-signal-safe — httplib acquires mutexes internally), so a tiny
+    // watcher thread polls a sig_atomic flag set by the handler and invokes
+    // stop() from normal context.
+    static std::atomic<bool> g_shutdown_requested{false};
+    auto relay_signal = [](int sig) {
+        (void)sig;
+        g_shutdown_requested.store(true);
+    };
+    std::signal(SIGINT, relay_signal);
+    std::signal(SIGTERM, relay_signal);
+    std::thread shutdown_watcher([&svr]() {
+        while (!g_shutdown_requested.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::fprintf(stderr, "\n  shutdown requested — finishing in-flight requests…\n");
+        svr->stop();
+    });
+    shutdown_watcher.detach();
+
     if (!svr->listen(cfg.host, cfg.port)) {
         std::fprintf(stderr, "failed to bind %s:%d\n",
                      cfg.host.c_str(), cfg.port);

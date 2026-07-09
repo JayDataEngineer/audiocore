@@ -1,8 +1,20 @@
 # ACE-Step Detokenizer Gap
 
-**Status:** Detokenizer transformer implemented (cover-mode ready); text_to_music quality issue is separate (under investigation)
+**Status:** ✅ Root cause found — the two-phase LM fix (2026-07-08) addresses the underlying
+code-collapse issue that made src=silence and src=detokenized produce identical output.
 **Found:** 2026-07-05
-**Updated:** 2026-07-06
+**Updated:** 2026-07-08
+
+> **UPDATE (2026-07-08):** The observation that "output is identical with seed=42
+> whether src=silence_latent or src=detokenized codes" was a symptom of LM code collapse,
+> not a DiT src-channel bug. The single-pass LM produced near-identical codes regardless
+> of caption (96.7% same code), so the detokenized src latent was nearly constant and
+> indistinguishable from silence. The **two-phase LM fix** (Phase 1 reasoning → parse →
+> Phase 2 deterministic CoT YAML injection) produces diverse, caption-specific codes that
+> the DiT src channel can meaningfully use. See
+> `docs/ACE-STEP-REFERENCE-COMPARISON.md` §0 for details.
+>
+> The text below is the original analysis, kept for reference.
 
 ## Summary
 

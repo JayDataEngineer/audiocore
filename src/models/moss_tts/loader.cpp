@@ -433,14 +433,15 @@ bool MossSession::load(const std::string& model_path,
                        const BackendConfig& backend_cfg,
                        std::string* error) {
     // Resolve model path: if it's a directory, find .gguf files inside.
-    // The per-family loader is responsible for file discovery within its
-    // own directory (see discovery.cpp docstring).
+    // If it's a single file, look for a sibling .extras.gguf sidecar in the
+    // same directory (the converter produces backbone.gguf + backbone.extras.gguf).
     std::string resolved_path = model_path;
     LoadOptions resolved_opts = opts;
     {
         std::error_code ec;
         namespace fs = std::filesystem;
         if (fs::is_directory(model_path, ec)) {
+            // Directory: scan for primary + extras GGUFs.
             std::string primary, extras;
             for (const auto& entry : fs::directory_iterator(model_path, ec)) {
                 const auto& p = entry.path();
@@ -457,6 +458,19 @@ bool MossSession::load(const std::string& model_path,
             }
             if (!extras.empty()) {
                 resolved_opts.extras["extras_gguf_path"] = extras;
+            }
+        } else if (resolved_opts.extras.find("extras_gguf_path") ==
+                   resolved_opts.extras.end()) {
+            // Single file: look for a sibling .extras.gguf in the same dir.
+            fs::path file_path(model_path);
+            std::string stem = file_path.stem().string();  // e.g. "moss-tts-f16"
+            // Remove a trailing .gguf if the stem still has one
+            if (stem.size() > 5 && stem.substr(stem.size() - 5) == ".gguf")
+                stem = stem.substr(0, stem.size() - 5);
+            fs::path sidecar = file_path.parent_path() /
+                               (stem + ".extras.gguf");
+            if (fs::exists(sidecar, ec)) {
+                resolved_opts.extras["extras_gguf_path"] = sidecar.string();
             }
         }
     }

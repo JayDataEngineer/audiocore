@@ -33,6 +33,7 @@ C++ binary that serves any collected audio GGUF.
 ## Features
 
 - **OpenAI-compatible HTTP API** — `/v1/audio/speech` (TTS), `/v1/audio/music`, `/v1/models`, `/health`
+- **Embedded Voice Studio webapp** — single-page UI served at `/` from the same binary. Voice Design, Synthesize, Music, SFX, Voice Maker (blend/shift/discover/shape), Voices + Clips libraries with drag-and-drop, PCA voice-space analysis, and a Models manager for hot load/unload. No separate frontend process.
 - **One weight format** — GGUF only. The `WeightLoader` interface is the single seam between file format and model code.
 - **One Qwen3 backbone** — MOSS (8B), ACE-Step (1.7B LM + 0.6B TE) and Qwen3-TTS (Talker + Code Predictor) all run through the same `qwen3::Runner` via llama.cpp. No duplicated transformer code.
 - **One sampler** — every family (and the qwen3 MTP predictor) samples through `audiocore::sampler::sample_token` in `src/framework/sampling/`.
@@ -264,6 +265,39 @@ build/bin/audiocore_server --config examples/server.json --model-dir /models
   ]
 }
 ```
+
+### Web app (Voice Studio)
+
+Every `audiocore_server` binary embeds a single-page **Voice Studio** webapp
+(default build flag `ENGINE_BUILD_WEBAPP=ON`). Open the root URL in any
+browser — no separate frontend process or static-file server is needed.
+
+```bash
+# Easiest path — auto-build, auto-discover weights/, pick a free port:
+scripts/run_webapp.sh
+
+# Or, after building, point your browser at the configured port:
+build/bin/audiocore_server --config examples/server.json
+# → open http://localhost:8080
+```
+
+The Voice Studio exposes every backend capability through eight tabs:
+
+| Tab | What it does |
+|---|---|
+| ✨ **Voice Design** | Natural-language description → unique speaker (Qwen3-TTS VoiceDesign). Presets + auto-saved to your Voices library. |
+| 🎛️ **Voice Maker** | Four mathematical knobs — SLERP/linear blend, steering-vector shift, concept-direction discovery, and WSOLA pitch/speed shaping. |
+| 🗣️ **Synthesize** | TTS / zero-shot clone / reference-audio clone / preset speaker / plain. Per-call seed, sampling params, post-pitch + speed. |
+| 🎵 **Music** | ACE-Step text-to-music / cover / repaint / completion. Batch variations, fixed seed, per-mode defaults per variant. |
+| 🔊 **SFX** | MOSS-SoundEffect-v2 text-to-audio. |
+| 🎭 **Voices** | Library of `.voice` embeddings + PCA voice-space analysis with K-means clustering. |
+| 🎬 **Clips** | All generated audio — uploads, TTS, music, SFX — searchable, playable, deletable. Drag & drop anywhere. |
+| 📦 **Models** | Hot load/unload any registered model to control VRAM. |
+
+Generated audio (music + SFX) is auto-saved to the clips library by default;
+plain TTS is opt-in via the **💾 Save to Clips** button. Keyboard shortcuts:
+`1`–`8` switch tabs, `/` focuses library search, `⌘/Ctrl+↵` runs the active
+tab's primary action.
 
 ### Docker
 
@@ -529,7 +563,39 @@ Lists configured model slots with family and load status.
 
 ### `GET /health`
 
-Returns `{"status": "ok"}`.
+Liveness + readiness probe. Returns the build version, server uptime, and
+model counts — safe to hit every few seconds from a load balancer or the
+webapp's status poller.
+
+```json
+{
+  "status": "ok",
+  "version": "v0.9.0-12-g7f3a1b2",
+  "uptime_s": 1834,
+  "models_total": 5,
+  "models_loaded": 3,
+  "webapp": true
+}
+```
+
+### Production notes (CORS, timeouts, graceful shutdown)
+
+- **CORS** — every response carries `Access-Control-Allow-Origin: *`, and
+  `OPTIONS` on any path returns `204 No Content` with
+  `Access-Control-Allow-{Methods,Headers}` and a 24 h `Max-Age`. The
+  embedded webapp is same-origin so this is unnecessary locally, but it
+  lets you host the static assets on a CDN (or point a separate SPA) at a
+  remote GPU box without browser blocks. There is no auth on the server,
+  so a wildcard origin is safe.
+- **Timeouts** — read/write timeouts are 600 s (default httplib is 5 s),
+  which covers long music generations (base 50-step / repaint can exceed
+  30 s). Fast requests still return as soon as they complete; these are
+  upper bounds only. Payload cap is 256 MB for base64 source audio.
+- **Graceful shutdown** — `SIGINT` / `SIGTERM` trigger a clean drain:
+  in-flight responses finish, `listen()` returns, and the process exits 0.
+  This matters in containers — the orchestrator sends `SIGTERM` and waits
+  a grace period before `SIGKILL`; without the handler, long generations
+  get hard-killed and the client sees a broken connection.
 
 ---
 
@@ -624,15 +690,22 @@ GGUF tensor map: see the family `loader.cpp` and `tools/inspect_gguf`.
 ├── tools/
 │   ├── convert_acestep.cpp           # HF → llama.cpp tensor rename
 │   └── convert_qwen3tts.cpp          # Qwen3-TTS safetensors → GGUF
+├── webapp/                           # Voice Studio webapp sources
+│   └── public/                       #   index.html, app.js, style.css
+│                                     #   (xxd-embedded into the server binary at build time)
 ├── examples/
 │   └── server.json                   # Reference server config
 ├── scripts/
+│   ├── run_webapp.sh                 #   one-shot launcher (build + config + serve)
+│   ├── fetch_models.sh               #   manifest-driven weight downloader
+│   ├── xxd.cmake                     #   webapp → C++ byte-array embedder
 │   └── reference_config.yaml         # Upstream Python pipeline config
 └── third_party/                      # Vendored + submoduled deps
     ├── llama.cpp/                    #   llama.cpp (MIT, submodule) — vendors ggml/
     ├── httplib/                      #   cpp-httplib (MIT, vendored)
     └── nlohmann/                     #   nlohmann/json (MIT, vendored)
 ```
+
 
 ---
 

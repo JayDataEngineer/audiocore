@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "audiocore/framework/runtime/registry.h"
+#include "audiocore/server/acestep_proxy.h"
 
 namespace audiocore {
 
@@ -16,7 +17,7 @@ namespace audiocore {
 // the same backend.
 struct ModelSlot {
     std::shared_ptr<ILoadedModel> model;
-    std::unique_ptr<IOfflineTaskSession> session;
+    IOfflineTaskSession* session = nullptr;  // non-owning; lifetime tied to model
     std::mutex mtx;
     bool loaded = true;
     ModelLoadRequest load_req;  // cached for /v1/models/load re-loading
@@ -31,7 +32,8 @@ std::shared_ptr<httplib::Server> build_server(
         std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots,
         const std::string& clips_dir = {},
         std::shared_ptr<ModelRegistry> registry = {},
-        const std::string& weights_dir = {});
+        const std::string& weights_dir = {},
+        std::shared_ptr<std::unordered_map<std::string, AceStepProxyConfig>> acestep_proxies = {});
 
 // WAV encoders (exposed for unit testing).
 std::string pcm_mono_to_wav(const std::vector<float>& pcm, int32_t sr);

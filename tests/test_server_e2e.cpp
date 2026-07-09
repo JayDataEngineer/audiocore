@@ -51,25 +51,29 @@ public:
     std::vector<ChatMessage>  last_messages_;
 };
 
-// Mock loaded model that creates MockTtsSession.
+// Mock loaded model that owns a MockTtsSession.
 class MockLoadedModel : public ILoadedModel {
 public:
     MockLoadedModel() {
         meta_.family = "mock_tts";
         caps_.tasks = {VoiceTaskKind::Tts};
+        session_ = std::make_unique<MockTtsSession>();
     }
 
     const ModelMetadata& metadata() const noexcept override { return meta_; }
     const CapabilitySet& capabilities() const noexcept override { return caps_; }
 
-    std::unique_ptr<IOfflineTaskSession> create_session(
+    IOfflineTaskSession* create_session(
         const TaskSpec&, const SessionOptions&) const override {
-        return std::make_unique<MockTtsSession>();
+        return session_.get();
     }
+
+    MockTtsSession* mock_session() const { return session_.get(); }
 
 private:
     ModelMetadata meta_;
     CapabilitySet caps_;
+    std::unique_ptr<MockTtsSession> session_;
 };
 
 // Mock music session.
@@ -103,19 +107,23 @@ public:
     MockMusicLoadedModel() {
         meta_.family = "mock_music";
         caps_.tasks = {VoiceTaskKind::MusicGen};
+        session_ = std::make_unique<MockMusicSession>();
     }
 
     const ModelMetadata& metadata() const noexcept override { return meta_; }
     const CapabilitySet& capabilities() const noexcept override { return caps_; }
 
-    std::unique_ptr<IOfflineTaskSession> create_session(
+    IOfflineTaskSession* create_session(
         const TaskSpec&, const SessionOptions&) const override {
-        return std::make_unique<MockMusicSession>();
+        return session_.get();
     }
+
+    MockMusicSession* mock_session() const { return session_.get(); }
 
 private:
     ModelMetadata meta_;
     CapabilitySet caps_;
+    std::unique_ptr<MockMusicSession> session_;
 };
 
 // Build a 1-slot server for TTS tests.
@@ -293,6 +301,36 @@ AUDIOCORE_TEST(speech_stream_endpoint_returns_wav_chunks) {
     }
     // If no response, it means the test server may have been stopped already
     // by the timeout. That's acceptable for a smoke test.
+}
+
+// ── CORS preflight ────────────────────────────────────────────────────────
+// A cross-origin SPA sends OPTIONS before POST; the server must answer 204
+// with permissive Access-Control-* headers, and every response must carry
+// Allow-Origin so the browser exposes the body to the cross-origin caller.
+AUDIOCORE_TEST(cors_preflight_returns_204_with_allow_headers) {
+    auto svr = build_server(make_tts_server());
+    TestServer ts(svr);
+
+    httplib::Client cli("127.0.0.1", ts.port);
+    auto resp = cli.Options("/v1/audio/speech");
+    AUDIOCORE_CHECK(resp != nullptr);
+    AUDIOCORE_CHECK_EQ(resp->status, 204);
+    // Methods + headers advertised so the browser accepts the preflight.
+    AUDIOCORE_CHECK(resp->headers.count("Access-Control-Allow-Methods"));
+    AUDIOCORE_CHECK(resp->headers.count("Access-Control-Allow-Headers"));
+    // Every response (including preflight) carries the wildcard origin.
+    AUDIOCORE_CHECK(resp->headers.count("Access-Control-Allow-Origin"));
+}
+
+AUDIOCORE_TEST(cors_allow_origin_on_normal_get) {
+    auto svr = build_server(make_tts_server());
+    TestServer ts(svr);
+
+    httplib::Client cli("127.0.0.1", ts.port);
+    auto resp = cli.Get("/v1/models");
+    AUDIOCORE_CHECK(resp != nullptr);
+    AUDIOCORE_CHECK_EQ(resp->status, 200);
+    AUDIOCORE_CHECK(resp->headers.count("Access-Control-Allow-Origin"));
 }
 
 int main() {

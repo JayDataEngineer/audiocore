@@ -1465,17 +1465,17 @@ bool VAERunner::decode(const float* latents, int32_t n_frames,
     // songs (2-3 minute output) with no model changes.
     //
     // Tile geometry (tuned for per-block VRAM budget):
-    //   TILE_FRAMES = 100 latent frames  = 4.0s audio
-    //     At 100 frames, block 4 (the final ×2 upsampling stage, T_in=96000,
-    //     C=128) allocates ~7 GB for im2col + intermediates — fits alongside
-    //     resident DiT weights on a 24 GB GPU. At 150 frames block 4 needs
-    //     ~11.8 GB and OOMs, forcing the slow per-op fallback (73 individual
-    //     ops with per-op CPU overhead = ~6s/tile vs ~0.7s/tile for the
-    //     7-sub-graph fast path).
-    //   OVERLAP_FRAMES = 20 latent frames = 0.8s audio crossfade
+    //   TILE_FRAMES = 64 latent frames  = 2.56s audio
+    //     At 64 frames, block 4 (the final ×2 upsampling stage, T_in=61440,
+    //     C=128) allocates ~5 GB for im2col + intermediates — fits alongside
+    //     resident DiT weights + F16 TE + LM on a 24 GB GPU even after the
+    //     DiT compute buffer is still resident. Previously 100 frames needed
+    //     ~7.9 GB and OOM'd on long clips (180s+) where the DiT buffer for
+    //     T_latent=4500 was also large.
+    //   OVERLAP_FRAMES = 12 latent frames = 0.48s audio crossfade
     // 1920 = total VAE upsampling factor (latent_frames → pcm_samples)
-    constexpr int32_t TILE_FRAMES    = 100;
-    constexpr int32_t OVERLAP_FRAMES = 20;
+    constexpr int32_t TILE_FRAMES    = 64;
+    constexpr int32_t OVERLAP_FRAMES = 12;
     constexpr int32_t UPSAMPLE       = 1920;
 
     if (n_frames > TILE_FRAMES) {

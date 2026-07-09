@@ -32,7 +32,7 @@ public:
     KokoroTtsSession();
     ~KokoroTtsSession() override;
 
-    std::string family_name() const override { return "kokoro_tts"; }
+    std::string family() const override { return "kokoro_tts"; }
 
     bool load(const std::string& model_path,
               const LoadOptions& opts,

@@ -31,7 +31,7 @@ public:
     PocketTtsSession();
     ~PocketTtsSession() override;
 
-    std::string family_name() const override { return "pocket_tts"; }
+    std::string family() const override { return "pocket_tts"; }
 
     bool load(const std::string& model_path,
               const LoadOptions& opts,

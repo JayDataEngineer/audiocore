@@ -222,7 +222,36 @@ bool AceStepSession::load(const std::string& model_path,
         opts.extras.count("lm_variant") ? opts.extras.at("lm_variant") : "1.7B";
     const std::string dit_path = find_gguf(dir, "acestep-v15", dit_variant);
     const std::string lm_path  = find_gguf(dir, "5Hz-lm", lm_variant);
-    const std::string te_path  = find_gguf(dir, "Qwen3-Embedding");
+    // Text encoder: ALWAYS prefer BF16 for caption fidelity.
+    // The reference (acestep.cpp) loads Qwen3-Embedding-0.6B-BF16.gguf even
+    // when the DiT and LM are Q8_0 — confirmed in every test log (CUDA0-Q8_0,
+    // CPU-Q8_0, etc.): "[GGUF] .../Qwen3-Embedding-0.6B-BF16.gguf".
+    // A Q8_0 text encoder degrades caption embeddings: the DiT's cross-attention
+    // produces weak genre/style signals, so lyrics (encoded separately by the
+    // lyric encoder) dominate and the output drifts to pop/ambient regardless
+    // of the caption. BF16 is 1.2 GB for a 0.6B model — trivial VRAM cost.
+    std::string te_path;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (!e.is_regular_file()) continue;
+        const std::string name = e.path().filename().string();
+        if (name.size() < 5 || name.compare(name.size() - 5, 5, ".gguf") != 0) continue;
+        if (name.find("Qwen3-Embedding") == std::string::npos) continue;
+        // Match full-precision quants (BF16 or F16) — both are 16-bit float.
+        // F16 preferred: ggml CPU backend has full F16 op support, while BF16
+        // mul (used in RoPE/embedding ops) crashes on CPU fallback.
+        if (name.find("-BF16.") == std::string::npos &&
+            name.find("-F16.")  == std::string::npos) continue;
+        te_path = e.path().string();
+        break;
+    }
+    if (te_path.empty()) {
+        // Fallback: no BF16 found — use whatever quant is available.
+        te_path = find_gguf(dir, "Qwen3-Embedding");
+        fprintf(stderr, "[ace_step] WARNING: no BF16 text encoder found; using "
+                        "'%s'. Genre fidelity may be degraded. Download "
+                        "Qwen3-Embedding-0.6B-BF16.gguf from "
+                        "Serveurperso/ACE-Step-1.5-GGUF.\n", te_path.c_str());
+    }
     // VAE path: allow override via extras["vae_path"] (ScragVAE swap-in).
     // The ScragVAE community decoder has tensor-for-tensor compatibility with
     // the stock VAE but produces dramatically better high-frequency detail

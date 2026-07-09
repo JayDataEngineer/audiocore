@@ -71,16 +71,25 @@ public:
                          std::string* error = nullptr) = 0;
     virtual bool run_music(const void* request, void* response,
                            std::string* error = nullptr) = 0;
+    // Compute a speaker embedding from a reference WAV for voice cloning.
+    // Only qwen3_tts implements this (ECAPA-TDNN encoder); others return {}.
+    virtual std::vector<float> compute_embedding(const std::string& wav_path,
+                                                  std::string* error = nullptr) {
+        if (error) *error = "compute_embedding not supported by this family";
+        return {};
+    }
 };
 
-// ── Loaded model interface (new, adapted from audio.cpp) ──────────────────
+// ── Loaded model interface ────────────────────────────────────────────────
 
 class ILoadedModel {
 public:
     virtual ~ILoadedModel() = default;
     virtual const ModelMetadata& metadata() const noexcept = 0;
     virtual const CapabilitySet& capabilities() const noexcept = 0;
-    virtual std::unique_ptr<IOfflineTaskSession> create_session(
+    // Returns a non-owning pointer to the session. The session's lifetime
+    // is tied to this ILoadedModel — destroy the model to free the session.
+    virtual IOfflineTaskSession* create_session(
         const TaskSpec& task,
         const SessionOptions& options) const = 0;
 };

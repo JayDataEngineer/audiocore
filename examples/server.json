@@ -1,33 +1,102 @@
 {
-  "_comment": "audiocore server config",
+  "_comment": "Reference audiocore server config. Edit the `path` fields to point at your weights/ tree. The webapp (Voice Studio) is embedded in the binary at '/' when built with -DENGINE_BUILD_WEBAPP=ON (default). Launch with: build/bin/audiocore_server --config examples/server.json — or use scripts/run_webapp.sh to auto-discover and skip this file entirely.",
 
   "host":   "0.0.0.0",
-  "port":   8081,
+  "port":   8080,
   "device": 0,
   "threads": 4,
+
+  "_clips_dir_comment": "Where generated audio + uploads live. Empty = '<exe-dir>/clips'. The webapp's Voices and Clips tabs read from here.",
   "clips_dir": "",
 
+  "_models_comment": "Only ONE model per family is loaded eagerly at boot to bound VRAM; the rest register as 'load on demand' and the webapp's Models tab swaps them. Families currently ship 4 variants: ace_step (music), qwen3_tts (speech + voice design), moss_tts (speech), moss_sfx_v2 (sound effects).",
   "models": [
     {
-      "id":       "qwen3-tts",
-      "family":   "qwen3_tts",
-      "path":     "/mnt/data/models/audio/qwen3-tts/",
+      "_comment": "ACE-Step turbo — fastest music model (8-step flow-matching). Modes: text_to_music (default), cover, repaint, completion.",
+      "id":       "ace-step-1.5-turbo",
+      "family":   "ace_step",
+      "path":     "weights/ace_step/ace-step-1.5-turbo/",
       "backend":  "ggml_cuda",
-      "extras": {
-        "talker_path":    "talker.q5_k.gguf",
-        "predictor_path": "predictor.q8_0.gguf",
-        "codec_path":     "tokenizer-f16.gguf",
-        "n_gpu_layers":   "99"
+      "extras":   { "dit_variant": "turbo", "lm_variant": "1.7B", "n_gpu_layers": "99" }
+    },
+    {
+      "_comment": "ACE-Step turbo + ScragVAE — same turbo DiT but with the ScragVAE decoder (preserves 12-24 kHz highs that the stock VAE rolls off).",
+      "id":       "ace-step-1.5-turbo-scrag",
+      "family":   "ace_step",
+      "path":     "weights/ace_step/ace-step-1.5-turbo-scrag/",
+      "backend":  "ggml_cuda",
+      "extras":   { "dit_variant": "turbo", "lm_variant": "1.7B", "vae_variant": "scrag", "n_gpu_layers": "99" }
+    },
+    {
+      "_comment": "ACE-Step base — full quality 50-step model. Register alongside turbo; the Models tab swaps them.",
+      "id":       "ace-step-1.5-base",
+      "family":   "ace_step",
+      "path":     "weights/ace_step/ace-step-1.5-base/",
+      "backend":  "ggml_cuda",
+      "extras":   { "dit_variant": "base", "lm_variant": "1.7B", "n_gpu_layers": "99" }
+    },
+    {
+      "_comment": "ACE-Step SFT — supervised fine-tune of base (50-step, better caption adherence).",
+      "id":       "ace-step-1.5-sft",
+      "family":   "ace_step",
+      "path":     "weights/ace_step/ace-step-1.5-sft/",
+      "backend":  "ggml_cuda",
+      "extras":   { "dit_variant": "sft", "lm_variant": "1.7B", "n_gpu_layers": "99" }
+    },
+    {
+      "_comment": "ACE-Step XL Turbo — 4B LM + XL DiT (8-step, higher quality, more VRAM).",
+      "id":       "ace-step-xl-turbo",
+      "family":   "ace_step",
+      "path":     "weights/ace_step/ace-step-xl-turbo/",
+      "backend":  "ggml_cuda",
+      "extras":   { "dit_variant": "turbo", "lm_variant": "4B", "n_gpu_layers": "99" }
+    },
+    {
+      "_comment": "Qwen3-TTS 1.7B CustomVoice — text-to-speech + zero-shot voice cloning from a .voice embedding.",
+      "id":       "qwen3-tts-customvoice",
+      "family":   "qwen3_tts",
+      "path":     "weights/qwen3_tts/qwen3-tts-1.7b-customvoice/",
+      "backend":  "ggml_cuda",
+      "extras":   { "talker_path": "qwen3tts-talker-1b7-f16.gguf", "predictor_path": "qwen3tts-predictor-1b7-f16.gguf", "codec_path": "tokenizer-f16.gguf", "n_gpu_layers": "99" }
+    },
+    {
+      "_comment": "Qwen3-TTS 1.7B VoiceDesign — natural-language voice description → unique speaker embedding. Used by the Voice Design tab.",
+      "id":       "qwen3-tts-voicedesign",
+      "family":   "qwen3_tts",
+      "path":     "weights/qwen3_tts/qwen3-tts-1.7b-voicedesign/",
+      "backend":  "ggml_cuda",
+      "extras":   { "talker_path": "qwen3tts-talker-1b7-f16.gguf", "predictor_path": "qwen3tts-predictor-1b7-f16.gguf", "codec_path": "tokenizer-f16.gguf", "n_gpu_layers": "99" }
+    },
+    {
+      "_comment": "MOSS-SoundEffect-v2 — text → sound effects (1.3B DiT + DAC VAE + Qwen3 text encoder). SFX tab.",
+      "id":       "moss-sfx-v2",
+      "family":   "moss_sfx_v2",
+      "path":     "weights/moss_sfx_v2/mse2-dit.gguf",
+      "backend":  "ggml_cuda",
+      "extras":   {
+        "vae_path": "weights/moss_sfx_v2/mse2-vae.gguf",
+        "te_path":  "weights/moss_sfx_v2/mse2-te.gguf",
+        "n_gpu_layers": "99"
       }
     }
   ],
 
   "_endpoints": [
-    "GET  /",
-    "GET  /health",
-    "GET  /v1/models",
-    "GET  /v1/clips",
-    "POST /v1/audio/speech   { model: 'qwen3-tts', input: 'hello', voice: 'Vivian' }",
-    "POST /v1/audio/music    { model: 'ace-step-turbo', caption: 'lo-fi piano', duration: 30 }"
+    "GET  /                                 — embedded Voice Studio webapp",
+    "GET  /health                           — {status, version, uptime_s, models_loaded}",
+    "GET  /v1/models                        — configured models (loaded + registered)",
+    "GET  /v1/models/available              — models discoverable under weights/",
+    "POST /v1/models/load    {id}           — hot-load a deferred model into VRAM",
+    "POST /v1/models/unload  {id}           — release a model's VRAM",
+    "POST /v1/audio/speech   {model,input}  — TTS / voice_clone / sfx / voice_design",
+    "POST /v1/audio/speech/stream           — chunked-transfer TTS",
+    "POST /v1/audio/music    {model,caption}— ACE-Step generation (5 modes)",
+    "GET  /v1/clips           — list",
+    "POST /v1/clips/upload    — multipart upload",
+    "POST /v1/clips/delete    {name}",
+    "GET  /v1/clips/raw/<n>   — serve audio",
+    "GET  /v1/voices           — list .voice embeddings",
+    "POST /v1/voices/blend | shift | discover_direction | analyze",
+    "GET/PUT/DELETE /v1/voices/<n>/meta     — DSP sidecar (pitch_shift / speed)"
   ]
 }

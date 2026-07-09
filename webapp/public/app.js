@@ -91,7 +91,7 @@
   }
 
   // ── Tab switching ──────────────────────────────────────────────────
-  const TAB_IDS = ["design", "maker", "synthesize", "music", "sfx", "voices", "clips"];
+  const TAB_IDS = ["design", "maker", "synthesize", "music", "sfx", "voices", "clips", "models"];
 
   function activate_tab(target, { persist = true } = {}) {
     $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === target));
@@ -105,6 +105,7 @@
     if (target === "clips")  load_clips();
     if (target === "maker")  refresh_maker_dropdowns();
     if (target === "music")  refresh_music_sources();
+    if (target === "models") render_model_manager();
     if (target === "voices" || target === "clips") {
       const search = $("#" + (target === "voices" ? "voice-search" : "clip-search"));
       if (search) setTimeout(() => search.focus(), 50);
@@ -127,15 +128,15 @@
   let MODELS = [];
   let ACTIVE_TTS = null;
   let ACTIVE_VD  = null;
-  let ACTIVE_MUSIC = null;       // currently-selected music model id
-  let MUSIC_MODELS = [];         // all available ACE-Step model ids
-  let ACTIVE_SFX = null;         // MOSS-SoundEffect v2 model id
+  let ACTIVE_MUSIC = null;
+  let ACTIVE_SFX = null;
+  // Per-category model lists: [{id, family, loaded}, …]
+  let MUSIC_MODELS = [];
+  let TTS_MODELS   = [];
+  let SFX_MODELS   = [];
+  let VD_MODELS    = [];
 
-  // Per-variant defaults. Turbo = 8-step flow-matching (fast), Base = 50-step
-  // (full quality). Guidance: upstream defaults to 1.0 (no CFG) for both.
-  // Guidance (CFG scale) controls how strongly the model follows the
-  // caption/lyrics.  1.0 = no CFG (caption largely ignored).  3.0+ gives
-  // strong caption adherence.  Turbo with 8 steps can handle 3.0–7.5.
+  // Per-variant defaults. Turbo = 8-step flow-matching (fast), Base/SFT = 50-step.
   const MUSIC_DEFAULTS = {
     turbo: { steps: 8,  guidance: 1.0 },
     base:  { steps: 50, guidance: 1.0 },
@@ -151,15 +152,20 @@
   function music_label_for(id) {
     const lid = (id || "").toLowerCase();
     const v = music_variant_of(id);
-    // Tag Scrag VAE variants so users can distinguish them in the picker.
     const scrag = lid.indexOf("scrag") >= 0 ? " · ScragVAE" : "";
+    const xl = lid.indexOf("xl") >= 0 ? "XL " : "";
     const map = {
-      turbo: "⚡ Turbo",
-      base:  "🎚️ Base",
-      sft:   "🎯 SFT",
+      turbo: "⚡ " + xl + "Turbo",
+      base:  "🎚️ " + xl + "Base",
+      sft:   "🎯 " + xl + "SFT",
     };
     return (map[v] || id) + scrag + "  ·  " + MUSIC_DEFAULTS[v].steps + " steps";
   }
+
+  // Track which models are proxied to the reference ace-server.
+  // Populated from the "backend" field in /v1/models responses.
+  const PROXY_MODELS = new Set();
+  function is_proxy(id) { return PROXY_MODELS.has(id); }
   function apply_music_defaults(id, { force = false } = {}) {
     const v = music_variant_of(id);
     const d = MUSIC_DEFAULTS[v];
@@ -168,12 +174,86 @@
     if (sInput && (force || !sInput.dataset.userTouched)) sInput.value = d.steps;
     if (gInput && (force || !gInput.dataset.userTouched)) gInput.value = d.guidance;
     const gh = $("#mus-guid-hint");
-    if (gh) gh.textContent = (v === "turbo") ? "(higher = follows caption more)" : "(CFG strength)";
+    if (gh) gh.textContent = (v === "turbo") ? "(distilled → forced 1.0)" : "(CFG strength)";
   }
 
   function set_engine_dot(id, state) {
     const el = $("#" + id);
     if (el) el.className = "engine-dot " + (state || "");
+  }
+
+  // Categorise a model into one or more buckets based on family + id.
+  function categorize(m) {
+    const f = (m.family || "").toLowerCase();
+    const id = (m.id || "").toLowerCase();
+    const entry = { id: m.id, family: m.family || "", loaded: m.loaded !== false,
+                    backend: m.backend || "" };
+    const cats = [];
+    // ACE-Step → music
+    if (f.indexOf("ace") >= 0 || id.indexOf("ace") >= 0) cats.push("music");
+    // MOSS-SFX or any id with "sfx" → sfx
+    if (f.indexOf("moss_sfx") >= 0 || id.indexOf("sfx") >= 0) cats.push("sfx");
+    // VoiceDesign variants
+    if (id.indexOf("voicedesign") >= 0 || id.indexOf("voice_design") >= 0) cats.push("vd");
+    // Qwen3-TTS and MOSS-TTS (non-sfx, non-vd) → tts
+    if ((f.indexOf("qwen3_tts") >= 0 || f.indexOf("moss_tts") >= 0) &&
+        cats.indexOf("sfx") < 0 && cats.indexOf("vd") < 0)
+      cats.push("tts");
+    return { entry, cats };
+  }
+
+  // Populate a <select> from a model list, preserving the current selection
+  // if possible. Unloaded models are shown but greyed out.
+  function populate_model_select(sel, list, labelFn) {
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = "";
+    if (!list.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "— no model registered —";
+      opt.disabled = true;
+      opt.selected = true;
+      return;
+    }
+    for (const m of list) {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = (labelFn ? labelFn(m.id) : m.id) +
+                        (m.loaded ? "" : "  (unload)");
+      if (!m.loaded) opt.style.color = "var(--text-dim)";
+      sel.appendChild(opt);
+    }
+    // Restore previous selection if still present, else pick first loaded.
+    if (list.some(m => m.id === prev))
+      sel.value = prev;
+    else {
+      const firstLoaded = list.find(m => m.loaded);
+      sel.value = (firstLoaded || list[0]).id;
+    }
+  }
+
+  // Auto-load a model if it's not already resident.
+  async function ensure_loaded(modelId, statusEl) {
+    const m = MODELS.find(x => x.id === modelId);
+    if (m && m.loaded !== false) return true;
+    if (statusEl) status(statusEl, "Loading " + modelId + "…", "loading");
+    try {
+      const r = await fetch("/v1/models/load", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: modelId }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || "load failed (" + r.status + ")");
+      }
+      await load_models();   // refresh state
+      return true;
+    } catch (e) {
+      if (statusEl) status(statusEl, "Model load failed: " + e.message, "err");
+      return false;
+    }
   }
 
   async function load_models() {
@@ -193,35 +273,50 @@
         return;
       }
 
-      // Pick models by family/heuristic
+      // Categorise every model.
       MUSIC_MODELS = [];
+      TTS_MODELS   = [];
+      SFX_MODELS   = [];
+      VD_MODELS    = [];
+      PROXY_MODELS.clear();
       for (const m of MODELS) {
-        const f = (m.family || "").toLowerCase();
-        const id = (m.id || "").toLowerCase();
-        if (f.indexOf("qwen3_tts") >= 0) {
-          if (id.indexOf("voicedesign") >= 0 || id.indexOf("voice_design") >= 0)
-            ACTIVE_VD = m.id;
-          else if (ACTIVE_TTS == null || id.indexOf("customvoice") >= 0 ||
-                   id.indexOf("cv") >= 0)
-            ACTIVE_TTS = m.id;
+        const { entry, cats } = categorize(m);
+        if (entry.backend === "acestep_proxy") PROXY_MODELS.add(entry.id);
+        for (const c of cats) {
+          if (c === "music") MUSIC_MODELS.push(entry);
+          if (c === "tts")   TTS_MODELS.push(entry);
+          if (c === "sfx")   SFX_MODELS.push(entry);
+          if (c === "vd")    VD_MODELS.push(entry);
         }
-        if (f.indexOf("ace") >= 0 || id.indexOf("ace") >= 0) {
-          MUSIC_MODELS.push(m.id);
-          // Only auto-select if this model is actually loaded.
-          if (ACTIVE_MUSIC == null && m.loaded !== false)
-            ACTIVE_MUSIC = m.id;
-        }
-        if (f.indexOf("moss") >= 0 && ACTIVE_TTS == null)
-          ACTIVE_TTS = m.id;
-        if ((f.indexOf("moss_sfx") >= 0 || id.indexOf("sfx") >= 0) &&
-            m.loaded !== false)
-          ACTIVE_SFX = m.id;
       }
 
-      // Apply default steps/guidance for whatever model is loaded.
-      if (ACTIVE_MUSIC) apply_music_defaults(ACTIVE_MUSIC, { force: true });
+      // Resolve ACTIVE_*: keep current selection if still loaded (or if no
+      // loaded alternative exists); otherwise switch to first loaded model.
+      function resolve_active(list, current) {
+        const cur = list.find(m => m.id === current);
+        if (cur && cur.loaded) return current;          // still loaded ✓
+        const firstLoaded = list.find(m => m.loaded);
+        if (firstLoaded) return firstLoaded.id;          // switch to loaded
+        if (cur) return current;                         // not loaded but exists
+        return list.length ? list[0].id : null;          // fallback
+      }
+      ACTIVE_MUSIC = resolve_active(MUSIC_MODELS, ACTIVE_MUSIC);
+      ACTIVE_TTS   = resolve_active(TTS_MODELS,   ACTIVE_TTS);
+      ACTIVE_SFX   = resolve_active(SFX_MODELS,   ACTIVE_SFX);
+      ACTIVE_VD    = resolve_active(VD_MODELS,    ACTIVE_VD);
 
-      badge.textContent = MODELS.length + " model" + (MODELS.length === 1 ? "" : "s");
+      // Populate the four model <select> dropdowns.
+      populate_model_select($("#mus-model"), MUSIC_MODELS, music_label_for);
+      populate_model_select($("#syn-model"), TTS_MODELS);
+      populate_model_select($("#sfx-model"), SFX_MODELS);
+      populate_model_select($("#vd-model"),  VD_MODELS);
+
+      // Apply defaults for the active music model.
+      if (ACTIVE_MUSIC) apply_music_defaults(ACTIVE_MUSIC, { force: true });
+      update_engine_tag();
+
+      badge.textContent = MODELS.length + " model" + (MODELS.length === 1 ? "" : "s") +
+        (PROXY_MODELS.size > 0 ? " · " + PROXY_MODELS.size + " ref⚡" : "");
       badge.className = "badge";
       set_engine_dot("engine-tts",   ACTIVE_TTS   ? "ready" : "");
       set_engine_dot("engine-vd",    ACTIVE_VD    ? "ready" : "");
@@ -684,6 +779,8 @@
     $("#syn-preset").hidden   = v !== "preset";
     $("#syn-uploaded").hidden = v !== "uploaded";
     $("#syn-ref-row").hidden  = v !== "reference";
+    // Voice strength slider: show for any voice source except "none".
+    $("#syn-strength-row").hidden = v === "none";
     if (v === "uploaded") load_syn_voice_meta();
     if (v === "designed") {
       if (vd_saved_name) {
@@ -693,6 +790,13 @@
       }
     }
   });
+
+  // Voice strength slider visual feedback.
+  $("#syn-voice-strength")?.addEventListener("input", (e) => {
+    $("#syn-voice-strength-val").textContent = parseFloat(e.target.value).toFixed(1);
+    sync_slider_fill(e.target);
+  });
+  sync_slider_fill($("#syn-voice-strength"));
 
   // When a saved .voice is picked in Synthesize, load its saved shaping
   // into the pitch/speed sliders so the user sees the actual values that
@@ -745,10 +849,21 @@
       temperature: parseFloat($("#syn-temp").value) || 0.7,
       top_p:       parseFloat($("#syn-topp").value) || 0.9,
       text_top_k:  parseInt($("#syn-topk").value, 10) || 50,
-      max_new_tokens: parseInt($("#syn-max").value, 10) || 100,
+      max_new_tokens: parseInt($("#syn-max").value, 10) || 220,
       pitch_shift: parseFloat($("#syn-pitch").value) || 0,
       speed:       parseFloat($("#syn-speed").value) || 1.0,
     };
+    // Voice embed strength — scale speaker identity influence.
+    // 1.0 = original, >1 = stronger voice, <1 = weaker (more from instruct).
+    // Only sent when a voice source is active (not "none").
+    if (src !== "none") {
+      const vs = parseFloat($("#syn-voice-strength")?.value);
+      if (!isNaN(vs) && vs > 0) body.embedding_strength = vs;
+    }
+    {
+      const seed = parseInt($("#syn-seed").value, 10) || 0;
+      if (seed > 0) body.seed = seed;
+    }
 
     if (src === "preset") {
       body.speaker = $("#syn-preset").value;
@@ -810,6 +925,7 @@
       const meta = (body.mode || "tts") + " · " + (blob.size / 1024).toFixed(1) + " KB";
       set_player($("#syn-player"), url, meta);
       $("#syn-download").disabled = false;
+      $("#syn-save-clip").disabled = false;
       status(st, "Done.", "ok");
     } catch (err) {
       status(st, "Error: " + err.message, "err");
@@ -817,6 +933,30 @@
 
     btn.disabled = false;
     btn.textContent = "🎙️ Synthesize";
+  });
+
+  // Save the last synthesis to the Clips library so it appears alongside
+  // other generated audio. Plain TTS isn't auto-saved by the backend (to
+  // avoid clip-spam), so this is the explicit user opt-in.
+  $("#syn-save-clip").addEventListener("click", async () => {
+    if (!syn_last_blob) return;
+    const st = $("#syn-status");
+    status(st, "Saving to clips…", "loading");
+    try {
+      const form = new FormData();
+      form.append("file", syn_last_blob, "tts_" + Date.now() + ".wav");
+      const r = await fetch("/v1/clips/upload", { method: "POST", body: form });
+      const j = await r.json();
+      if (j.ok && j.saved && j.saved.length) {
+        CLIPS_CACHE = [];
+        toast("Saved as " + j.saved[0], "ok");
+        status(st, "Saved as " + j.saved[0] + " — find it in the Clips tab.", "ok");
+      } else {
+        status(st, j.error || "Save failed", "err");
+      }
+    } catch (err) {
+      status(st, "Error: " + err.message, "err");
+    }
   });
 
   $("#syn-download").addEventListener("click", () => {
@@ -867,17 +1007,58 @@
           ? "Inside [start,end] is preserved; outside is regenerated (extension)."
           : "";
     }
-    // Contextual guidance hint: in cover mode lower CFG = more faithful to source.
+    // Contextual guidance hint. Turbo models always force guidance=1.0
+    // (distilled into weights), so the cover-mode "lower = faithful" hint
+    // is misleading — turbo ignores guidance_scale entirely.
     const gh = $("#mus-guid-hint");
     if (gh) {
-      gh.textContent = (mode === "cover")
-        ? "(lower = faithful to source)"
-        : "(CFG strength)";
+      const variant = ACTIVE_MUSIC ? music_variant_of(ACTIVE_MUSIC) : "turbo";
+      if (variant === "turbo")
+        gh.textContent = "(distilled → forced 1.0)";
+      else
+        gh.textContent = (mode === "cover")
+          ? "(lower = faithful to source)"
+          : "(CFG strength)";
     }
     if (needs_src) refresh_music_sources();
   }
   $("#mus-mode").addEventListener("change", sync_music_mode_rows);
   sync_music_mode_rows();
+
+  // Show/hide the "⚡ ref" badge for proxy models.
+  function update_engine_tag() {
+    const tag = $("#mus-engine-tag");
+    if (!tag) return;
+    if (ACTIVE_MUSIC && is_proxy(ACTIVE_MUSIC)) {
+      tag.classList.remove("hidden");
+      tag.title = "Served by the reference acestep.cpp engine (ace-server)";
+    } else {
+      tag.classList.add("hidden");
+    }
+  }
+
+  // ── Model picker change handlers ───────────────────────────────────
+  // Each dropdown updates its ACTIVE_* and, if the selected model isn't
+  // loaded yet, triggers a load via /v1/models/load before proceeding.
+  $("#mus-model")?.addEventListener("change", async (e) => {
+    ACTIVE_MUSIC = e.target.value;
+    apply_music_defaults(ACTIVE_MUSIC, { force: true });
+    sync_music_mode_rows();
+    update_engine_tag();
+    await ensure_loaded(ACTIVE_MUSIC, $("#mus-status"));
+  });
+  $("#syn-model")?.addEventListener("change", async (e) => {
+    ACTIVE_TTS = e.target.value;
+    await ensure_loaded(ACTIVE_TTS, $("#syn-status"));
+  });
+  $("#sfx-model")?.addEventListener("change", async (e) => {
+    ACTIVE_SFX = e.target.value;
+    await ensure_loaded(ACTIVE_SFX, $("#sfx-status"));
+  });
+  $("#vd-model")?.addEventListener("change", async (e) => {
+    ACTIVE_VD = e.target.value;
+    await ensure_loaded(ACTIVE_VD, $("#vd-status"));
+  });
 
   // Caption preset chips: one-click genre/mood fill.
   $$("#mus-presets .chip").forEach((chip) => {
@@ -966,9 +1147,27 @@
           caption:  $("#mus-caption").value.trim(),
           lyrics:   $("#mus-lyrics").value.trim(),
           duration: parseFloat($("#mus-dur").value) || 30,
-          steps:    parseInt($("#mus-steps").value, 10) || 50,
+          steps:    parseInt($("#mus-steps").value, 10) ||
+                    MUSIC_DEFAULTS[music_variant_of(ACTIVE_MUSIC)].steps,
           guidance_scale: parseFloat($("#mus-guid").value) || 1.0,
         };
+        // Musical metadata (optional — when all are set, Phase 1 reasoning
+        // is skipped and the LM goes straight to code generation with the
+        // deterministic CoT YAML built from these values).
+        const bpm = parseInt($("#mus-bpm")?.value, 10) || 0;
+        if (bpm > 0) body.bpm = bpm;
+        const ks = $("#mus-keyscale")?.value.trim();
+        if (ks) body.keyscale = ks;
+        const tsig = $("#mus-timesig")?.value.trim();
+        if (tsig) body.timesignature = tsig;
+        const lang = $("#mus-lang")?.value.trim();
+        if (lang) body.vocal_language = lang;
+        const lmCfg = parseFloat($("#mus-lm-cfg")?.value);
+        if (lmCfg && lmCfg > 1.0) body.lm_cfg_scale = lmCfg;
+        // LM sampling params — always sent so the server uses our values,
+        // not its internal defaults. Matches MusicRequest defaults (0.85, 0.9).
+        body.temperature = parseFloat($("#mus-temp")?.value) || 0.85;
+        body.top_p       = parseFloat($("#mus-top-p")?.value) || 0.9;
         if (seed_i && seed_i > 0) body.seed = seed_i;
         if (src_b64) {
           body.input_audio = src_b64;
@@ -988,12 +1187,17 @@
             const j = await r.json().catch(() => ({}));
             throw new Error(j.error || ("HTTP " + r.status));
           }
-          return r.blob();
+          // The backend auto-saves each render to the clips library and
+          // surfaces the filename via this header — capture it so we can
+          // tell the user where to find it.
+          const clip = r.headers.get("X-Audiocore-Clip");
+          const blob = await r.blob();
+          return { blob, clip };
         });
         // Light up the music dot during the first request.
         if (i === 0) engine_promise = with_engine_dot("engine-music", req);
-        const blob = await req;
-        results.push({ seed: seed_i, blob });
+        const rslt = await req;
+        results.push({ seed: seed_i, blob: rslt.blob, clip: rslt.clip });
       } catch (err) {
         results.push({ seed: seed_i, error: err.message });
       }
@@ -1006,6 +1210,16 @@
     const ok = results.filter(r => r.blob);
     const failed = results.filter(r => r.error);
     const player = $("#mus-player");
+
+    // If the backend auto-saved any clips, refresh the cached clips list so
+    // the Clips tab shows them without a manual refresh, and surface the
+    // saved filenames in the status line.
+    const savedClips = ok.map(r => r.clip).filter(Boolean);
+    if (savedClips.length) {
+      // Invalidate the cache so the next tab visit re-fetches.
+      CLIPS_CACHE = [];
+      if ($(".tab.active")?.dataset.tab === "clips") load_clips();
+    }
     if (ok.length === 0) {
       status(st, failed[0]?.error || "All variations failed.", "err");
       btn.disabled = false; btn.textContent = "🎵 Generate";
@@ -1069,14 +1283,17 @@
       mus_last_blob = ok[ok.length - 1].blob;
     }
     $("#mus-download").disabled = !mus_last_blob;
+    const saveNote = savedClips.length
+      ? " · saved " + (savedClips.length === 1 ? savedClips[0] : savedClips.length + " clips")
+      : "";
     if (failed.length) {
       status(st, ok.length + "/" + batch_n + " OK · " + failed.length + " failed: " +
         failed[0].error, "err");
     } else if (batch_n > 1) {
       status(st, ok.length + " variations ready (seeds " +
-        ok.map(r => r.seed || "?").join(", ") + ").", "ok");
+        ok.map(r => r.seed || "?").join(", ") + ")." + saveNote, "ok");
     } else {
-      status(st, "Done.", "ok");
+      status(st, "Done." + saveNote, "ok");
     }
     btn.disabled = false; btn.textContent = "🎵 Generate";
   });
@@ -1112,6 +1329,7 @@
     if (!text) { status(st, "Describe the sound effect first.", "err"); return; }
 
     const duration = parseFloat($("#sfx-dur").value) || 5;
+    const sfx_seed = parseInt($("#sfx-seed")?.value, 10) || 0;
     // moss_sfx_v2 uses duration_tokens (1 token ≈ 0.08s)
     const duration_tokens = Math.round(duration / 0.08);
 
@@ -1120,29 +1338,39 @@
     clear_player($("#sfx-player"));
 
     try {
-      const p = fetch("/v1/audio/speech", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const reqBody = {
           model: ACTIVE_SFX,
           input: text,
           mode: "tts",
           duration_tokens: duration_tokens,
-        }),
+      };
+      if (sfx_seed > 0) reqBody.seed = sfx_seed;
+      const p = fetch("/v1/audio/speech", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(reqBody),
       }).then(async (r) => {
         if (!r.ok) {
           const j = await r.json().catch(() => ({}));
           throw new Error(j.error || "SFX failed (" + r.status + ")");
         }
-        return r.blob();
+        const clip = r.headers.get("X-Audiocore-Clip");
+        const blob = await r.blob();
+        return { blob, clip };
       });
-      const blob = await with_engine_dot("engine-sfx", p);
+      const { blob, clip } = await with_engine_dot("engine-sfx", p);
       sfx_last_blob = blob;
       const url = URL.createObjectURL(blob);
       set_player($("#sfx-player"), url,
         "sfx · " + text.substring(0, 40) + " · " + (blob.size / 1024).toFixed(1) + " KB");
       $("#sfx-download").disabled = false;
-      status(st, "Done.", "ok");
+      if (clip) {
+        CLIPS_CACHE = [];
+        if ($(".tab.active")?.dataset.tab === "clips") load_clips();
+        status(st, "Done · saved " + clip, "ok");
+      } else {
+        status(st, "Done.", "ok");
+      }
     } catch (err) {
       status(st, "Error: " + err.message, "err");
     }
@@ -1738,8 +1966,8 @@
 
     if (typing) return;
 
-    // 1–7: tabs
-    if (/^[1-7]$/.test(e.key)) {
+    // 1–8: tabs
+    if (/^[1-8]$/.test(e.key)) {
       const idx = parseInt(e.key, 10) - 1;
       if (TAB_IDS[idx]) { e.preventDefault(); activate_tab(TAB_IDS[idx]); }
       return;
@@ -1757,17 +1985,56 @@
 
   // ── Footer uptime ticker ───────────────────────────────────────────
   const t0 = Date.now();
-  function tick_uptime() {
+  // Server-side uptime + version, polled from /health every 30 s. Filled
+  // in async; until the first response resolves the footer just shows the
+  // client session uptime (which is still useful).
+  let SERVER_INFO = null;  // {version, uptime_s, models_total, models_loaded}
+  async function load_health() {
+    try {
+      const r = await fetch("/health");
+      if (!r.ok) throw new Error(r.status);
+      SERVER_INFO = await r.json();
+      // If the backend advertises zero loaded models, the engine dots are
+      // meaningless — let the user know via the badge.
+      if (SERVER_INFO.models_loaded === 0 && SERVER_INFO.models_total === 0) {
+        const badge = $("#model-badge");
+        badge.textContent = "no models configured";
+        badge.className = "badge err";
+      }
+    } catch (_) {
+      SERVER_INFO = null;
+    }
+    render_footer();
+  }
+  function fmt_uptime(s) {
+    s = Math.max(0, Math.floor(s));
+    const d = Math.floor(s / 86400); s %= 86400;
+    const h = Math.floor(s / 3600);  s %= 3600;
+    const m = Math.floor(s / 60);    const sec = s % 60;
+    if (d > 0) return d + "d " + h + "h " + m + "m";
+    if (h > 0) return h + "h " + m + "m " + sec + "s";
+    return m + "m " + sec + "s";
+  }
+  function render_footer() {
     const el = $("#footer-uptime");
     if (!el) return;
-    const s = Math.floor((Date.now() - t0) / 1000);
-    const m = Math.floor(s / 60), sec = s % 60;
-    const h = Math.floor(m / 60), mm = m % 60;
-    el.textContent = (h > 0 ? h + "h " : "") + mm + "m " + sec + "s" +
-      " · session uptime";
+    const session_s = Math.floor((Date.now() - t0) / 1000);
+    const parts = [];
+    if (SERVER_INFO) {
+      parts.push("v" + (SERVER_INFO.version || "?"));
+      parts.push("server " + fmt_uptime(SERVER_INFO.uptime_s || 0));
+      parts.push(SERVER_INFO.models_loaded + "/" + SERVER_INFO.models_total + " models");
+    } else {
+      parts.push("backend offline");
+    }
+    parts.push("session " + fmt_uptime(session_s));
+    el.textContent = parts.join(" · ");
   }
+  function tick_uptime() { render_footer(); }
   setInterval(tick_uptime, 1000);
   tick_uptime();
+  load_health();
+  setInterval(load_health, 30000);
 
   // ── Init ───────────────────────────────────────────────────────────
   sync_all_sliders();

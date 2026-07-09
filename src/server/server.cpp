@@ -1,8 +1,10 @@
 #include "audiocore/server/server.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -11,12 +13,14 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 #include <nlohmann/json.hpp>
 
 #include "audiocore/framework/runtime/tasks.h"
 #include "audiocore/framework/audio/dsp.h"   // pitch_shift, change_speed
 #include "audiocore/models/ace_step/family.h"    // MusicRequest / MusicResponse
+#include "audiocore/server/acestep_proxy.h"     // reference ace-server proxy
 #ifdef AUDIOCORE_ENABLE_MP3
 #include "audiocore/framework/io/mp3_encoder.h"
 #endif
@@ -27,10 +31,75 @@
 #include "app.js.hpp"
 #endif
 
+#ifndef AUDIOCORE_VERSION
+#define AUDIOCORE_VERSION "0.0.0-dev"
+#endif
+
 namespace audiocore {
 
 using nlohmann::json;
 namespace fs = std::filesystem;
+
+// Server-wide start time — used by /health for uptime reporting. Defined
+// here so it's set at libaudiocore load time, which is as close to "server
+// boot" as we can get without a constructor hook in build_server().
+namespace {
+const std::chrono::steady_clock::time_point kServerStart =
+    std::chrono::steady_clock::now();
+
+std::string iso_timestamp_for_filename() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    char buf[24];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+    // Append 3-digit milliseconds to disambiguate rapid bursts.
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now.time_since_epoch()) % 1000;
+    snprintf(buf + 19, 5, "_%03d", static_cast<int>(ms.count()));
+    return buf;
+}
+
+// Pick a unique filename in clips_dir of the form `<prefix>_<ts>(_<n>)?<ext>`.
+// Collisions are resolved by appending _2, _3, …
+std::string unique_clip_path(const std::string& clips_dir,
+                              const std::string& prefix,
+                              const std::string& ext) {
+    if (clips_dir.empty()) return {};
+    std::error_code ec;
+    fs::create_directories(clips_dir, ec);
+    std::string base = prefix + "_" + iso_timestamp_for_filename();
+    fs::path candidate = fs::path(clips_dir) / (base + ext);
+    int n = 2;
+    while (fs::exists(candidate)) {
+        candidate = fs::path(clips_dir) / (base + "_" + std::to_string(n++) + ext);
+    }
+    return candidate.string();
+}
+
+// Persist a generated audio buffer to the clips library so it appears in
+// the webapp's Clips tab. Returns the saved filename (basename) or empty.
+// `pcm` is mono float32 for speech, stereo interleaved float32 for music.
+std::string save_pcm_to_clips(const std::string& clips_dir,
+                               const std::vector<float>& pcm,
+                               int32_t sampling_rate,
+                               bool stereo,
+                               const std::string& prefix) {
+    if (clips_dir.empty() || pcm.empty()) return {};
+    std::string path = unique_clip_path(
+        clips_dir, prefix, stereo ? ".wav" : ".wav");
+    if (path.empty()) return {};
+    std::string wav = stereo ? pcm_stereo_to_wav(pcm, sampling_rate)
+                              : pcm_mono_to_wav(pcm, sampling_rate);
+    std::ofstream of(path, std::ios::binary);
+    if (!of) return {};
+    of.write(wav.data(), wav.size());
+    of.close();
+    if (!of.good()) return {};
+    return fs::path(path).filename().string();
+}
+}  // namespace
 
 namespace {
 
@@ -275,17 +344,49 @@ std::shared_ptr<httplib::Server> build_server(
         std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots,
         const std::string& clips_dir,
         std::shared_ptr<ModelRegistry> registry,
-        const std::string& weights_dir) {
+        const std::string& weights_dir,
+        std::shared_ptr<std::unordered_map<std::string, AceStepProxyConfig>> acestep_proxies) {
     auto svr = std::make_shared<httplib::Server>();
     auto slots_ref = slots;
     auto registry_raw = registry.get();
+    auto proxies_ref = acestep_proxies ?
+        acestep_proxies :
+        std::make_shared<std::unordered_map<std::string, AceStepProxyConfig>>();
 
-    svr->Get("/health", [slots_ref](const httplib::Request&, httplib::Response& res) {
-        json j = {{"status", "ok"}};
+    svr->Get("/health", [slots_ref, proxies_ref](const httplib::Request&, httplib::Response& res) {
+        // Lightweight liveness + readiness probe. Counts are O(n_slots)
+        // and lock-free (we only read booleans, no session deref), so this
+        // is cheap enough for a k8s-style probe hitting it every few seconds.
+        int total = 0, loaded = 0;
+        for (const auto& [_, slot] : *slots_ref) {
+            ++total;
+            if (slot->loaded) ++loaded;
+        }
+        // Proxy models are always "loaded" (served by the external ace-server).
+        int proxy_count = static_cast<int>(proxies_ref->size());
+        total  += proxy_count;
+        loaded += proxy_count;
+        auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now() - kServerStart)
+                            .count();
+#ifdef AUDIOCORE_HAS_WEBAPP
+        constexpr bool kHasWebapp = true;
+#else
+        constexpr bool kHasWebapp = false;
+#endif
+        json j = {
+            {"status", "ok"},
+            {"version", AUDIOCORE_VERSION},
+            {"uptime_s", static_cast<int64_t>(uptime_s)},
+            {"models_total", total},
+            {"models_loaded", loaded},
+            {"proxy_models", proxy_count},
+            {"webapp", kHasWebapp},
+        };
         res.set_content(j.dump(), "application/json");
     });
 
-    svr->Get("/v1/models", [slots_ref](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/v1/models", [slots_ref, proxies_ref](const httplib::Request&, httplib::Response& res) {
         json arr = json::array();
         for (const auto& [id, slot] : *slots_ref) {
             std::lock_guard<std::mutex> g(slot->mtx);
@@ -294,6 +395,16 @@ std::shared_ptr<httplib::Server> build_server(
                 {"id", id},
                 {"family", fam},
                 {"loaded", slot->loaded},
+            });
+        }
+        // Proxy models are served by the reference ace-server, not loaded
+        // locally. Surface them so the webapp can select them for generation.
+        for (const auto& [id, cfg] : *proxies_ref) {
+            arr.push_back({
+                {"id", id},
+                {"family", "ace_step"},
+                {"loaded", true},
+                {"backend", "acestep_proxy"},
             });
         }
         res.set_content(json{{"object", "list"}, {"data", arr}}.dump(),
@@ -323,7 +434,7 @@ std::shared_ptr<httplib::Server> build_server(
         }
         auto& slot = it->second;
         std::unique_lock<std::mutex> g(slot->mtx);
-        slot->session.reset();
+        slot->session = nullptr;
         slot->model.reset();
         slot->loaded = false;
         std::fprintf(stderr, "[server] model '%s' unloaded (VRAM freed)\n", id.c_str());
@@ -361,9 +472,8 @@ std::shared_ptr<httplib::Server> build_server(
         try {
             std::fprintf(stderr, "[server] loading '%s'...\n", id.c_str());
             auto loaded = registry_raw->load(slot->load_req);
-            auto session = loaded->create_session({VoiceTaskKind::Tts}, {});
             slot->model = std::move(loaded);
-            slot->session = std::move(session);
+            slot->session = slot->model->create_session({VoiceTaskKind::Tts}, {});
             slot->loaded = true;
             std::fprintf(stderr, "[server] model '%s' loaded\n", id.c_str());
             res.set_content(R"({"ok":true})", "application/json");
@@ -377,19 +487,50 @@ std::shared_ptr<httplib::Server> build_server(
     });
 
     // List available models on disk (scan weights directory).
+    // Resolution order: (1) explicit --model-dir / config "model_dir",
+    // (2) AUDIOCORE_WEIGHTS_DIR env var, (3) a "weights/" directory next
+    // to the executable, (4) a "weights/" directory at the repo root.
+    // This lets the Models tab in the webapp browse un-loaded models so
+    // the user can load them on demand — without requiring the server to
+    // have been launched with --model-dir.
     svr->Get("/v1/models/available",
               [weights_dir](const httplib::Request&, httplib::Response& res) {
         json arr = json::array();
-        if (!weights_dir.empty() && fs::exists(weights_dir)) {
-            for (const auto& fam_dir : fs::directory_iterator(weights_dir)) {
+        fs::path scan_dir = !weights_dir.empty() && fs::exists(weights_dir)
+                                ? fs::path(weights_dir)
+                                : fs::path();
+        if (scan_dir.empty()) {
+            if (const char* env = std::getenv("AUDIOCORE_WEIGHTS_DIR")) {
+                if (fs::exists(env)) scan_dir = env;
+            }
+        }
+        if (scan_dir.empty()) {
+            // "weights/" next to the executable.
+            char exe_buf[4096];
+            ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+            if (len > 0) {
+                exe_buf[len] = '\0';
+                fs::path exe_dir = fs::path(exe_buf).parent_path();
+                for (auto cand : {exe_dir / "weights", exe_dir.parent_path() / "weights"}) {
+                    if (fs::exists(cand)) { scan_dir = cand; break; }
+                }
+            }
+        }
+        if (!scan_dir.empty() && fs::exists(scan_dir)) {
+            std::error_code ec;
+            for (const auto& fam_dir : fs::directory_iterator(scan_dir, ec)) {
                 if (!fam_dir.is_directory()) continue;
                 std::string fam = fam_dir.path().filename().string();
-                for (const auto& model_dir : fs::directory_iterator(fam_dir.path())) {
+                // MOSS ships codec ONNX sidecars alongside model dirs — skip
+                // non-family directories early.
+                if (fam == "tmp" || fam == "MOSS-Audio-Tokenizer-ONNX") continue;
+                for (const auto& model_dir : fs::directory_iterator(fam_dir.path(), ec)) {
                     if (!model_dir.is_directory()) continue;
                     std::string mid = model_dir.path().filename().string();
                     std::string family_hint;
                     if (fam.find("ace_step") != std::string::npos) family_hint = "ace_step";
                     else if (fam.find("qwen3") != std::string::npos) family_hint = "qwen3_tts";
+                    else if (fam.find("moss_sfx") != std::string::npos) family_hint = "moss_sfx_v2";
                     else if (fam.find("moss") != std::string::npos) family_hint = "moss_tts";
                     else family_hint = fam;
                     arr.push_back({
@@ -519,6 +660,24 @@ std::shared_ptr<httplib::Server> build_server(
             }
         }
 
+        // Auto-save generated audio to the clips library. Default is ON for
+        // sound-effects and voice-design outputs (one-shot creative content
+        // the user typically wants to keep), OFF for plain TTS (frequent and
+        // short — saving every one would spam the library). The caller can
+        // force the behaviour either way with `"save": true|false`.
+        const std::string& m = tr.mode;
+        bool default_save = (m == "sfx" || m == "voice_design");
+        bool save = body.value("save", default_save);
+        if (save && !tresp.pcm_mono.empty()) {
+            std::string prefix = m.empty() ? "tts" : m;
+            std::string saved = save_pcm_to_clips(
+                clips_dir, tresp.pcm_mono, tresp.sampling_rate,
+                /*stereo=*/false, prefix);
+            if (!saved.empty()) {
+                res.set_header("X-Audiocore-Clip", saved);
+            }
+        }
+
         if (tr.response_format == "mp3") {
 #ifdef AUDIOCORE_ENABLE_MP3
             auto mp3 = pcm_mono_to_mp3(tresp.pcm_mono.data(),
@@ -536,10 +695,80 @@ std::shared_ptr<httplib::Server> build_server(
     });
 
     svr->Post("/v1/audio/music",
-              [slots_ref](const httplib::Request& req, httplib::Response& res) {
+              [slots_ref, clips_dir, proxies_ref](const httplib::Request& req, httplib::Response& res) {
+        // Parse body early — proxy models don't need a loaded slot.
+        json body;
+        try { body = json::parse(req.body); }
+        catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const std::string model_id = body.value("model", "");
+
+        // ── Check if this model is proxied to the reference ace-server ──
+        auto pit = proxies_ref->find(model_id);
+        if (pit != proxies_ref->end()) {
+            fprintf(stderr, "[music] proxying '%s' → ace-server (%s)\n",
+                    model_id.c_str(), pit->second.ace_server_url.c_str());
+
+            acestep::MusicRequest mr;
+            mr.caption  = body.value("caption", body.value("prompt", ""));
+            mr.lyrics   = body.value("lyrics", body.value("prompt_lyrics", ""));
+            mr.duration = body.value("duration", 30.0f);
+            if (body.contains("seed"))           mr.seed              = body["seed"].get<int32_t>();
+            if (body.contains("guidance_scale")) mr.guidance_scale    = body["guidance_scale"].get<float>();
+            if (body.contains("steps"))          mr.n_diffusion_steps = body["steps"].get<int32_t>();
+            if (body.contains("temperature"))    mr.temperature       = body["temperature"].get<float>();
+            if (body.contains("top_p"))          mr.top_p             = body["top_p"].get<float>();
+            if (body.contains("bpm"))            mr.bpm               = body["bpm"].get<int32_t>();
+            if (body.contains("keyscale"))       mr.keyscale          = body["keyscale"].get<std::string>();
+            if (body.contains("timesignature"))  mr.timesignature     = body["timesignature"].get<std::string>();
+            if (body.contains("vocal_language")) mr.vocal_language    = body["vocal_language"].get<std::string>();
+            if (body.contains("language"))       mr.vocal_language    = body["language"].get<std::string>();
+            if (body.contains("lm_cfg_scale"))   mr.lm_cfg_scale      = body["lm_cfg_scale"].get<float>();
+
+            auto proxy_cfg = pit->second;
+            // Allow per-request dit_variant override.
+            if (body.contains("dit_variant"))
+                proxy_cfg.dit_variant = body["dit_variant"].get<std::string>();
+            // Allow per-request VAE swap (e.g. "vae-scrag-BF16.gguf" or "vae-BF16.gguf").
+            if (body.contains("vae") && body["vae"].is_string())
+                proxy_cfg.vae_override = body["vae"].get<std::string>();
+            // Allow clearing the VAE override by sending null.
+            if (body.contains("vae") && body["vae"].is_null())
+                proxy_cfg.vae_override.clear();
+
+            std::string error;
+            auto wav = acestep_proxy_generate(proxy_cfg, mr, &error);
+            if (wav.empty()) {
+                res.status = 502;
+                json e = {{"error", "ace-server proxy failed"}, {"detail", error}};
+                res.set_content(e.dump(), "application/json");
+                return;
+            }
+
+            // Save clip to clips_dir.
+            if (!clips_dir.empty()) {
+                std::string fname = iso_timestamp_for_filename() + "_" +
+                                    model_id + ".wav";
+                std::string fpath = clips_dir + "/" + fname;
+                std::ofstream f(fpath, std::ios::binary);
+                if (f.is_open()) {
+                    f.write(reinterpret_cast<const char*>(wav.data()), wav.size());
+                    fprintf(stderr, "[music] saved clip: %s\n", fpath.c_str());
+                }
+            }
+
+            res.set_content(reinterpret_cast<const char*>(wav.data()),
+                            wav.size(), "audio/wav");
+            return;
+        }
+
+        // ── Normal path: our own ACE-Step or other music model ──
         auto sg = resolve_slot(req, *slots_ref, res);
         if (!sg) return;
-        const auto& body = sg->body;
+        body = sg->body;
         auto& slot = sg->slot;
 
         acestep::MusicRequest mr;
@@ -557,6 +786,16 @@ std::shared_ptr<httplib::Server> build_server(
         if (body.contains("steps"))          mr.n_diffusion_steps = body["steps"].get<int32_t>();
         if (body.contains("temperature"))    mr.temperature       = body["temperature"].get<float>();
         if (body.contains("top_p"))          mr.top_p             = body["top_p"].get<float>();
+        // ── Musical metadata (for Phase 2 CoT YAML injection) ─────────────
+        // When provided, these bypass Phase 1 reasoning (skip_phase1=true).
+        // When omitted (0/empty), the LM Phase 1 infers them from its
+        // reasoning block, exactly like the reference acestep.cpp.
+        if (body.contains("bpm"))            mr.bpm               = body["bpm"].get<int32_t>();
+        if (body.contains("keyscale"))       mr.keyscale          = body["keyscale"].get<std::string>();
+        if (body.contains("timesignature"))  mr.timesignature     = body["timesignature"].get<std::string>();
+        if (body.contains("vocal_language")) mr.vocal_language    = body["vocal_language"].get<std::string>();
+        if (body.contains("language"))       mr.vocal_language    = body["language"].get<std::string>();
+        if (body.contains("lm_cfg_scale"))   mr.lm_cfg_scale      = body["lm_cfg_scale"].get<float>();
 
         if (body.contains("input_audio") && body["input_audio"].is_string()) {
             std::string b64 = body["input_audio"].get<std::string>();
@@ -677,6 +916,22 @@ std::shared_ptr<httplib::Server> build_server(
                         return audiocore::change_speed(
                             p, n, static_cast<double>(speed_ratio), sr);
                     });
+            }
+        }
+
+        // Auto-save generated music to the clips library by default so it
+        // appears in the webapp's Clips tab without a separate upload step.
+        // Caller can opt out with `"save": false`. The saved filename is
+        // surfaced via the X-Audiocore-Clip response header so the client
+        // can refresh the clips list and link to it.
+        const bool save = body.value("save", true);
+        if (save && !mresp.pcm_stereo.empty()) {
+            std::string mode_tag = mr.mode.empty() ? "music" : mr.mode;
+            std::string saved = save_pcm_to_clips(
+                clips_dir, mresp.pcm_stereo, mresp.sampling_rate,
+                /*stereo=*/true, "music_" + mode_tag);
+            if (!saved.empty()) {
+                res.set_header("X-Audiocore-Clip", saved);
             }
         }
 
@@ -1238,6 +1493,138 @@ std::shared_ptr<httplib::Server> build_server(
                 res.set_content(resp.dump(), "application/json");
             });
 
+            // ── Voice extraction endpoint ────────────────────────────────
+            // POST /v1/voices/extract — extract a speaker embedding from a
+            // reference audio clip using the ECAPA-TDNN encoder (qwen3_tts).
+            // Body: {"reference_audio": "<base64 WAV>", "name": "optional.voice"}
+            //   or: {"clip": "saved_clip_name.wav", "name": "optional.voice"}
+            // Returns the .voice binary; also saves to voices_dir if name is set.
+            svr->Post("/v1/voices/extract",
+                [slots_ref, voices_dir](const httplib::Request& req, httplib::Response& res) {
+                json body;
+                try { body = json::parse(req.body); }
+                catch (...) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid json"})", "application/json");
+                    return;
+                }
+                std::string name = body.value("name", "");
+
+                // Find a loaded qwen3_tts session to run the encoder.
+                // Only qwen3_tts implements compute_embedding (ECAPA-TDNN).
+                std::shared_ptr<ModelSlot> tts_slot;
+                for (auto& [_, s] : *slots_ref) {
+                    if (s->loaded && s->session) {
+                        std::string fam = s->session->family();
+                        if (fam.find("qwen3") != std::string::npos) {
+                            tts_slot = s;
+                            break;
+                        }
+                    }
+                }
+                if (!tts_slot) {
+                    res.status = 503;
+                    json e = {{"error", "no TTS model loaded — load a qwen3_tts model first"}};
+                    res.set_content(e.dump(), "application/json");
+                    return;
+                }
+
+                // Get the WAV path: either from a saved clip or base64 decode.
+                std::string wav_path;
+                if (body.contains("clip") && !body["clip"].is_null()) {
+                    std::string clip_name = body["clip"].get<std::string>();
+                    // voices_dir = clips_dir + "/voices", so clips_dir = parent.
+                    fs::path vd(voices_dir);
+                    wav_path = (vd.parent_path() / clip_name).string();
+                } else if (body.contains("reference_audio") && !body["reference_audio"].is_null()) {
+                    // Decode base64 to a temp file.
+                    std::string b64 = body["reference_audio"].get<std::string>();
+                    static int seq = 0;
+                    wav_path = "/tmp/audiocore_voice_extract_" +
+                               std::to_string(getpid()) + "_" +
+                               std::to_string(seq++) + ".wav";
+                    // Simple base64 decoder.
+                    static const int tbl[256] = {
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+                        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+                        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                    };
+                    std::vector<uint8_t> wav_bytes;
+                    wav_bytes.reserve(b64.size() * 3 / 4);
+                    int val = 0, bits = 0;
+                    for (char c : b64) {
+                        int d = tbl[(unsigned char)c];
+                        if (d < 0) continue;
+                        val = (val << 6) | d;
+                        bits += 6;
+                        if (bits >= 8) {
+                            bits -= 8;
+                            wav_bytes.push_back((val >> bits) & 0xFF);
+                        }
+                    }
+                    std::ofstream tf(wav_path, std::ios::binary);
+                    tf.write(reinterpret_cast<const char*>(wav_bytes.data()), wav_bytes.size());
+                } else {
+                    res.status = 400;
+                    res.set_content(R"({"error":"provide 'clip' or 'reference_audio'")",
+                                    "application/json");
+                    return;
+                }
+
+                // Run the encoder.
+                std::string emb_err;
+                std::vector<float> embedding;
+                {
+                    std::lock_guard<std::mutex> g(tts_slot->mtx);
+                    embedding = tts_slot->session->compute_embedding(wav_path, &emb_err);
+                }
+                if (embedding.empty()) {
+                    res.status = 500;
+                    json e = {{"error", "embedding extraction failed"}, {"detail", emb_err}};
+                    res.set_content(e.dump(), "application/json");
+                    return;
+                }
+
+                // Save as .voice if a name was provided.
+                if (!name.empty() && name.find("..") == std::string::npos &&
+                    name.find('/') == std::string::npos) {
+                    fs::path p = fs::path(voices_dir) / name;
+                    std::ofstream f(p, std::ios::binary);
+                    if (f) {
+                        f.write("QWEN3VOICE\0\0\0\0\0\0", 16);
+                        uint32_t ver = 1, dim = static_cast<uint32_t>(embedding.size()),
+                                 flags = 0, rs = 0;
+                        f.write(reinterpret_cast<const char*>(&ver), 4);
+                        f.write(reinterpret_cast<const char*>(&dim), 4);
+                        f.write(reinterpret_cast<const char*>(&flags), 4);
+                        f.write(reinterpret_cast<const char*>(&rs), 4);
+                        f.write(reinterpret_cast<const char*>(embedding.data()),
+                               static_cast<std::streamsize>(embedding.size() * 4));
+                    }
+                }
+
+                // Return the embedding as JSON (dim + values).
+                json resp = {
+                    {"dim", embedding.size()},
+                    {"embedding", embedding},
+                    {"saved", !name.empty()},
+                };
+                if (!name.empty()) resp["name"] = name;
+                res.set_content(resp.dump(), "application/json");
+            });
+
             // ── Voice arithmetic endpoints ───────────────────────────────
             // These match the qwen_voice CLI subcommands and exist so the
             // Voice Maker tab in the webapp can do all three voice-editing
@@ -1596,6 +1983,23 @@ std::shared_ptr<httplib::Server> build_server(
         }
     }
 
+    // ── CORS preflight (cross-origin SPA / dev-proxy support) ──────────────
+    // The embedded webapp is same-origin, but production deployments often
+    // host the static assets elsewhere (CDN, separate nginx box) and point
+    // them at this inference server. Browsers block such cross-origin
+    // requests without a permissive OPTIONS response. There is no auth on
+    // this server, so a wildcard origin is safe; the matching
+    // `Access-Control-Allow-Origin: *` is attached to every response via
+    // set_default_headers below.
+    svr->Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Methods",
+                       "GET, POST, PUT, DELETE, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers",
+                       "Content-Type, Authorization, X-Requested-With");
+        res.set_header("Access-Control-Max-Age", "86400");
+        res.status = 204;  // No Content
+    });
+
     // ── Embedded webapp assets ────────────────────────────────────────────
 #ifdef AUDIOCORE_HAS_WEBAPP
     svr->Get("/", [](const httplib::Request&, httplib::Response& res) {
@@ -1612,6 +2016,28 @@ std::shared_ptr<httplib::Server> build_server(
                         "application/javascript; charset=utf-8");
     });
 #endif
+
+    // ── Production tuning ──────────────────────────────────────────────────
+    // Default httplib timeouts are 5s read / 5s write — too tight for music
+    // generation (turbo 8 steps ≈ 3s, but base 50 steps or repaint can run
+    // 30s+) and long TTS. Bump both so the proxy/browser connection stays
+    // open for the full compute window. These are upper bounds only; fast
+    // requests still return as soon as they complete.
+    svr->set_read_timeout(600, 0);    // 10 min — covers any generation
+    svr->set_write_timeout(600, 0);   // 10 min — slow clients / chunked TTS
+    svr->set_idle_interval(0, 100000); // 100 ms — responsive keep-alive sweep
+    svr->set_keep_alive_max_count(1000);
+    // Allow up to ~256 MB payloads (base64-encoded source audio for music
+    // cover/repaint, large reference clips, batch uploads).
+    svr->set_payload_max_length(256ull * 1024 * 1024);
+    // Default Content-Type for error responses.
+    // `Access-Control-Expose-Headers` lets a cross-origin webapp (e.g. a
+    // dev server on a different port) read the X-Audiocore-Clip header we
+    // attach to generation responses so it can refresh its clips list.
+    svr->set_default_headers({{"X-Content-Type-Options", "nosniff"},
+                              {"Referrer-Policy", "no-referrer"},
+                              {"Access-Control-Allow-Origin", "*"},
+                              {"Access-Control-Expose-Headers", "X-Audiocore-Clip"}});
 
     return svr;
 }

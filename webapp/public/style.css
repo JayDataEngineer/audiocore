@@ -191,6 +191,19 @@ a:hover { color: var(--accent-3); text-decoration: underline; }
 .badge.err { background: var(--red-glow); color: var(--red); border-color: rgba(239, 68, 68, .25); }
 .badge.warn { background: var(--yellow-glow); color: var(--yellow); border-color: rgba(234, 179, 8, .25); }
 
+/* Proxy engine badge — shown next to model selectors when a model is served
+   by the reference ace-server subprocess rather than local code. */
+.engine-tag {
+  font-size: 10px; font-weight: 700;
+  letter-spacing: .03em;
+  padding: 4px 8px; border-radius: var(--radius-pill);
+  background: rgba(34, 211, 238, .10); color: var(--accent-3);
+  border: 1px solid rgba(34, 211, 238, .22);
+  white-space: nowrap; cursor: default;
+  transition: opacity .2s var(--ease);
+}
+.engine-tag.hidden { display: none; }
+
 /* ══════════════ TABS ══════════════ */
 .tabs {
   display: flex; gap: 0;

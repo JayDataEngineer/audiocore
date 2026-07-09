@@ -161,27 +161,162 @@ download_one() {
     # Optional post_process: invoke a converter binary.
     local post; post="$(jq -r '.post_process // .convert_with // ""' <<<"$source_json")"
     if [ -n "$post" ]; then
-        # We only know about two converters today.
-        case "$post" in
+        # The manifest may write either "convert_acestep" or
+        # "convert_acestep --in <file>"; strip args for the dispatch match
+        # and substitute <file> in the remaining args afterwards.
+        local post_name="${post%% *}"
+        local post_args="${post#"$post_name"}"
+        # Substitute <file> placeholder with the destination file path.
+        post_args="${post_args//<file>/$dest}"
+        # Trim leading whitespace.
+        post_args="${post_args#"${post_args%%[![:space:]]*}"}"
+        case "$post_name" in
             convert_acestep|convert_qwen3tts)
-                local bin="$BUILD_DIR/$post"
+                local bin="$BUILD_DIR/$post_name"
                 if [ ! -x "$bin" ]; then
-                    echo "  warn: $bin not found; skipping conversion (build it with cmake --build build --target $post)" >&2
+                    echo "  warn: $bin not found; skipping conversion (build it with cmake --build build --target $post_name)" >&2
                     return 0
                 fi
-                # convert_acestep rewrites in place; convert_qwen3tts takes a dir.
-                if [ "$post" = "convert_acestep" ]; then
-                    echo "  convert (in-place): $bin --in $dest"
-                    [ $DRY_RUN -eq 1 ] || "$bin" --in "$dest"
+                if [ "$post_name" = "convert_acestep" ]; then
+                    # In-place conversion: the args typically carry --in <file>.
+                    # If no args, default to --in $dest for backward compat.
+                    if [ -z "$post_args" ]; then
+                        post_args="--in $dest"
+                    fi
+                    echo "  convert (in-place): $bin $post_args"
+                    [ $DRY_RUN -eq 1 ] || "$bin" $post_args
                 else
-                    echo "  convert: $bin $dest_dir/$repo --outdir $dest_dir"
-                    [ $DRY_RUN -eq 1 ] || "$bin" "$dest_dir/$repo" --outdir "$dest_dir"
+                    # convert_qwen3tts takes the upstream repo dir + --outdir.
+                    # Manifest may pass explicit args; otherwise default.
+                    if [ -z "$post_args" ]; then
+                        echo "  convert: $bin $dest_dir/$repo --outdir $dest_dir"
+                        [ $DRY_RUN -eq 1 ] || "$bin" "$dest_dir/$repo" --outdir "$dest_dir"
+                    else
+                        echo "  convert: $bin $post_args"
+                        [ $DRY_RUN -eq 1 ] || "$bin" $post_args
+                    fi
+                fi
+                ;;
+            convert_ecapa)
+                local bin="$BUILD_DIR/$post_name"
+                if [ ! -x "$bin" ]; then
+                    echo "  warn: $bin not found; skipping conversion (build it with cmake --build build --target $post_name)" >&2
+                    return 0
+                fi
+                if [ -z "$post_args" ]; then
+                    post_args="$dest_dir/$repo --outdir $dest_dir"
+                fi
+                echo "  convert: $bin $post_args"
+                [ $DRY_RUN -eq 1 ] || "$bin" $post_args
+                ;;
+            convert_moss_tts)
+                # Python converter: extracts Qwen3 backbone from MOSS
+                # safetensors via llama.cpp, then writes a sidecar GGUF
+                # carrying audio embeddings + LM heads + codec tensors.
+                local script="$PROJECT_DIR/tools/convert_moss_tts.py"
+                if [ ! -f "$script" ]; then
+                    echo "  warn: $script not found; skipping conversion" >&2
+                    return 0
+                fi
+                # Upstream model + codec repos were cloned to
+                # $dest_dir/$repo (nested: e.g. $dest_dir/OpenMOSS-Team/...).
+                # The codec lives in a sibling clone of MOSS-Audio-Tokenizer.
+                local model_repo="$dest_dir/$repo"
+                local codec_repo=""
+                local cand
+                # Search two levels deep to find the codec clone.
+                while IFS= read -r -d '' cand; do
+                    case "$(basename "$cand")" in
+                        *Audio-Tokenizer*|*audio-tokenizer*|*codec*)
+                            codec_repo="$cand"; break ;;
+                    esac
+                done < <(find "$dest_dir" -maxdepth 3 -type d -printf '%p\0' 2>/dev/null)
+                # Output GGUF is named after the variant (e.g.
+                # moss-tts-f16.gguf, moss-sfx-f16.gguf, moss-voicegen-q8_0.gguf).
+                local base_name="$variant"
+                # Strip any explicit -f16 / -q4_k_m / -q8_0 suffix from the
+                # variant name — the dtype/quant suffix is added back below
+                # based on --backbone-dtype and the optional quantize pass.
+                base_name="${base_name%-f16}"
+                base_name="${base_name%-q4-k-m}"
+                base_name="${base_name%-q8_0}"
+                local dtype="f16"
+                local out_gguf="$dest_dir/${variant}.gguf"
+                local out_sidecar="$dest_dir/${variant}.extras.gguf"
+                if [ -f "$out_gguf" ] && [ -f "$out_sidecar" ]; then
+                    echo "  have: $out_gguf (+ sidecar)"
+                else
+                    local codec_args=()
+                    if [ -n "$codec_repo" ] && [ -d "$codec_repo" ]; then
+                        codec_args=(--codec "$codec_repo")
+                    fi
+                    echo "  convert: python3 $(basename "$script") --moss-tts $model_repo ${codec_args[*]:-} --output $out_gguf"
+                    if [ $DRY_RUN -ne 1 ]; then
+                        python3 "$script" \
+                            --moss-tts "$model_repo" \
+                            "${codec_args[@]}" \
+                            --output "$out_gguf" \
+                            --backbone-dtype "$dtype" \
+                            --scratch-dir "$dest_dir/scratch" || return 1
+                    fi
+                fi
+                # Optional quantization pass.
+                local quant; quant="$(jq -r '.post_quantize // ""' <<<"$source_json")"
+                if [ -n "$quant" ]; then
+                    # llama-quantize may live at $BUILD_DIR/llama-quantize
+                    # (legacy) or $BUILD_DIR/bin/llama-quantize (current
+                    # llama.cpp layout).
+                    local qbin=""
+                    for cand in \
+                        "$BUILD_DIR/llama-quantize" \
+                        "$BUILD_DIR/bin/llama-quantize"; do
+                        if [ -x "$cand" ]; then qbin="$cand"; break; fi
+                    done
+                    if [ -n "$qbin" ] && [ -f "$out_gguf" ]; then
+                        # Name the quantized output with the variant's own
+                        # basename + lowercase quant suffix.
+                        local qout="$dest_dir/${base_name}-${quant,,}.gguf"
+                        echo "  quantize: $qbin $out_gguf $qout $quant"
+                        if [ $DRY_RUN -ne 1 ]; then
+                            "$qbin" "$out_gguf" "$qout" "$quant" || return 1
+                            # Remove the F16 intermediate so the directory
+                            # scanner picks the quantized file. Without this,
+                            # sorted() picks "moss-tts-q4-k-m.gguf" (F16)
+                            # before "moss-tts-q4_k_m.gguf" (quantized).
+                            rm -f "$out_gguf"
+                        fi
+                    elif [ -z "$qbin" ]; then
+                        echo "  warn: llama-quantize not found (looked in $BUILD_DIR and $BUILD_DIR/bin)" >&2
+                        echo "         build with: cmake -S . -B build -DENGINE_BUILD_LLAMA_QUANTIZE=ON && cmake --build build --target llama-quantize" >&2
+                        echo "         F16 retained" >&2
+                    fi
                 fi
                 ;;
             *)
                 echo "  warn: unknown converter '$post'; skipping" >&2
                 ;;
         esac
+    fi
+
+    # Optional sidecar: download a companion .extras.gguf alongside the main file.
+    local sidecar; sidecar="$(jq -r '.sidecar // ""' <<<"$source_json")"
+    if [ -n "$sidecar" ]; then
+        local sidecar_url; sidecar_url="$(build_hf_url "$repo" "$rev" "$sidecar")"
+        local sidecar_dest="$dest_dir/$sidecar"
+        if [ -f "$sidecar_dest" ]; then
+            echo "  have: $sidecar_dest"
+        else
+            if [ $DRY_RUN -eq 1 ]; then
+                echo "  would: curl -L $sidecar_url -o $sidecar_dest"
+            else
+                echo "  fetch: $sidecar_url → $sidecar_dest"
+                local auth=()
+                if [ -n "${HF_TOKEN:-}" ]; then
+                    auth=(--header "Authorization: Bearer $HF_TOKEN")
+                fi
+                curl -fL "${auth[@]}" "$sidecar_url" -o "$sidecar_dest.tmp" && mv "$sidecar_dest.tmp" "$sidecar_dest"
+            fi
+        fi
     fi
 }
 
@@ -204,7 +339,14 @@ while IFS= read -r family_quoted; do
         files_json="$(jq -c --arg f "$family" --arg v "$variant" '.families[$f].variants[$v].files[]' "$MANIFEST")"
         while IFS= read -r file_obj; do
             filename="$(jq -r '.filename' <<<"$file_obj")"
-            source_json="$(jq -c '.source' <<<"$file_obj")"
+            # Merge file-level post_process / post_quantize down into the
+            # source object so download_one's single-arg lookup works whether
+            # the manifest used the legacy `source.convert_with` form or the
+            # newer file-level `post_process` form.
+            source_json="$(jq -c \
+                --argjson pp "$(jq -r '.post_process // .source.convert_with // ""' <<<"$file_obj" | jq -R '{post_process: .}')" \
+                --argjson pq "$(jq -r '.post_quantize // ""' <<<"$file_obj" | jq -R '{post_quantize: .}')" \
+                '.source + $pp + $pq' <<<"$file_obj")"
             download_one "$family" "$variant" "$dest_dir" "$filename" "$source_json" || status=1
         done <<<"$files_json"
     done <<<"$variants_json"

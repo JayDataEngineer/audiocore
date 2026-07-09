@@ -102,7 +102,7 @@ struct MusicResponse {
 class AceStepSession : public Session {
 public:
     ~AceStepSession() override;
-    std::string family_name() const override { return "ace_step"; }
+    std::string family() const override { return "ace_step"; }
     bool load(const std::string& model_path,
               const LoadOptions& opts,
               const BackendConfig& backend_cfg,

@@ -31,7 +31,7 @@ struct SfxConfig {
 class SfxSession : public Session {
 public:
     ~SfxSession() override;
-    std::string family_name() const override { return "moss_sfx_v2"; }
+    std::string family() const override { return "moss_sfx_v2"; }
     bool load(const std::string& model_path,
               const LoadOptions& opts,
               const BackendConfig& backend_cfg,

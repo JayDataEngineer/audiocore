@@ -37,6 +37,31 @@ option(ENGINE_BUILD_WEBAPP      "Embed web UI in server binary"    ON)
 option(ENGINE_BUILD_TESTS        "Build unit tests"             OFF)
 option(ENGINE_BUILD_PYTHON       "Build Python bindings"        OFF)
 
+# ── Version stamp (git describe, with a fallback) ──────────────────────────
+# Exposed as AUDIOCORE_VERSION on compile so /health and the startup banner
+# can surface what is actually running. Override with -DAUDIOCORE_VERSION=...
+# at configure time for out-of-tree / packaged builds that don't ship .git.
+if(NOT DEFINED AUDIOCORE_VERSION)
+    find_package(Git QUIET)
+    if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" describe --tags --dirty --always
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            OUTPUT_VARIABLE _audiocore_git_ver
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+            RESULT_VARIABLE _audiocore_git_rc
+        )
+        if(_audiocore_git_rc EQUAL 0 AND _audiocore_git_ver)
+            set(AUDIOCORE_VERSION "${_audiocore_git_ver}")
+        endif()
+    endif()
+endif()
+if(NOT AUDIOCORE_VERSION)
+    set(AUDIOCORE_VERSION "0.0.0-dev")
+endif()
+message(STATUS "audiocore version: ${AUDIOCORE_VERSION}")
+
 # ── llama.cpp (subtree in third_party/llama.cpp) ─────────────────────────
 # Pinned via git submodule. Provides libllama (Qwen3 inference) AND vendors
 # its own ggml under llama.cpp/ggml/. We use the llama.cpp copy and drop our
@@ -58,6 +83,24 @@ if(ENGINE_ENABLE_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
 endif()
 add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
+
+# Opt-in: build llama-quantize so fetch_models.sh can quantize converted
+# MOSS-TTS / MOSS-SFX / MOSS-VoiceGen backbones in-place.
+#   cmake -S . -B build -DENGINE_BUILD_LLAMA_QUANTIZE=ON
+#   cmake --build build --target llama-quantize
+# Binary lands at ${CMAKE_BINARY_DIR}/bin/llama-quantize.
+option(ENGINE_BUILD_LLAMA_QUANTIZE "Build llama-quantize for fetch_models.sh quantization" OFF)
+if(ENGINE_BUILD_LLAMA_QUANTIZE)
+    set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TOOLS  ON CACHE BOOL "" FORCE)
+    # The llama.cpp tools were skipped at first configure because
+    # LLAMA_STANDALONE was OFF.  Add the common lib + quantize tool directly
+    # so we get just the target we need without pulling in every tool.
+    if(NOT TARGET llama-quantize)
+        add_subdirectory(third_party/llama.cpp/common)
+        add_subdirectory(third_party/llama.cpp/tools/quantize)
+    endif()
+endif()
 
 # ── audiocore framework library ──────────────────────────────────────────
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -125,6 +168,7 @@ add_library(audiocore_framework STATIC
     # audiocore_server binary AND into the e2e HTTP test, so both share the
     # same routing code path.
     src/server/server.cpp
+    src/server/acestep_proxy.cpp
 )
 if(ENGINE_ENABLE_MP3)
     target_sources(audiocore_framework PRIVATE src/framework/io/mp3_encoder.cpp)
@@ -159,6 +203,9 @@ if(ENGINE_BUILD_WEBAPP AND ENGINE_BUILD_SERVER)
     target_include_directories(audiocore_framework PRIVATE "${WEBAPP_OUT}")
     target_compile_definitions(audiocore_framework PRIVATE AUDIOCORE_HAS_WEBAPP=1)
 endif()
+
+# Surface the configured version to all translation units.
+target_compile_definitions(audiocore_framework PUBLIC AUDIOCORE_VERSION="${AUDIOCORE_VERSION}")
 target_include_directories(audiocore_framework
     PUBLIC
         include
@@ -189,6 +236,12 @@ if(ENGINE_BUILD_SERVER)
     add_executable(audiocore_server src/server/main.cpp)
     # cpp-httplib needs Threads on linux.
     target_link_libraries(audiocore_server PRIVATE audiocore_framework pthread)
+    # Propagate the webapp-embedded flag so main.cpp's startup banner reports
+    # the correct state (the asset bytes live in the framework lib, but the
+    # banner check runs in the executable's TU).
+    if(ENGINE_BUILD_WEBAPP)
+        target_compile_definitions(audiocore_server PRIVATE AUDIOCORE_HAS_WEBAPP=1)
+    endif()
 endif()
 
 # ACE-Step HF → llama.cpp tensor-name converter. Builds unconditionally so the

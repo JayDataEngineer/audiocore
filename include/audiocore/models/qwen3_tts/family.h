@@ -160,7 +160,7 @@ public:
     Qwen3TtsSession();
     ~Qwen3TtsSession() override;
 
-    std::string family_name() const override { return "qwen3_tts"; }
+    std::string family() const override { return "qwen3_tts"; }
 
     bool load(const std::string& model_path,
               const LoadOptions& opts,

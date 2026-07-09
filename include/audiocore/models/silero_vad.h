@@ -31,7 +31,7 @@ public:
     SileroVadSession();
     ~SileroVadSession() override;
 
-    std::string family_name() const override { return "silero_vad"; }
+    std::string family() const override { return "silero_vad"; }
 
     bool load(const std::string& model_path,
               const LoadOptions& opts,
