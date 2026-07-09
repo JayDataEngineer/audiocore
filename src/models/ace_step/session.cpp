@@ -786,6 +786,9 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                                                     : normalize_timesig(req.timesignature);
     meta.vocal_language = req.vocal_language;
 
+    // Save original user caption for genre detection (before Phase 1 enrichment)
+    const std::string original_caption = req.caption;
+
     // Can we skip Phase 1? (all metadata provided by user)
     const bool skip_phase1 = (meta.bpm > 0 &&
                               !meta.keyscale.empty() &&
@@ -1211,6 +1214,63 @@ bool AceStepSession::run_lm(const MusicRequest& req,
                     "keyscale='%s' timesig='%s' lang='%s'\n",
             meta.bpm, meta.duration, meta.keyscale.c_str(),
             meta.timesignature.c_str(), meta.vocal_language.c_str());
+
+    // ── GENRE-AWARE METADATA OVERRIDE (always runs) ──────────────────────
+    // Phase 1's metadata inference is often wrong for short captions
+    // (e.g. bpm=100, keyscale='B♭ minor' for "metal" — should be bpm=140,
+    // D minor). When the user didn't provide explicit metadata AND the
+    // original caption is short enough to benefit from genre defaults,
+    // override with genre-appropriate values. This ensures the CoT YAML
+    // and TE prompt have correct musical context regardless of Phase 1's
+    // quality. User-provided values ALWAYS take priority.
+    if (original_caption.size() < 80) {
+        std::string gl = original_caption;
+        for (auto& ch : gl) ch = (char)tolower(ch);
+        auto ghas = [&](const std::string& kw) { return gl.find(kw) != std::string::npos; };
+
+        int32_t genre_bpm = 0;
+        const char* genre_key = nullptr;
+        const char* genre_ts = "4";
+        bool genre_found = false;
+
+        if (ghas("metal") || ghas("metalcore") || ghas("deathcore")) {
+            genre_bpm = 140; genre_key = "D minor"; genre_found = true;
+        } else if (ghas("rock") || ghas("punk") || ghas("grunge")) {
+            genre_bpm = 128; genre_key = "E minor"; genre_found = true;
+        } else if (ghas("edm") || ghas("electronic") || ghas("house") ||
+                   ghas("techno") || ghas("trance") || ghas("dubstep")) {
+            genre_bpm = 128; genre_key = "A minor"; genre_found = true;
+        } else if (ghas("jazz")) {
+            genre_bpm = 120; genre_key = "Bb major"; genre_found = true;
+        } else if (ghas("country") || ghas("folk") || ghas("acoustic")) {
+            genre_bpm = 100; genre_key = "G major"; genre_found = true;
+        } else if (ghas("blues")) {
+            genre_bpm = 100; genre_key = "A minor"; genre_found = true;
+        } else if (ghas("hip") || ghas("rap") || ghas("r&b") || ghas("soul")) {
+            genre_bpm = 90; genre_key = "F# minor"; genre_found = true;
+        } else if (ghas("pop")) {
+            genre_bpm = 120; genre_key = "C major"; genre_found = true;
+        } else if (ghas("reggae")) {
+            genre_bpm = 80; genre_key = "Bb major"; genre_found = true;
+        } else if (ghas("funk")) {
+            genre_bpm = 110; genre_key = "D minor"; genre_found = true;
+        }
+
+        if (genre_found) {
+            if (req.bpm == 0 && meta.bpm != genre_bpm) {
+                meta.bpm = genre_bpm;
+            }
+            if (req.keyscale.empty() && genre_key) {
+                meta.keyscale = genre_key;
+            }
+            if (req.timesignature.empty()) {
+                meta.timesignature = genre_ts;
+            }
+            fprintf(stderr, "[ace_step] run_lm: genre-aware metadata override: "
+                            "bpm=%d keyscale='%s' timesig='%s'\n",
+                    meta.bpm, meta.keyscale.c_str(), meta.timesignature.c_str());
+        }
+    }
 
     // ════════════════════════════════════════════════════════════════════════
     //  TE Encoding (DEFERRED from above — now uses enriched metadata)
