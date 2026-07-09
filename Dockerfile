@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         pkg-config \
         libmp3lame-dev \
+        libespeak-ng-dev \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so \
@@ -70,6 +71,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libmp3lame0 \
         libgomp1 \
+        libespeak-ng1 \
         ca-certificates \
         curl \
         jq \

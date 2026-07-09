@@ -39,7 +39,7 @@ jobs:
       - name: install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential ${{ matrix.cc }}
+          sudo apt-get install -y cmake build-essential libespeak-ng-dev libmp3lame-dev ${{ matrix.cc }}
 
       - name: apply submodule patches
         run: ./scripts/apply-submodule-patches.sh
