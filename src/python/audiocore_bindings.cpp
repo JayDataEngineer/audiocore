@@ -150,7 +150,7 @@ public:
               int32_t bpm = 0,
               const std::string& keyscale = "",
               const std::string& timesignature = "") {
-        ace_step::MusicRequest req;
+        acestep::MusicRequest req;
         req.caption           = caption;
         req.lyrics            = lyrics;
         req.duration          = duration;
@@ -166,7 +166,7 @@ public:
         req.keyscale          = keyscale;
         req.timesignature     = timesignature;
 
-        ace_step::MusicResponse resp;
+        acestep::MusicResponse resp;
         std::string err;
         if (!session_->run_music(&req, &resp, &err)) {
             throw std::runtime_error("music generation failed: " + err);
