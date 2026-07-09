@@ -9,6 +9,7 @@
 #include "audiocore/framework/core/session.h"
 #include "audiocore/framework/runtime/registry.h"
 #include "audiocore/framework/runtime/tasks.h"
+#include "audiocore/models/ace_step/family.h"
 
 namespace py = pybind11;
 using namespace audiocore;
@@ -20,11 +21,13 @@ using namespace audiocore;
 extern "C" void audiocore_register_moss_tts();
 extern "C" void audiocore_register_ace_step();
 extern "C" void audiocore_register_qwen3_tts();
+extern "C" void audiocore_register_moss_sfx_v2();
 
 static void register_all_families() {
     audiocore_register_moss_tts();
     audiocore_register_ace_step();
     audiocore_register_qwen3_tts();
+    audiocore_register_moss_sfx_v2();
 }
 
 // ── PythonSession wrapper ──────────────────────────────────────────────────
@@ -131,6 +134,46 @@ public:
         return emb;
     }
 
+    // Run music generation (ACE-Step family). Returns stereo PCM at 48 kHz.
+    std::tuple<std::vector<float>, int32_t, int32_t>
+    run_music(const std::string& caption,
+              const std::string& lyrics = "",
+              float duration = 30.0f,
+              int32_t seed = 0,
+              float guidance_scale = 1.0f,
+              int32_t n_diffusion_steps = 0,
+              float temperature = 0.85f,
+              float top_p = 0.9f,
+              float lm_cfg_scale = 2.0f,
+              const std::string& mode = "text_to_music",
+              const std::string& vocal_language = "en",
+              int32_t bpm = 0,
+              const std::string& keyscale = "",
+              const std::string& timesignature = "") {
+        ace_step::MusicRequest req;
+        req.caption           = caption;
+        req.lyrics            = lyrics;
+        req.duration          = duration;
+        req.seed              = seed;
+        req.guidance_scale    = guidance_scale;
+        req.n_diffusion_steps = n_diffusion_steps;
+        req.temperature       = temperature;
+        req.top_p             = top_p;
+        req.lm_cfg_scale      = lm_cfg_scale;
+        req.mode              = mode;
+        req.vocal_language    = vocal_language;
+        req.bpm               = bpm;
+        req.keyscale          = keyscale;
+        req.timesignature     = timesignature;
+
+        ace_step::MusicResponse resp;
+        std::string err;
+        if (!session_->run_music(&req, &resp, &err)) {
+            throw std::runtime_error("music generation failed: " + err);
+        }
+        return {std::move(resp.pcm_stereo), resp.sampling_rate, resp.channels};
+    }
+
     bool loaded() const { return session_->loaded(); }
 
 private:
@@ -144,8 +187,8 @@ PYBIND11_MODULE(audiocore, m) {
 
     // Module-level init (must call before creating sessions)
     m.def("init", &register_all_families,
-          "Register all model families (moss_tts, ace_step, qwen3_tts). "
-          "Required once before creating any session.");
+          "Register all model families (moss_tts, ace_step, qwen3_tts, "
+          "moss_sfx_v2). Required once before creating any session.");
 
     m.def("list_families", []() {
         return FamilyRegistry::instance().list();
@@ -199,6 +242,26 @@ PYBIND11_MODULE(audiocore, m) {
              "suitable for passing to run_tts(speaker_embedding=...). "
              "Voice-caching pattern: compute once, save the vector, reuse "
              "across thousands of run_tts calls without re-running ECAPA.")
+
+        .def("run_music", &PythonSession::run_music,
+             py::arg("caption"),
+             py::arg("lyrics") = "",
+             py::arg("duration") = 30.0f,
+             py::arg("seed") = 0,
+             py::arg("guidance_scale") = 1.0f,
+             py::arg("n_diffusion_steps") = 0,
+             py::arg("temperature") = 0.85f,
+             py::arg("top_p") = 0.9f,
+             py::arg("lm_cfg_scale") = 2.0f,
+             py::arg("mode") = "text_to_music",
+             py::arg("vocal_language") = "en",
+             py::arg("bpm") = 0,
+             py::arg("keyscale") = "",
+             py::arg("timesignature") = "",
+             "Run music generation (ACE-Step). "
+             "Returns (pcm_stereo_f32, sample_rate, channels). "
+             "caption is the text prompt; lyrics optional. "
+             "n_diffusion_steps=0 uses variant default (turbo=8, sft=50).")
 
         .def("loaded", &PythonSession::loaded,
              "Check if model weights are loaded.");
