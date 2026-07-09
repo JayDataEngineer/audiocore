@@ -3,4 +3,4 @@
 	url = https://github.com/ggml-org/ggml.git
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
-	url = https://github.com/ggml-org/llama.cpp
+	url = https://github.com/JayDataEngineer/llama.cpp.git
