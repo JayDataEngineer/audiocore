@@ -178,6 +178,15 @@ class AudiocoreTTS:
             if v is not None and v != ""
         }
 
+        # ── Mode alias mapping ──
+        # The node UI exposes "clone" / "design" for readability, but the
+        # C++ engine (moss_tts session.cpp) expects "voice_clone" for the
+        # zero-shot cloning mode. Map it here so users don't hit a runtime
+        # error from the engine's mode validation.
+        mode = call_kwargs.get("mode", "tts")
+        if mode == "clone":
+            call_kwargs["mode"] = "voice_clone"
+
         pcm, sr = model.run_tts(text, **call_kwargs)
         audio_np = np.clip(np.array(pcm, dtype=np.float32), -1.0, 1.0)
         waveform = torch.from_numpy(audio_np).reshape(1, 1, -1)
