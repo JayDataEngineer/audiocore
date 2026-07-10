@@ -77,7 +77,17 @@ class ManagedModel:
     Each LoadAudiocoreModel node creates one ManagedModel. Downstream TTS /
     embedding nodes receive it via the AUDIOCORE_MODEL type. Multiple
     ManagedModels (different families or paths) can coexist in one graph.
+
+    VRAM management: a global registry tracks all live sessions. When a new
+    model is loaded, the registry unloads previous sessions first to free
+    VRAM — preventing OOM-induced "tensor count mismatch" errors that occur
+    when GGML can't allocate weight buffers.
     """
+
+    # Global registry: only ONE model resident in VRAM at a time (singleton).
+    # GGML models are large (8B MOSS-TTS Q8 ≈ 9 GB). On a 24 GB 4090, loading
+    # a second model without freeing the first causes silent weight corruption.
+    _active_model: "ManagedModel | None" = None
 
     def __init__(self, family: str, path: str, backend: str = "ggml_cuda"):
         self.family = family
@@ -89,6 +99,14 @@ class ManagedModel:
         """Load model weights. Returns True on success."""
         if self._session is not None:
             return True
+
+        # ── Free VRAM from any previously loaded model ──
+        prev = ManagedModel._active_model
+        if prev is not None and prev is not self:
+            logger.info("unloading %s from VRAM before loading %s",
+                        prev.family, self.family)
+            prev._cleanup()
+
         init()
         import audiocore
         try:
@@ -97,17 +115,38 @@ class ManagedModel:
             load_kwargs = {k: v for k, v in extras.items() if v}
             s.load(self.path, **kwargs, **load_kwargs)
             self._session = s
+            ManagedModel._active_model = self
             logger.info("loaded %s from %s", self.family, self.path)
             return True
         except Exception as e:
             logger.error("load failed for %s: %s", self.family, e)
             return False
 
-    def unload(self):
-        """Release the model session (frees VRAM)."""
-        self._session = None
+    def _cleanup(self):
+        """Actually free the C++ session and its VRAM."""
+        if self._session is not None:
+            # Call the C++ destructor explicitly if available.
+            close_fn = getattr(self._session, "close", None)
+            if close_fn:
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._session = None
+        if ManagedModel._active_model is self:
+            ManagedModel._active_model = None
         import gc
         gc.collect()
+        # Force CUDA cache clear so GGML can reallocate.
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def unload(self):
+        """Release the model session (frees VRAM)."""
+        self._cleanup()
 
     def run_tts(self, text: str, **kwargs) -> tuple[list[float], int]:
         """Run TTS inference. Returns (pcm_float32, sample_rate)."""
