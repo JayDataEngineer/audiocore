@@ -108,6 +108,19 @@ class AudiocoreTTS:
       clone  — zero-shot voice cloning (needs reference_audio + reference_text)
       design — instruction-following voice design (needs instruct)
 
+    Combined mode (critical): reference_audio/voice_file AND instruct can be
+    passed simultaneously. The C++ engine's voice_clone path accepts a speaker
+    embedding (voice identity) AND an instruct string (emotion/style direction)
+    at the same time — this is the "custom voice + emotion" pipeline that
+    Qwen3-TTS cannot do natively. The service layer auto-escalates to clone
+    mode when a voice source is present, while still forwarding instruct.
+
+    Voice files: a .voice file is a pre-computed speaker embedding (ECAPA or
+    PCA-steered). Pass voice_file="/path/to/voice.voice" to load it instead
+    of running ECAPA on a reference WAV. Optionally pass voice_pca_strengths
+    as a JSON string like '{"pca_pc1.dir": 0.5, "pca_pc2.dir": -0.3}' to
+    steer the embedding along principal component directions.
+
     Voice caching: connect an AUDIOCORE_EMBEDDING from
     AudiocoreVoiceEmbedding to speaker_embedding to bypass per-call
     ECAPA computation (qwen3_tts only).
@@ -162,10 +175,19 @@ class AudiocoreTTS:
                 "speaker_name": ("STRING", {"default": ""}),
                 "instruct": ("STRING", {
                     "default": "",
-                    "placeholder": "voice description (mode=design)",
+                    "placeholder": "emotion/style direction (works with ANY mode)",
                     "multiline": True,
                 }),
                 "speaker_embedding": ("AUDIOCORE_EMBEDDING",),
+                "voice_file": ("STRING", {
+                    "default": "",
+                    "placeholder": "/path/to/voice.voice (pre-computed speaker embedding)",
+                }),
+                "voice_pca_strengths": ("STRING", {
+                    "default": "",
+                    "placeholder": '{"pca_pc1.dir": 0.5, "pca_pc2.dir": -0.3}',
+                    "multiline": True,
+                }),
             },
         }
 
@@ -178,13 +200,73 @@ class AudiocoreTTS:
             if v is not None and v != ""
         }
 
+        # ── Voice file loading + PCA steering ──
+        # A .voice file is a pre-computed speaker embedding (QWEN3VOICE
+        # header + float32 vector). When provided, load it and pass as
+        # speaker_embedding — bypasses ECAPA extraction from a WAV ref.
+        # Optionally apply PCA steering: each .dir file is a principal
+        # component direction; voice_pca_strengths is JSON mapping
+        # direction file names to strength multipliers.
+        voice_file = call_kwargs.pop("voice_file", "")
+        pca_json = call_kwargs.pop("voice_pca_strengths", "")
+
+        if voice_file:
+            import json as _json
+            import struct as _struct
+            import numpy as _np
+
+            with open(voice_file, "rb") as f:
+                data = f.read()
+            MAGIC = b"QWEN3VOICE"
+            if len(data) >= 36 and data[:len(MAGIC)] == MAGIC:
+                dim = _struct.unpack_from("<I", data, 20)[0]
+                emb = _np.frombuffer(data, dtype=_np.float32,
+                                     count=dim, offset=32)
+            else:
+                emb = _np.frombuffer(data, dtype=_np.float32)
+            emb = _np.array(emb, dtype=_np.float32)
+
+            # Apply PCA steering if requested.
+            if pca_json:
+                import os.path as _osp
+                voices_dir = _osp.dirname(voice_file)
+                strengths = _json.loads(pca_json)
+                for dir_name, strength in strengths.items():
+                    dir_path = _osp.join(voices_dir, dir_name)
+                    if not _osp.exists(dir_path):
+                        continue
+                    with open(dir_path, "rb") as f:
+                        ddata = f.read()
+                    if len(ddata) >= 36 and ddata[:len(MAGIC)] == MAGIC:
+                        ddim = _struct.unpack_from("<I", ddata, 20)[0]
+                        direction = _np.frombuffer(ddata, dtype=_np.float32,
+                                                   count=ddim, offset=32)
+                    else:
+                        direction = _np.frombuffer(ddata, dtype=_np.float32)
+                    direction = _np.array(direction, dtype=_np.float32)
+                    if len(direction) == len(emb):
+                        emb = emb + direction * float(strength)
+
+            # Override speaker_embedding with the loaded+steered vector.
+            # Remove any pre-existing speaker_embedding (from graph input)
+            # so our computed one takes precedence.
+            call_kwargs.pop("speaker_embedding", None)
+            call_kwargs["speaker_embedding"] = emb.tolist()
+
         # ── Mode alias mapping ──
         # The node UI exposes "clone" / "design" for readability, but the
         # C++ engine (moss_tts session.cpp) expects "voice_clone" for the
         # zero-shot cloning mode. Map it here so users don't hit a runtime
         # error from the engine's mode validation.
+        #
+        # Critical: voice_clone mode accepts BOTH reference_audio AND
+        # instruct simultaneously. If a voice source is present, always
+        # use voice_clone so the combined path activates.
         mode = call_kwargs.get("mode", "tts")
-        if mode == "clone":
+        has_voice = bool(call_kwargs.get("reference_audio")
+                         or call_kwargs.get("speaker_embedding")
+                         or call_kwargs.get("voice_path"))
+        if mode == "clone" or (has_voice and mode in ("tts", "design", "")):
             call_kwargs["mode"] = "voice_clone"
 
         pcm, sr = model.run_tts(text, **call_kwargs)
