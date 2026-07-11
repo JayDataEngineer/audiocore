@@ -1101,6 +1101,28 @@ select[multiple] { background-image: none; padding-right: 12px; }
 }
 .cockpit-polygon svg { width: 100%; max-width: 600px; height: auto; }
 
+/* PCA sweep bar — isolate each PC at +max/-min for perceptual listening */
+.pca-sweep-bar {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  justify-content: center; margin-top: 8px; max-width: 600px;
+}
+.pca-sweep-group {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 2px; min-width: 100px;
+}
+.pca-sweep-label {
+  font-size: 9px; color: var(--text-dim); text-align: center;
+  line-height: 1.2; max-width: 100px;
+}
+.pca-sweep-btns { display: flex; gap: 2px; }
+.pca-sweep-btn {
+  font-size: 10px; padding: 3px 8px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg-card);
+  color: var(--text); border-radius: 3px; transition: background 0.15s;
+}
+.pca-sweep-btn:hover { background: var(--border); }
+.pca-sweep-btn.active { background: #f59e0b; color: #1a1a2e; border-color: #f59e0b; }
+
 /* Staged steps — numbered badges guide the eye left-to-right */
 .ck-step {
   display: flex; align-items: center; gap: 0.5em; margin: 0.35em 0 0.1em;

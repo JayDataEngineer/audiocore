@@ -2285,31 +2285,86 @@
   // ── Draggable PCA explorer: drag the marker, reconstruct the embedding,
   //    and either play it (POST to /v1/audio/speech) or save it as a .voice. ──
   // ── PCA polygon (radar) renderer ─────────────────────────────────────
-  // One axis per principal component; each vertex is draggable along its
-  // axis to set that PC's signed weight. The filled polygon IS the voice.
+  // ── Push-pull polygon ───────────────────────────────────────────────────
+  // 10 vertices on a decagon, but only N_PCA_PCS underlying PCA values.
+  // Each PCA gets a PAIR of opposite vertices:
+  //   vertex k       = positive end of PCA k  (drag outward → weight ↑)
+  //   vertex k+N     = negative end of PCA k  (drag outward → weight ↓)
+  // At most one vertex of each pair is off-center at any time.
+  // This gives 10 grab points but only 5 numbers — easy to understand.
+  const N_PCA_PCS = 5; // show top 5 PCAs on the polygon (91% of variance)
+
+  // ── Sweep bar: isolate one PCA at ±max to listen and label it ──
+  // Each PCA gets a label + "−" / "+" buttons. Clicking zeros everything
+  // else and pushes that PCA to its extreme, so you can hear what it does.
+  function pca_render_sweep_bar() {
+    const host = document.getElementById("pca-sweep-bar");
+    if (!host || !PCA.data) return;
+    const d = PCA.data;
+    const np = Math.min(N_PCA_PCS, d.n_components);
+    let html = "";
+    for (let k = 0; k < np; k++) {
+      const al = d.axis_labels && d.axis_labels[k];
+      const labeled = al && al.score > 0;
+      const varp = ((d.explained_variance_ratio[k] || 0) * 100).toFixed(0);
+      const name = labeled ? al.label : ('PC' + (k + 1));
+      const negTag = labeled ? al.neg : '−';
+      const posTag = labeled ? al.pos : '+';
+      html += '<div class="pca-sweep-group">';
+      html += '<span class="pca-sweep-label">' + name + ' · ' + varp + '%</span>';
+      html += '<div class="pca-sweep-btns">';
+      html += '<button class="pca-sweep-btn" data-pca="' + k + '" data-sign="-1" type="button" title="' + negTag + '">− ' + negTag + '</button>';
+      html += '<button class="pca-sweep-btn" data-pca="' + k + '" data-sign="1" type="button" title="' + posTag + '">+ ' + posTag + '</button>';
+      html += '</div></div>';
+    }
+    host.innerHTML = html;
+    host.querySelectorAll(".pca-sweep-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const k = parseInt(btn.dataset.pca, 10);
+        const sign = parseInt(btn.dataset.sign, 10);
+        const rg = PCA.ranges[k] || 1;
+        PCA.weights.fill(0);
+        PCA.weights[k] = sign * rg;
+        pca_refresh();
+        // visual feedback: highlight active button briefly
+        host.querySelectorAll(".pca-sweep-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        setTimeout(() => btn.classList.remove("active"), 600);
+      });
+    });
+  }
+
   function pca_render_polygon() {
     const host = document.getElementById("pca-polygon");
     if (!host || !PCA.data) return;
     const d = PCA.data;
-    const axes = Math.min(d.n_components, 16);   // cap visible axes
+    const np = Math.min(N_PCA_PCS, d.n_components);
+    const nVerts = np * 2;  // 10 vertices for 5 PCAs
     const W = 600, H = 600, cx = W / 2, cy = H / 2, R = 220;
     const dirs = [];
-    for (let i = 0; i < axes; i++) {
-      const a = -Math.PI / 2 + i * (2 * Math.PI / axes);
+    for (let i = 0; i < nVerts; i++) {
+      const a = -Math.PI / 2 + i * (2 * Math.PI / nVerts);
       dirs.push({ x: Math.cos(a), y: Math.sin(a) });
     }
-    const vertexPos = (i) => {
-      const w = PCA.weights[i] || 0, rg = PCA.ranges[i] || 1;
-      const rr = (w / rg) * R;                    // signed radius
-      return { x: cx + dirs[i].x * rr, y: cy + dirs[i].y * rr };
+
+    // Each PCA k has weight PCA.weights[k]. The positive vertex (k) sits
+    // at radius = max(0, w) * R; the negative vertex (k+np) sits at
+    // radius = max(0, -w) * R. So the polygon stretches toward whichever
+    // end you push.
+    const pcaIdx = (vi) => vi < np ? vi : vi - np;      // vertex → PCA index
+    const vertexPos = (vi) => {
+      const k = pcaIdx(vi);
+      const w = PCA.weights[k] || 0, rg = PCA.ranges[k] || 1;
+      const isPos = vi < np;
+      const signed = isPos ? Math.max(0, w / rg) : Math.max(0, -w / rg);
+      const rr = signed * R;
+      return { x: cx + dirs[vi].x * rr, y: cy + dirs[vi].y * rr };
     };
 
-    // Build the scaffold ONCE; refreshes only update points/cx/cy in place.
-    // (Rebuilding innerHTML on every drag tick destroys the dragged vertex and
-    //  its pointer-capture, killing the drag after one move — see pca_refresh.)
+    // Build scaffold ONCE.
     let svgEl = host.querySelector("svg");
     const needRebuild = !svgEl ||
-      svgEl.dataset.axes !== String(axes) ||
+      svgEl.dataset.np !== String(np) ||
       svgEl.dataset.W !== String(W) || svgEl.dataset.R !== String(R);
     if (needRebuild) {
       let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
@@ -2317,53 +2372,81 @@
       // grid rings
       for (let g = 1; g <= 3; g++) {
         let pts = "";
-        for (let i = 0; i < axes; i++) {
+        for (let i = 0; i < nVerts; i++) {
           const x = cx + dirs[i].x * (R * g / 3), y = cy + dirs[i].y * (R * g / 3);
           pts += x.toFixed(1) + "," + y.toFixed(1) + " ";
         }
-        svg += '<polygon points="' + pts.trim() + '" fill="none" stroke="var(--border)" stroke-width="1" opacity="0.5"/>';
+        svg += '<polygon points="' + pts.trim() + '" fill="none" stroke="var(--border)" stroke-width="1" opacity="0.4"/>';
       }
-      // axes + labels
-      for (let i = 0; i < axes; i++) {
-        const ex = cx + dirs[i].x * R, ey = cy + dirs[i].y * R;
-        svg += '<line x1="' + cx + '" y1="' + cy + '" x2="' + ex.toFixed(1) + '" y2="' + ey.toFixed(1) +
-               '" stroke="var(--border)" stroke-width="1" opacity="0.6"/>';
-        const lx = cx + dirs[i].x * (R + 28), ly = cy + dirs[i].y * (R + 28);
-        const al = d.axis_labels && d.axis_labels[i];
-        const varp = ((d.explained_variance_ratio[i] || 0) * 100).toFixed(0);
-        const shortLabel = (al && al.score > 0) ? al.label : 'PC' + (i + 1);
+      // diameter lines: one line per PCA, passing through center
+      for (let k = 0; k < np; k++) {
+        const px = cx + dirs[k].x * R, py = cy + dirs[k].y * R;
+        const nx = cx + dirs[k + np].x * R, ny = cy + dirs[k + np].y * R;
+        svg += '<line x1="' + px.toFixed(1) + '" y1="' + py.toFixed(1) +
+               '" x2="' + nx.toFixed(1) + '" y2="' + ny.toFixed(1) +
+               '" stroke="var(--border)" stroke-width="1" opacity="0.5"/>';
+      }
+      // labels at both ends of each diameter
+      for (let vi = 0; vi < nVerts; vi++) {
+        const k = pcaIdx(vi);
+        const al = d.axis_labels && d.axis_labels[k];
+        const varp = ((d.explained_variance_ratio[k] || 0) * 100).toFixed(0);
+        const isPos = vi < np;
+        const tag = (al && al.score > 0)
+          ? (isPos ? al.pos : al.neg)
+          : (isPos ? ('+' + (al ? al.pos : 'PC' + (k+1))) : ('−' + (al ? al.neg : '')));
+        const lbl = (al && al.score > 0) ? al.label : 'PC' + (k + 1);
+        const lx = cx + dirs[vi].x * (R + 26), ly = cy + dirs[vi].y * (R + 26);
         svg += '<text x="' + lx.toFixed(1) + '" y="' + ly.toFixed(1) + '" text-anchor="middle" ' +
-               'font-size="10" fill="var(--text-dim)">' + shortLabel + ' · ' + varp + '%</text>';
+               'font-size="9" fill="var(--text-dim)">' + tag + '</text>';
+        // PCA label + variance only on the positive end (to avoid clutter)
+        if (isPos) {
+          const vx = cx + dirs[vi].x * (R + 42), vy = cy + dirs[vi].y * (R + 42);
+          svg += '<text x="' + vx.toFixed(1) + '" y="' + vy.toFixed(1) + '" text-anchor="middle" ' +
+                 'font-size="8" fill="var(--text-dim)" opacity="0.6">' + varp + '%</text>';
+        }
       }
-      // voice-shape polygon (filled) — class so we can update points in place
+      // center dot
+      svg += '<circle cx="' + cx + '" cy="' + cy + '" r="3" fill="var(--border)"/>';
+      // voice-shape polygon
       svg += '<polygon class="pca-shape" points="" fill="rgba(245,158,11,0.18)" stroke="#f59e0b" stroke-width="2"/>';
-      // draggable vertices
-      for (let i = 0; i < axes; i++) {
-        svg += '<circle class="pca-vert" data-axis="' + i + '" cx="0" cy="0" r="7" ' +
-               'fill="#f59e0b" stroke="var(--bg-card)" stroke-width="2" style="cursor:grab"/>';
+      // draggable vertices — each labeled with pos/neg tag
+      for (let vi = 0; vi < nVerts; vi++) {
+        const k = pcaIdx(vi);
+        const isPos = vi < np;
+        svg += '<circle class="pca-vert" data-vi="' + vi + '" data-pca="' + k +
+               '" data-sign="' + (isPos ? '1' : '-1') +
+               '" cx="0" cy="0" r="7" fill="#f59e0b" stroke="var(--bg-card)" stroke-width="2" style="cursor:grab"/>';
       }
       svg += "</svg>";
       host.innerHTML = svg;
       svgEl = host.querySelector("svg");
-      svgEl.dataset.axes = axes; svgEl.dataset.W = W; svgEl.dataset.R = R;
+      svgEl.dataset.np = np; svgEl.dataset.W = W; svgEl.dataset.R = R;
 
-      // Attach drag listeners ONCE. These closures capture dirs/cx/R which are
-      // stable for a given scaffold; we rebuild only if axes/W/R change.
+      // Drag listeners — project onto the PCA's axis direction.
+      // Positive vertex k: weight = proj / R * range (natural sign).
+      // Negative vertex k+np: weight = -proj_on_neg_dir / R * range
+      //                        = proj_on_pos_dir / R * range (same formula!)
+      // Both reduce to: weight(k) = (proj onto dirs[k]) / R * range
       svgEl.querySelectorAll(".pca-vert").forEach((v) => {
         v.addEventListener("pointerdown", (e) => {
           e.preventDefault();
-          const axis = parseInt(v.dataset.axis, 10);
+          const k = parseInt(v.dataset.pca, 10);
+          const sign = parseInt(v.dataset.sign, 10);
           v.setPointerCapture(e.pointerId);
           v.style.cursor = "grabbing";
           const move = (ev) => {
             const pt = svgEl.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
             const p = pt.matrixTransform(svgEl.getScreenCTM().inverse());
             const dx = p.x - cx, dy = p.y - cy;
-            const proj = dx * dirs[axis].x + dy * dirs[axis].y;
-            const rg = PCA.ranges[axis] || 1;
-            let w = (proj / R) * rg;
+            // Project onto THIS vertex's direction, then map to signed weight.
+            // sign=+1: outward on positive vertex → weight increases.
+            // sign=-1: outward on negative vertex → weight decreases.
+            const proj = dx * dirs[parseInt(v.dataset.vi,10)].x + dy * dirs[parseInt(v.dataset.vi,10)].y;
+            const rg = PCA.ranges[k] || 1;
+            let w = sign * (proj / R) * rg;
             w = Math.max(-rg, Math.min(rg, w));
-            PCA.weights[axis] = w;
+            PCA.weights[k] = w;
             pca_refresh();
           };
           const up = () => {
@@ -2377,14 +2460,14 @@
       });
     }
 
-    // In-place update — never destroys the DOM, so drags stay alive.
+    // In-place update.
     let poly = "";
-    for (let i = 0; i < axes; i++) { const p = vertexPos(i); poly += p.x.toFixed(1) + "," + p.y.toFixed(1) + " "; }
+    for (let i = 0; i < nVerts; i++) { const p = vertexPos(i); poly += p.x.toFixed(1) + "," + p.y.toFixed(1) + " "; }
     const shape = svgEl.querySelector(".pca-shape");
     if (shape) shape.setAttribute("points", poly.trim());
     const verts = svgEl.querySelectorAll(".pca-vert");
     verts.forEach((v, i) => {
-      if (i >= axes) return;
+      if (i >= nVerts) return;
       const p = vertexPos(i);
       v.setAttribute("cx", p.x.toFixed(1));
       v.setAttribute("cy", p.y.toFixed(1));
@@ -2419,9 +2502,15 @@
         const al = d.axis_labels && d.axis_labels[i];
         return (al && al.score > 0) ? al.label : ('PC' + (i + 1));
       };
-      c.textContent = lbl(0) + " " + (PCA.weights[0] || 0).toFixed(2) +
-                      " · " + lbl(1) + " " + (PCA.weights[1] || 0).toFixed(2) +
-                      " · " + PCA.weights.length + " axes";
+      // Show all 5 polygon PCA values as "name: ±value" pairs
+      const np = Math.min(N_PCA_PCS, d.n_components);
+      let parts = [];
+      for (let i = 0; i < np; i++) {
+        const w = PCA.weights[i] || 0;
+        const sign = w >= 0 ? '+' : '';
+        parts.push(lbl(i) + ' ' + sign + w.toFixed(2));
+      }
+      c.textContent = parts.join(' · ');
     }
   }
 
@@ -2610,6 +2699,7 @@
     });
 
     pca_render_axes();
+    pca_render_sweep_bar();
     pca_snap_render();
     const snapAdd = document.getElementById("pca-snap-add");
     if (snapAdd) snapAdd.addEventListener("click", pca_snap_add);
