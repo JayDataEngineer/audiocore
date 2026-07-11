@@ -51,6 +51,7 @@
 #include "audiocore/models/qwen3/runner.h"
 #include "audiocore/framework/io/gguf_reader.h"   // Stage 17: full type for unique_ptr<GgufReader> dtor
 #include "audiocore/framework/sampling/sampler.h"
+#include "audiocore/framework/audio/dsp.h"         // trim_silence for over-generation fix
 
 #include <algorithm>
 #include <cctype>
@@ -983,6 +984,17 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     // Repetition penalty: track previously generated CB0 tokens.
     std::unordered_set<int32_t> generated_cb0;
 
+    // ── Stuck-loop detector ────────────────────────────────────────────
+    // If the model emits the same cb0 token for `repeat_limit` consecutive
+    // steps, it's stuck in a degenerate loop (common on CPU f16, also
+    // happens on GPU when the model loses coherence). We break early AND
+    // zero out the repeated frames so the post-loop frame scan discards
+    // them — otherwise they decode to audible noise that trim_silence
+    // can't remove (it has energy, just no information).
+    int32_t last_cb0 = -1;
+    int32_t repeat_count = 0;
+    const int32_t repeat_limit = 12;  // 1 second at 12 Hz
+
     const int32_t suppress_start = codec_vocab - 1024;
     const int32_t progress_interval = std::max(1, max_steps / 20); // ~5% steps
     prog("ar_decode", 0.3f, "starting AR loop");
@@ -1045,6 +1057,7 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
         }
         code_matrix[(size_t)0 * max_steps + step] = code_0;
         generated_cb0.insert(code_0);
+
         // Debug: first 5 steps log cb0 + top logits
         if (step < 5 && std::getenv("QWEN3TTS_DEBUG")) {
             std::fprintf(stderr, "  ar[%d]: cb0=%d (unique=%zu)\n",
@@ -1121,6 +1134,43 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
 
         // Update prev_fine for next step
         prev_fine = fine_codes;
+
+        // ── Stuck-loop detector ──────────────────────────────────────────
+        // At this point the full frame (cb0 + fine codes) for this step is
+        // in code_matrix. Compare with the previous step's frame: if every
+        // codebook is identical for repeat_limit consecutive steps, the
+        // model's hidden state has frozen (common on f16 CPU, also happens
+        // on GPU). We break and zero out the frozen frames so they don't
+        // decode to audible noise.
+        //
+        // Note: checking ONLY cb0 is wrong — cb0=327 is a natural pause
+        // token. But if all 16 codebooks repeat identically, it's stuck.
+        if (step > 0) {
+            bool full_repeat = true;
+            for (int cb = 0; cb < n_total_books && full_repeat; cb++) {
+                if (code_matrix[(size_t)cb * max_steps + step] !=
+                    code_matrix[(size_t)cb * max_steps + step - 1])
+                    full_repeat = false;
+            }
+            if (full_repeat) {
+                ++repeat_count;
+                if (repeat_count >= repeat_limit && step > 18) {
+                    std::fprintf(stderr,
+                        "qwen3_tts: stuck-loop break at step %d "
+                        "(full 16-book frame repeated %d times, cb0=%d)\n",
+                        step, repeat_count, code_0);
+                    int32_t keep_until = step - repeat_count + 2;
+                    for (int32_t s = keep_until; s <= step; s++) {
+                        for (int cb = 0; cb < n_total_books; cb++)
+                            code_matrix[(size_t)cb * max_steps + s] = 0;
+                    }
+                    break;
+                }
+            } else {
+                repeat_count = 0;
+            }
+            last_cb0 = code_0;
+        }
 
         // ── 3c. Per-frame streaming: decode newly available frames ──────
         if (streaming && codec_graphs_.is_present()) {
@@ -1368,6 +1418,26 @@ bool Qwen3TtsSession::run_inference(const TtsRequest& req, TtsResponse& resp,
     }
 
     resp.sampling_rate = 24000;
+
+    // ── Trim trailing silence ────────────────────────────────────────────
+    // The AR loop's EOS detection is imperfect — the model often generates
+    // hundreds of near-silent frames after the actual speech content. We
+    // trim leading/trailing silence with a generous margin so the output
+    // sounds tight without clipping natural onset/decay.
+    {
+        const size_t before = resp.pcm_mono.size();
+        auto trimmed = trim_silence(resp.pcm_mono.data(), resp.pcm_mono.size(),
+                                    24000, /*threshold_db=*/40.0f,
+                                    /*window_ms=*/10.0f, /*margin_ms=*/120.0f);
+        if (trimmed.size() < before) {
+            std::fprintf(stderr, "qwen3_tts: trimmed %.2fs → %.2fs (removed %.2fs silence)\n",
+                         double(before) / 24000.0,
+                         double(trimmed.size()) / 24000.0,
+                         double(before - trimmed.size()) / 24000.0);
+            resp.pcm_mono = std::move(trimmed);
+        }
+    }
+
     session_timer.log("codec decode done");
     prog("codec_decode", 1.0f, "done");
     std::fprintf(stderr, "qwen3_tts: codec decode ok (%zu samples, %.2fs)\n",

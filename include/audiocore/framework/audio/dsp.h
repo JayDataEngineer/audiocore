@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <cstddef>
+#include <string>
 
 namespace audiocore {
 
@@ -36,6 +37,72 @@ std::vector<float> pitch_shift(const float* x, size_t n, double semitones,
 // Equivalent to wsola_stretch(x, n, 1/rate, ...).
 std::vector<float> change_speed(const float* x, size_t n, double rate,
                                  int sample_rate);
+
+// ── Voice-enhance chain: formant shaper + airiness + breathiness ────────
+//
+// A cascaded biquad EQ (RBJ Audio EQ Cookbook) plus optional breathiness
+// noise excitation. Every band is centred at a perceptually meaningful
+// frequency for speech; each axis ranges -1..+1 where 0 = flat (no change).
+//
+//   warmth     : low-shelf @ 180 Hz   (+6 dB → chesty/full, -6 dB → thin)
+//   formant    : peaking  @ 700/1700 Hz (F1/F2 emphasis → vowel colour)
+//   brightness : peaking  @ 3000 Hz   (presence/crispness)
+//   airiness   : high-shelf @ 6000 Hz (+8 dB → breathy/airy sheen)
+//   breathiness: shaped white-noise excitation, mixed in proportionally to
+//                the signal envelope (0 = off, 1 = strong breathy texture)
+//
+struct VoiceEnhanceParams {
+    float warmth     = 0.0f;  // -1..1
+    float formant    = 0.0f;  // -1..1
+    float brightness = 0.0f;  // -1..1
+    float airiness   = 0.0f;  // -1..1
+    float breathiness = 0.0f; // 0..1
+};
+std::vector<float> voice_enhance(const float* x, size_t n,
+                                  int sample_rate,
+                                  const VoiceEnhanceParams& p);
+
+// ── Prosody: automatic breath insertion at pauses ───────────────────────
+//
+// Scans for silence gaps (envelope below -silence_db for >= min_gap_ms) and,
+// in each gap, lays down a short shaped noise "breath" of breath_ms.
+// `intensity` 0..1 scales breath loudness and relaxes the gap threshold
+// (higher intensity → breaths in shorter gaps). Returns a signal that is
+// never shorter than the input.
+//
+std::vector<float> insert_breaths(const float* x, size_t n, int sample_rate,
+                                   float intensity = 0.5f,
+                                   float silence_db = 32.0f,
+                                   float min_gap_ms = 120.0f,
+                                   float breath_ms  = 90.0f);
+
+// ── Prosody: pitch contour shaping ──────────────────────────────────────
+//
+// Applies a time-varying pitch shift across the utterance. `shape` selects
+// the contour: "flat", "rise", "fall", "dip", "wave". `depth` is the peak
+// deviation in semitones (0..6). The signal is split into overlapping
+// segments; each is pitch-shifted by the contour value at its midpoint and
+// crossfaded with its neighbours, so the result is the same length as the
+// input but with a deliberate intonation movement.
+//
+std::vector<float> pitch_contour(const float* x, size_t n, int sample_rate,
+                                  const std::string& shape,
+                                  float depth);
+
+// ── Silence trimming ────────────────────────────────────────────────────
+//
+// Removes leading and trailing silence from a PCM signal. A sliding-window
+// RMS envelope is computed (window_ms, default 10 ms); the first and last
+// windows whose RMS exceeds -threshold_db define the speech region. A
+// margin of margin_ms silence is retained at each end for natural onset/
+// decay. If the entire signal is below threshold, the original is returned
+// unchanged (don't destroy intentionally-silent output).
+//
+std::vector<float> trim_silence(const float* x, size_t n,
+                                int sample_rate = 24000,
+                                float threshold_db = 40.0f,
+                                float window_ms = 10.0f,
+                                float margin_ms = 100.0f);
 
 }  // namespace audiocore
 
