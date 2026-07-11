@@ -74,3 +74,5 @@ tools/compare/
 *.swo
 *~
 ref-qwen3tts/
+# Saved Qwen3-TTS voice files (generated, up to 3.6GB each)
+*.qvoice

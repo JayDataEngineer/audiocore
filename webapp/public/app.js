@@ -561,6 +561,280 @@
     }
   });
 
+  // ── QWEN Voice Maker tab ─────────────────────────────────────────────
+  // Design a voice via instruct, export as .qvoice, use with emotion/str.
+
+  // Load saved .qvoice files.
+  async function load_qvoices() {
+    const sel = $("#qvm-voice-select");
+    if (!sel) return;
+    try {
+      const r = await fetch("/v1/qvoices");
+      const j = await r.json();
+      const voices = j.voices || [];
+      sel.innerHTML = "";
+      if (!voices.length) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "— no .qvoice files —";
+        opt.disabled = true;
+        opt.selected = true;
+        sel.appendChild(opt);
+        $("#qvm-voice-controls").style.display = "none";
+        return;
+      }
+      for (const v of voices) {
+        const opt = document.createElement("option");
+        opt.value = v.name;
+        const type = v.size > 100 * 1024 * 1024 ? " [WDELTA]" : "";
+        opt.textContent = v.name + " (" + fmt_size(v.size) + type + ")";
+        sel.appendChild(opt);
+      }
+      sel.dispatchEvent(new Event("change"));
+    } catch (err) {
+      sel.innerHTML = '<option value="">— error loading —</option>';
+    }
+  }
+
+  // Voice select change → show controls.
+  $("#qvm-voice-select")?.addEventListener("change", () => {
+    const val = $("#qvm-voice-select").value;
+    $("#qvm-voice-controls").style.display = val ? "" : "none";
+  });
+
+  // Refresh button.
+  $("#qvm-refresh")?.addEventListener("click", load_qvoices);
+
+  // Strength slider display.
+  $("#qvm-strength")?.addEventListener("input", () => {
+    $("#qvm-strength-val").textContent = parseFloat($("#qvm-strength").value).toFixed(2);
+  });
+
+  // Preset chips.
+  $$("#qvm-presets .chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      $("#qvm-instruct").value = chip.dataset.desc;
+      $("#qvm-instruct").focus();
+    });
+  });
+
+  // Listen button — preview the voice via CLI VoiceDesign.
+  let qvm_last_blob = null;
+  $("#qvm-listen")?.addEventListener("click", async () => {
+    const st = $("#qvm-status");
+    const btn = $("#qvm-listen");
+    const instruct = $("#qvm-instruct").value.trim();
+    const text = $("#qvm-text").value.trim();
+    if (!instruct) { status(st, "Describe a voice first.", "err"); return; }
+    if (!text)     { status(st, "Type some sample text.", "err"); return; }
+
+    btn.disabled = true;
+    btn.textContent = "🔊 Listening…";
+    status(st, "Generating preview via VoiceDesign CLI…", "loading");
+    clear_player($("#qvm-player"));
+
+    try {
+      const r = await fetch("/v1/voice/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instruct, text }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.detail || j.error || "Preview failed (" + r.status + ")");
+      }
+      const blob = await r.blob();
+      qvm_last_blob = blob;
+      const url = URL.createObjectURL(blob);
+      set_player($("#qvm-player"), url,
+        "preview · " + (blob.size / 1024).toFixed(1) + " KB");
+      $("#qvm-export").disabled = false;
+      status(st, "Preview ready. Click Export to save as .qvoice.", "ok");
+    } catch (err) {
+      status(st, "Error: " + err.message, "err");
+    }
+
+    btn.disabled = false;
+    btn.textContent = "🔊 Listen";
+  });
+
+  // Export button — save as .qvoice via /v1/voice/export.
+  $("#qvm-export")?.addEventListener("click", async () => {
+    const st = $("#qvm-status");
+    const instruct = $("#qvm-instruct").value.trim();
+    const text = $("#qvm-text").value.trim();
+    const wdelta = $("#qvm-wdelta")?.checked || false;
+    if (!instruct) { status(st, "Describe a voice first.", "err"); return; }
+
+    // Generate a name from the instruct (first 30 chars, sanitized).
+    let name = instruct.replace(/[^a-zA-Z0-9 ]/g, "").trim().substring(0, 30).replace(/\s+/g, "_").toLowerCase();
+    if (!name) name = "voice_" + Date.now();
+
+    const mode = wdelta ? "WDELTA (~3GB, ~2min)" : "lite graft (~25MB, ~30s)";
+    status(st, "Exporting " + name + ".qvoice… " + mode, "loading");
+
+    try {
+      const r = await fetch("/v1/voice/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, instruct, text, wdelta }),
+      });
+      const j = await r.json();
+      if (!r.ok || !j.ok) {
+        throw new Error(j.detail || j.error || "Export failed");
+      }
+      const type = j.wdelta ? "WDELTA" : "lite";
+      status(st, "Exported " + j.name + ".qvoice (" + fmt_size(j.size) + ", " + type + "). Select it below to use.", "ok");
+      toast("Voice exported!", "ok");
+      await load_qvoices();
+    } catch (err) {
+      status(st, "Error: " + err.message, "err");
+    }
+  });
+
+  // Expr weight slider display.
+  $("#qvm-expr-weight")?.addEventListener("input", () => {
+    $("#qvm-expr-weight-val").textContent = parseFloat($("#qvm-expr-weight").value).toFixed(2);
+  });
+
+  // Generate button — use a saved .qvoice with emotion + strength + expr.
+  $("#qvm-use")?.addEventListener("click", async () => {
+    const st = $("#qvm-use-status");
+    const voiceName = $("#qvm-voice-select").value;
+    if (!voiceName) { status(st, "Select a voice first.", "err"); return; }
+    const text = $("#qvm-use-text").value.trim();
+    if (!text) { status(st, "Type some text.", "err"); return; }
+    const emotion = $("#qvm-emotion").value;
+    const strength = parseFloat($("#qvm-strength").value) || 1.0;
+    const instruct = $("#qvm-use-instruct").value.trim();
+    const exprFile = $("#qvm-expr")?.value || "";
+    const exprWeight = parseFloat($("#qvm-expr-weight")?.value) || 1.0;
+    const temperature = parseFloat($("#qvm-temp")?.value) || 0.9;
+    const topP = parseFloat($("#qvm-topp")?.value) || 1.0;
+    const topK = parseInt($("#qvm-topk")?.value) || 50;
+    const repPenalty = parseFloat($("#qvm-rep")?.value) || 1.05;
+
+    // Find the CustomVoice model.
+    const cvModel = MODELS.find(m => m.id.indexOf("customvoice") >= 0 && m.loaded);
+    if (!cvModel) {
+      status(st, "No CustomVoice model loaded. Load qwen3-tts-customvoice from Models tab.", "err");
+      return;
+    }
+
+    const btn = $("#qvm-use");
+    btn.disabled = true;
+    btn.textContent = "🗣️ Generating…";
+    status(st, "Generating with " + voiceName + "…", "loading");
+    clear_player($("#qvm-use-player"));
+
+    try {
+      const body = {
+        model: cvModel.id,
+        input: text,
+        voice: voiceName,
+        emotion,
+        voice_strength: strength,
+        instruct,
+        temperature,
+        top_p: topP,
+        top_k: topK,
+        repetition_penalty: repPenalty,
+        seed: Math.floor(Math.random() * 1000000),
+      };
+      if (exprFile) {
+        body.expr_file = exprFile;
+        body.expr_weight = exprWeight;
+      }
+      const p = fetch("/v1/audio/speech", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).then(async (r) => {
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.detail || j.error || "Generation failed (" + r.status + ")");
+        }
+        return r.blob();
+      });
+      const blob = await p;
+      const url = URL.createObjectURL(blob);
+      const desc = [emotion || "", exprFile ? "expr:" + exprFile : ""].filter(Boolean).join("+") || "neutral";
+      set_player($("#qvm-use-player"), url,
+        voiceName + " · " + desc + " · " + fmt_size(blob.size));
+      status(st, "Done! " + voiceName + " with " + desc + ".", "ok");
+      toast("Generated!", "ok");
+    } catch (err) {
+      status(st, "Error: " + err.message, "err");
+    }
+
+    btn.disabled = false;
+    btn.textContent = "🗣️ Generate";
+  });
+
+  // Re-bake button — generate emotional audio, then bake as new voice.
+  $("#qvm-rebake")?.addEventListener("click", async () => {
+    const st = $("#qvm-rebake-status");
+    const sourceVoice = $("#qvm-voice-select").value;
+    if (!sourceVoice) { status(st, "Select a source voice first.", "err"); return; }
+    const emotion = $("#qvm-emotion").value;
+    const instruct = $("#qvm-use-instruct").value.trim();
+    if (!emotion && !instruct) { status(st, "Pick an emotion or type an instruct.", "err"); return; }
+    let newName = $("#qvm-rebake-name").value.trim();
+    if (!newName) {
+      newName = sourceVoice + "_" + (emotion || "custom");
+      $("#qvm-rebake-name").value = newName;
+    }
+    const wdelta = $("#qvm-rebake-wdelta")?.checked || false;
+
+    const mode = wdelta ? "WDELTA (~3GB, ~2min)" : "lite (~25MB, ~30s)";
+    status(st, "Re-baking " + newName + " with " + (emotion || instruct) + " baked in… " + mode, "loading");
+
+    try {
+      const r = await fetch("/v1/voice/rebake", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_voice: sourceVoice,
+          name: newName,
+          emotion,
+          instruct,
+          wdelta,
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.detail || j.error || "Rebake failed");
+      const type = j.wdelta ? "WDELTA" : "lite";
+      status(st, "Re-baked " + j.name + ".qvoice (" + fmt_size(j.size) + ", " + type + "). Emotion baked in.", "ok");
+      toast("Voice re-baked!", "ok");
+      await load_qvoices();
+    } catch (err) {
+      status(st, "Error: " + err.message, "err");
+    }
+  });
+
+  // Send to Synthesize tab.
+  $("#qvm-use-to-syn")?.addEventListener("click", async () => {
+    const voiceName = $("#qvm-voice-select").value;
+    if (!voiceName) return;
+    await load_voices();
+    activate_tab("synthesize");
+    // Set voice source to uploaded and select the voice.
+    $("#syn-voice-source").value = "uploaded";
+    $("#syn-voice-source").dispatchEvent(new Event("change"));
+    const sel = $("#syn-uploaded");
+    for (const o of sel.options) {
+      if (o.value.indexOf(voiceName) >= 0 || o.textContent.indexOf(voiceName) >= 0) {
+        sel.selectedIndex = o.index;
+        break;
+      }
+    }
+    load_syn_voice_meta();
+    $("#syn-text").focus();
+  });
+
+  // Load qvoices on startup.
+  load_qvoices();
+
   // ── Voice Maker tab ────────────────────────────────────────────────
   // Populate all the dropdowns when the user opens the tab.
   async function refresh_maker_dropdowns() {

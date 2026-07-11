@@ -602,12 +602,20 @@ std::shared_ptr<httplib::Server> build_server(
                     tr.instruct     = body_peek.value("instruct", "");
                     tr.speaker_name = body_peek.value("speaker", "");
                     tr.speed        = body_peek.value("speed", 1.0f);
+                    tr.emotion      = body_peek.value("emotion", "");
+                    tr.voice_strength = body_peek.value("voice_strength", 1.0f);
+                    tr.expr_file      = body_peek.value("expr_file", "");
+                    tr.expr_weight    = body_peek.value("expr_weight", 1.0f);
                     if (body_peek.contains("seed"))
                         tr.seed = body_peek["seed"].get<int32_t>();
                     if (body_peek.contains("temperature"))
                         tr.temperature = body_peek["temperature"].get<float>();
                     if (body_peek.contains("top_p"))
                         tr.top_p = body_peek["top_p"].get<float>();
+                    if (body_peek.contains("top_k"))
+                        tr.text_top_k = body_peek["top_k"].get<int32_t>();
+                    if (body_peek.contains("repetition_penalty"))
+                        tr.repetition_penalty = body_peek["repetition_penalty"].get<float>();
                     if (body_peek.contains("max_new_tokens"))
                         tr.max_new_tokens = body_peek["max_new_tokens"].get<int32_t>();
                     if (body_peek.contains("max_tokens"))
@@ -622,8 +630,34 @@ std::shared_ptr<httplib::Server> build_server(
                         }
                     }
 
+                    // ── Voice-bearing CLI path ─────────────────────────
+                    // If `voice` resolves to a saved .qvoice file in
+                    // voices_dir, shell out to the CLI binary with
+                    // --load-voice --icl-only --voice-strength --emotion.
+                    // This avoids per-request weight mutation in the
+                    // persistent reference server.
+                    std::vector<uint8_t> wav;
                     std::string error;
-                    auto wav = audiocore::qwen3tts_proxy_generate(qit->second, tr, &error);
+                    bool used_cli = false;
+
+                    if (!qit->second.voices_dir.empty() && !tr.voice_path.empty()) {
+                        // Check if voice matches a saved .qvoice.
+                        std::string qvpath = qit->second.voices_dir + "/" +
+                                             tr.voice_path + ".qvoice";
+                        struct stat st;
+                        if (stat(qvpath.c_str(), &st) == 0 && st.st_size > 0) {
+                            fprintf(stderr, "[speech] CLI path: voice=%s emotion=%s strength=%.2f\n",
+                                    tr.voice_path.c_str(), tr.emotion.c_str(), tr.voice_strength);
+                            wav = audiocore::qwen3tts_cli_generate(qit->second, tr, qvpath, &error);
+                            used_cli = true;
+                        }
+                    }
+
+                    if (!used_cli) {
+                        // Fallback: proxy to reference server.
+                        wav = audiocore::qwen3tts_proxy_generate(qit->second, tr, &error);
+                    }
+
                     if (wav.empty()) {
                         res.status = 502;
                         json e = {{"error", "qwen_tts-server proxy failed"}, {"detail", error}};
@@ -2297,6 +2331,257 @@ std::shared_ptr<httplib::Server> build_server(
                     return;
                 }
                 res.set_content(output, "application/json");
+            });
+
+            // ── Qwen3-TTS .qvoice routes ─────────────────────────────────
+            // GET /v1/qvoices — list saved .qvoice files from the qwen3tts
+            // proxy's voices_dir. Returns name, path, size for each.
+            svr->Get("/v1/qvoices", [q3_proxies_ref](const httplib::Request&, httplib::Response& res) {
+                json arr = json::array();
+                for (const auto& [id, cfg] : *q3_proxies_ref) {
+                    auto voices = audiocore::qwen3tts_list_voices(cfg);
+                    for (const auto& v : voices) {
+                        arr.push_back({
+                            {"name", v.name},
+                            {"path", v.path},
+                            {"size", v.size_bytes},
+                            {"model_id", id},
+                        });
+                    }
+                }
+                res.set_content(json{{"voices", arr}}.dump(), "application/json");
+            });
+
+            // POST /v1/voice/export — generate a voice via VoiceDesign and
+            // bake it into a .qvoice file with the Base model.
+            // Body: {name, instruct, text?, wdelta?}
+            // If wdelta=true, creates a heavy WDELTA voice (~0.8-3GB)
+            // that supports voice_strength. Default: lite graft (~25MB).
+            svr->Post("/v1/voice/export", [q3_proxies_ref](const httplib::Request& req, httplib::Response& res) {
+                json body;
+                try { body = json::parse(req.body); } catch (...) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid json"})", "application/json");
+                    return;
+                }
+                std::string name     = body.value("name", "");
+                std::string instruct = body.value("instruct", "");
+                std::string text     = body.value("text", "");
+                bool        wdelta   = body.value("wdelta", false);
+                if (name.empty() || instruct.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"name and instruct required"})", "application/json");
+                    return;
+                }
+                // Use the first qwen3tts proxy config (there's typically one).
+                if (q3_proxies_ref->empty()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"no qwen3tts proxy configured"})", "application/json");
+                    return;
+                }
+                auto& cfg = q3_proxies_ref->begin()->second;
+                std::string error;
+                bool ok = audiocore::qwen3tts_cli_export_voice(cfg, name, instruct, text, &error, wdelta);
+                if (!ok) {
+                    res.status = 500;
+                    json e = {{"error", "voice export failed"}, {"detail", error}};
+                    res.set_content(e.dump(), "application/json");
+                    return;
+                }
+                std::string qvpath = cfg.voices_dir + "/" + name + ".qvoice";
+                struct stat st;
+                stat(qvpath.c_str(), &st);
+                json r = {{"ok", true}, {"name", name}, {"path", qvpath},
+                          {"size", static_cast<int64_t>(st.st_size)},
+                          {"wdelta", wdelta}};
+                res.set_content(r.dump(), "application/json");
+            });
+
+            // POST /v1/voice/rebake — Take existing voice, generate audio
+            // with emotion/instruct, re-bake as NEW voice with emotion baked in.
+            // Body: {source_voice, name, emotion?, instruct?, wdelta?}
+            svr->Post("/v1/voice/rebake", [q3_proxies_ref](const httplib::Request& req, httplib::Response& res) {
+                json body;
+                try { body = json::parse(req.body); } catch (...) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid json"})", "application/json");
+                    return;
+                }
+                std::string source = body.value("source_voice", "");
+                std::string name   = body.value("name", "");
+                std::string emotion  = body.value("emotion", "");
+                std::string instruct = body.value("instruct", "");
+                bool wdelta = body.value("wdelta", false);
+                if (source.empty() || name.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"source_voice and name required"})", "application/json");
+                    return;
+                }
+                if (q3_proxies_ref->empty()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"no qwen3tts proxy configured"})", "application/json");
+                    return;
+                }
+                auto& cfg = q3_proxies_ref->begin()->second;
+
+                // Step 1: Generate emotional audio from source voice.
+                std::string tmp_wav = "/tmp/audiocore_rebake_" + std::to_string(getpid()) + ".wav";
+                std::string sample_text = "Hello, I am speaking with emotion. This is my voice.";
+                {
+                    std::string src_path = cfg.voices_dir + "/" + source + ".qvoice";
+                    struct stat st;
+                    if (stat(src_path.c_str(), &st) != 0) {
+                        res.status = 404;
+                        res.set_content(R"({"error":"source voice not found"})", "application/json");
+                        return;
+                    }
+                    bool is_heavy = (st.st_size > 100 * 1024 * 1024);
+                    std::vector<std::string> argv = {
+                        cfg.binary_path, "-d", cfg.customvoice_dir,
+                        "--load-voice", src_path,
+                    };
+                    if (!is_heavy) argv.push_back("--icl-only");
+                    argv.push_back("--text");
+                    argv.push_back(sample_text);
+                    argv.push_back("-o");
+                    argv.push_back(tmp_wav);
+                    argv.push_back("-T");
+                    argv.push_back("0.9");
+                    argv.push_back("-p");
+                    argv.push_back("1.0");
+                    argv.push_back("-k");
+                    argv.push_back("50");
+                    argv.push_back("--rep-penalty");
+                    argv.push_back("1.05");
+                    if (cfg.use_gpu) { argv.push_back("--backend"); argv.push_back("cuda"); }
+                    if (!emotion.empty()) { argv.push_back("--emotion"); argv.push_back(emotion); }
+                    if (!instruct.empty()) { argv.push_back("--instruct"); argv.push_back(instruct); }
+
+                    fprintf(stderr, "[voice/rebake] step1: generate from %s with emotion=%s\n",
+                            source.c_str(), emotion.c_str());
+                    auto env = audiocore::qwen3tts_build_cli_env(cfg);
+                    int rc = audiocore::qwen3tts_run_cli(cfg.binary_path, argv, env);
+                    if (rc != 0) { unlink(tmp_wav.c_str()); res.status = 500;
+                        json e = {{"error", "generate failed"}, {"detail", "exit " + std::to_string(rc)}};
+                        res.set_content(e.dump(), "application/json"); return; }
+                }
+
+                // Step 2: Re-bake emotional audio as new voice.
+                mkdir(cfg.voices_dir.c_str(), 0755);
+                // Auto-number on collision: foo → foo_2 → foo_3 → ...
+                std::string base_name = name;
+                std::string out_qvoice = cfg.voices_dir + "/" + name + ".qvoice";
+                {
+                    struct stat st;
+                    int seq = 2;
+                    while (stat(out_qvoice.c_str(), &st) == 0) {
+                        name = base_name + "_" + std::to_string(seq++);
+                        out_qvoice = cfg.voices_dir + "/" + name + ".qvoice";
+                    }
+                }
+                {
+                    std::vector<std::string> argv = {
+                        cfg.binary_path, "-d", cfg.base_dir,
+                        "--ref-audio", tmp_wav,
+                        "--voice-name", name,
+                        "--save-voice", out_qvoice,
+                    };
+                    if (wdelta) argv.push_back("--target-cv");
+                    if (cfg.use_gpu) { argv.push_back("--backend"); argv.push_back("cuda"); }
+
+                    fprintf(stderr, "[voice/rebake] step2: bake %s%s\n",
+                            name.c_str(), wdelta ? " (WDELTA)" : "");
+                    auto env = audiocore::qwen3tts_build_cli_env(cfg);
+                    int rc = audiocore::qwen3tts_run_cli(cfg.binary_path, argv, env);
+                    unlink(tmp_wav.c_str());
+                    if (rc != 0) { res.status = 500;
+                        json e = {{"error", "bake failed"}, {"detail", "exit " + std::to_string(rc)}};
+                        res.set_content(e.dump(), "application/json"); return; }
+                }
+
+                struct stat st;
+                stat(out_qvoice.c_str(), &st);
+                json r = {{"ok", true}, {"name", name}, {"path", out_qvoice},
+                          {"size", static_cast<int64_t>(st.st_size)}, {"wdelta", wdelta},
+                          {"emotion_baked", emotion}};
+                res.set_content(r.dump(), "application/json");
+            });
+
+            // POST /v1/voice/preview — VoiceDesign preview only (no bake).
+            // Body: {instruct, text?}. Returns WAV audio.
+            svr->Post("/v1/voice/preview", [q3_proxies_ref](const httplib::Request& req, httplib::Response& res) {
+                json body;
+                try { body = json::parse(req.body); } catch (...) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid json"})", "application/json");
+                    return;
+                }
+                std::string instruct = body.value("instruct", "");
+                std::string text     = body.value("text", "");
+                if (instruct.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"instruct required"})", "application/json");
+                    return;
+                }
+                if (q3_proxies_ref->empty()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"no qwen3tts proxy configured"})", "application/json");
+                    return;
+                }
+                auto& cfg = q3_proxies_ref->begin()->second;
+                if (cfg.binary_path.empty() || cfg.voicedesign_dir.empty()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"VoiceDesign CLI not configured"})", "application/json");
+                    return;
+                }
+
+                std::string synth_text = text.empty()
+                    ? "Hello, I am a friendly voice assistant. How can I help you today?"
+                    : text;
+                std::string tmp_out = "/tmp/audiocore_preview_" + std::to_string(getpid()) + ".wav";
+
+                std::vector<std::string> argv = {
+                    cfg.binary_path,
+                    "-d", cfg.voicedesign_dir,
+                    "--voice-design",
+                    "--instruct", instruct,
+                    "--text", synth_text,
+                    "-o", tmp_out,
+                    "-T", "0.9",
+                    "-p", "1.0",
+                    "-k", "50",
+                    "--rep-penalty", "1.05",
+                };
+                if (cfg.use_gpu) {
+                    argv.push_back("--backend");
+                    argv.push_back("cuda");
+                }
+
+                fprintf(stderr, "[voice/preview] VoiceDesign gen instruct='%s...'\n",
+                        instruct.substr(0, 40).c_str());
+
+                auto env = audiocore::qwen3tts_build_cli_env(cfg);
+                int rc = audiocore::qwen3tts_run_cli(cfg.binary_path, argv, env);
+
+                if (rc != 0) {
+                    unlink(tmp_out.c_str());
+                    res.status = 500;
+                    json e = {{"error", "VoiceDesign CLI exited with code " + std::to_string(rc)}};
+                    res.set_content(e.dump(), "application/json");
+                    return;
+                }
+
+                auto wav = audiocore::qwen3tts_read_file(tmp_out);
+                unlink(tmp_out.c_str());
+                if (wav.empty()) {
+                    res.status = 500;
+                    res.set_content(R"({"error":"CLI produced no output"})", "application/json");
+                    return;
+                }
+
+                fprintf(stderr, "[voice/preview] ← %zu bytes WAV\n", wav.size());
+                res.set_content(reinterpret_cast<const char*>(wav.data()),
+                                wav.size(), "audio/wav");
             });
         }
     }

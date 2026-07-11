@@ -81,6 +81,13 @@ struct ServerConfig {
         std::string model_dir;   // model directory for qwen_tts (-d)
         std::string library_dir; // LD_LIBRARY_PATH for qwen_tts
         std::vector<std::string> extra_args;
+        // CLI runner paths (for voice-bearing requests via shell-out).
+        std::string customvoice_dir;  // 1.7B-CustomVoice model dir
+        std::string voicedesign_dir;  // VoiceDesign model dir
+        std::string base_dir;         // 1.7B-Base model dir
+        std::string voices_dir;       // saved .qvoice files directory
+        bool        use_gpu = false;  // --backend cuda for CLI calls
+        int         gpu_device = 0;   // CUDA_VISIBLE_DEVICES
     };
     bool has_qwen3tts_proxy = false;
     Qwen3TtsProxyCfg qwen3tts_proxy;
@@ -160,6 +167,13 @@ bool load_config(const std::string& path, ServerConfig& out) {
             for (const auto& a : p["extra_args"])
                 out.qwen3tts_proxy.extra_args.push_back(a.get<std::string>());
         }
+        // CLI runner paths (voice-bearing requests).
+        out.qwen3tts_proxy.customvoice_dir = p.value("customvoice_dir", "");
+        out.qwen3tts_proxy.voicedesign_dir = p.value("voicedesign_dir", "");
+        out.qwen3tts_proxy.base_dir        = p.value("base_dir", "");
+        out.qwen3tts_proxy.voices_dir      = p.value("voices_dir", "");
+        out.qwen3tts_proxy.use_gpu         = p.value("use_gpu", false);
+        out.qwen3tts_proxy.gpu_device      = p.value("gpu_device", 0);
     }
     return true;
 }
@@ -327,6 +341,16 @@ int main(int argc, char** argv) {
             pc.model_dir  = cfg.has_qwen3tts_proxy
                 ? cfg.qwen3tts_proxy.model_dir
                 : m.path;
+            // CLI runner paths (voice-bearing requests).
+            if (cfg.has_qwen3tts_proxy) {
+                pc.binary_path     = cfg.qwen3tts_proxy.binary;
+                pc.customvoice_dir = cfg.qwen3tts_proxy.customvoice_dir;
+                pc.voicedesign_dir = cfg.qwen3tts_proxy.voicedesign_dir;
+                pc.base_dir        = cfg.qwen3tts_proxy.base_dir;
+                pc.voices_dir      = cfg.qwen3tts_proxy.voices_dir;
+                pc.use_gpu         = cfg.qwen3tts_proxy.use_gpu;
+                pc.gpu_device      = cfg.qwen3tts_proxy.gpu_device;
+            }
             (*qwen3_proxies)[m.id] = pc;
             std::fprintf(stderr,
                 "audiocore_server: proxy '%s' → qwen_tts-server (%s)\n",

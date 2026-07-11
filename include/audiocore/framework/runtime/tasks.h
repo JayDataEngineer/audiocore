@@ -82,7 +82,7 @@ struct TtsRequest {
     // ── Core (every TTS family reads these) ──
     std::string text;                  // text to synthesize
     std::string language;              // "en", "zh", "ja", … empty = auto
-    float       temperature    = 0.8f;
+    float       temperature    = 0.9f;
     float       top_p          = 0.9f;
     int32_t     max_new_tokens = 0;    // 0 → model default
     int32_t     seed           = 0;    // 0 → nondeterministic
@@ -122,6 +122,10 @@ struct TtsRequest {
     float       speed = 1.0f;                 // speed multiplier
     float       repetition_penalty = 1.05f;   // repetition penalty (CB0, HuggingFace style)
     float       embedding_strength = 1.0f;    // speaker embedding scale [0.0..2.0+]; 1.0=normal, <1=softer, >1=stronger
+    std::string emotion;                     // emotion preset name ("joy","sad","anger","fear","disgust","surprise", dyads, etc.)
+    float       voice_strength = 1.0f;       // voice identity strength [0.0..3.0]; 1.0=normal (WDELTA only; no-op for x-vector/ICL)
+    std::string expr_file;                   // .expr expressivity weight delta file path
+    float       expr_weight = 1.0f;          // .expr dose: 1=as trained, 0.6=subtler, 1.5=stronger
 
     // ── Voice sidecar DSP defaults ──
     // Populated by resolve_voice_field() when a `<name>.voice.json` sidecar

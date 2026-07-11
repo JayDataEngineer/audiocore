@@ -54,13 +54,14 @@
 <!-- ════════════════════════════════════════════════════════════════════ -->
 <nav class="tabs" role="tablist">
   <button class="tab active" data-tab="design"     role="tab"><span class="tab-emoji">✨</span> Voice Design<span class="tab-key">1</span></button>
-  <button class="tab"        data-tab="maker"      role="tab"><span class="tab-emoji">🎛️</span> Voice Maker<span class="tab-key">2</span></button>
-  <button class="tab"        data-tab="synthesize" role="tab"><span class="tab-emoji">🗣️</span> Synthesize<span class="tab-key">3</span></button>
-  <button class="tab"        data-tab="music"      role="tab"><span class="tab-emoji">🎵</span> Music<span class="tab-key">4</span></button>
-  <button class="tab"        data-tab="sfx"        role="tab"><span class="tab-emoji">🔊</span> SFX<span class="tab-key">5</span></button>
-  <button class="tab"        data-tab="voices"     role="tab"><span class="tab-emoji">🎭</span> Voices<span class="tab-key">6</span></button>
-  <button class="tab"        data-tab="clips"      role="tab"><span class="tab-emoji">🎬</span> Clips<span class="tab-key">7</span></button>
-  <button class="tab"        data-tab="models"     role="tab"><span class="tab-emoji">📦</span> Models<span class="tab-key">8</span></button>
+  <button class="tab"        data-tab="qwen-vm"     role="tab"><span class="tab-emoji">🎌</span> QWEN VM<span class="tab-key">2</span></button>
+  <button class="tab"        data-tab="maker"      role="tab"><span class="tab-emoji">🎛️</span> Voice Maker<span class="tab-key">3</span></button>
+  <button class="tab"        data-tab="synthesize" role="tab"><span class="tab-emoji">🗣️</span> Synthesize<span class="tab-key">4</span></button>
+  <button class="tab"        data-tab="music"      role="tab"><span class="tab-emoji">🎵</span> Music<span class="tab-key">5</span></button>
+  <button class="tab"        data-tab="sfx"        role="tab"><span class="tab-emoji">🔊</span> SFX<span class="tab-key">6</span></button>
+  <button class="tab"        data-tab="voices"     role="tab"><span class="tab-emoji">🎭</span> Voices<span class="tab-key">7</span></button>
+  <button class="tab"        data-tab="clips"      role="tab"><span class="tab-emoji">🎬</span> Clips<span class="tab-key">8</span></button>
+  <button class="tab"        data-tab="models"     role="tab"><span class="tab-emoji">📦</span> Models<span class="tab-key">9</span></button>
 </nav>
 
 <main class="shell">
@@ -302,6 +303,193 @@
           </div>
         </div>
       </div>
+    </div>
+  </section>
+
+  <!-- ════════════════ QWEN VOICE MAKER ════════════════ -->
+  <section class="panel" id="tab-qwen-vm">
+    <div class="panel-grid">
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>🎌 QWEN Voice Maker</h2>
+            <p class="card-sub">Design, export, and use Qwen3-TTS voices with emotion and strength control.</p>
+          </div>
+        </div>
+
+        <!-- Step 1: Design a voice -->
+        <div class="ck-step">
+          <span class="ck-num">1</span>
+          <label>Describe the voice</label>
+        </div>
+        <div class="preset-chips" id="qvm-presets">
+          <button type="button" class="chip" data-desc="cute high-pitched cheerful bright youthful voice, soft and bubbly, playful, gentle">🎌 anime</button>
+          <button type="button" class="chip" data-desc="A deep, gravelly male voice with a British accent, middle-aged, slow and deliberate.">🇬🇧 Deep Male</button>
+          <button type="button" class="chip" data-desc="A bright, high-pitched young female voice with an American accent, energetic and cheerful.">🇺🇸 Bright Female</button>
+          <button type="button" class="chip" data-desc="A warm, gentle grandmother voice, soft and comforting, with a slight lisp.">👵 Grandmother</button>
+          <button type="button" class="chip" data-desc="A young child's voice, innocent and curious, high-pitched and small.">🧒 Child</button>
+          <button type="button" class="chip" data-desc="A robotic, monotone, metallic voice, like an AI assistant from a sci-fi movie.">🤖 Robotic</button>
+        </div>
+        <textarea id="qvm-instruct" rows="3"
+          placeholder="Describe the voice… e.g. 'A warm Scottish male voice with a slight rasp'"></textarea>
+
+        <div class="form-row">
+          <label>Sample text</label>
+          <input type="text" id="qvm-text" class="grow"
+                 value="Hello! I am so happy to finally meet you. How can I help you today?"
+                 placeholder="Text to preview">
+        </div>
+
+        <div class="form-row">
+          <label>
+            <input type="checkbox" id="qvm-wdelta"> Heavy WDELTA (~3GB, enables voice_strength)
+          </label>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="qvm-listen" type="button">🔊 Listen</button>
+          <button class="btn btn-ghost" id="qvm-export" type="button" disabled>💾 Export .qvoice</button>
+        </div>
+        <div class="status" id="qvm-status"></div>
+
+        <!-- Player -->
+        <div class="player-area" id="qvm-player">
+          <div class="player-empty">
+            <div class="eq-bars" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div>Preview appears here</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>📦 Saved QWEN Voices</h2>
+            <p class="card-sub">Exported .qvoice files. Select one to use with emotion and strength control.</p>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label>Voice</label>
+          <select id="qvm-voice-select" class="grow">
+            <option value="">— loading… —</option>
+          </select>
+          <button class="btn btn-ghost" id="qvm-refresh" type="button">🔄</button>
+        </div>
+
+          <div class="form-row">
+          <div class="form-row">
+            <label>Emotion</label>
+            <select id="qvm-emotion" class="grow">
+              <option value="">Neutral</option>
+              <option value="joy">😊 Joy</option>
+              <option value="sad">😢 Sad</option>
+              <option value="anger">😠 Anger</option>
+              <option value="fear">😨 Fear</option>
+              <option value="disgust">🤢 Disgust</option>
+              <option value="surprise">😲 Surprise</option>
+              <option value="contempt">😤 Contempt</option>
+              <option value="awe">🤩 Awe</option>
+              <option value="nostalgia">🥺 Nostalgia</option>
+              <option value="disapproval">😒 Disapproval</option>
+              <option value="remorse">😞 Remorse</option>
+              <option value="outrage">🤬 Outrage</option>
+              <option value="despair">😰 Despair</option>
+            </select>
+          </div>
+
+          <div class="form-row">
+            <label>Expressivity (.expr)</label>
+            <select id="qvm-expr" class="grow">
+              <option value="">None</option>
+              <option value="italian_csp_topk6.expr">Italian (universal)</option>
+              <option value="german_csp_k6.expr">German</option>
+              <option value="french_csp_k6.expr">French</option>
+            </select>
+          </div>
+
+          <div class="form-row">
+            <label>Expr weight <span class="slider-val" id="qvm-expr-weight-val">1.00</span></label>
+            <input type="range" id="qvm-expr-weight" min="0" max="2" step="0.1" value="1.0" class="slider grow">
+          </div>
+
+          <div class="form-row">
+            <label>Voice strength <span class="slider-val" id="qvm-strength-val">1.00</span></label>
+            <input type="range" id="qvm-strength" min="0" max="3" step="0.1" value="1.0" class="slider grow">
+          </div>
+
+          <div class="form-row">
+            <label>Temperature</label>
+            <input type="number" id="qvm-temp" value="0.9" min="0.1" max="2.0" step="0.05" class="num">
+            <label>Top-P</label>
+            <input type="number" id="qvm-topp" value="1.0" min="0.1" max="1.0" step="0.05" class="num">
+          </div>
+
+          <div class="form-row">
+            <label>Top-K</label>
+            <input type="number" id="qvm-topk" value="50" min="1" max="100" step="1" class="num">
+            <label>Rep penalty</label>
+            <input type="number" id="qvm-rep" value="1.05" min="1.0" max="2.0" step="0.05" class="num">
+          </div>
+
+          <div class="form-row">
+            <label>Text</label>
+            <input type="text" id="qvm-use-text" class="grow"
+                   value="Hello! I am so happy to finally meet you."
+                   placeholder="Text to speak">
+          </div>
+
+          <div class="form-row">
+            <label>Instruct</label>
+            <input type="text" id="qvm-use-instruct" class="grow"
+                   placeholder="Optional style instruction (e.g. 'whispered', 'excited')"
+                   value="">
+          </div>
+
+          <div class="actions">
+            <button class="btn btn-primary" id="qvm-use" type="button">🗣️ Generate</button>
+            <button class="btn btn-ghost" id="qvm-use-to-syn" type="button">🎙️ Send to Synthesize</button>
+          </div>
+          <div class="status" id="qvm-use-status"></div>
+
+          <!-- Use player -->
+          <div class="player-area" id="qvm-use-player">
+            <div class="player-empty">
+              <div class="eq-bars" aria-hidden="true">
+                <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+              </div>
+              <div>Generated audio appears here</div>
+            </div>
+          </div>
+
+          <hr style="border-color: var(--border); margin: 1.5em 0;">
+
+          <h3>🔄 Re-bake with Emotion Baked In</h3>
+          <p class="card-sub" style="margin-bottom: 1em;">
+            Generate audio from this voice with emotion, then bake as a NEW voice.
+            The emotion becomes part of the voice identity — stronger than runtime controls.
+          </p>
+
+          <div class="form-row">
+            <label>New voice name</label>
+            <input type="text" id="qvm-rebake-name" class="grow"
+                   placeholder="e.g. tts_remote_angry, tts_remote_sad" value="">
+          </div>
+          <div class="form-row">
+            <label>
+              <input type="checkbox" id="qvm-rebake-wdelta"> Heavy WDELTA (enables voice_strength)
+            </label>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" id="qvm-rebake" type="button">🔄 Re-bake with Emotion</button>
+          </div>
+          <div class="status" id="qvm-rebake-status"></div>
+        </div>
+      </div>
+
     </div>
   </section>
 
