@@ -1847,10 +1847,13 @@
       const varp = ((d.explained_variance_ratio[i] || 0) * 100).toFixed(0);
       const step = (rg / 200).toFixed(4);
       const al = d.axis_labels && d.axis_labels[i];
+      const ext = d.pc_extremes && d.pc_extremes[i];
       const labeled = al && al.score > 0;
-      const name = labeled ? al.label : 'PC' + (i + 1);
-      const dir = labeled ? (al.neg + ' ←→ ' + al.pos) :
-                  ((al && al.neg) ? (al.neg + ' ←→ ' + al.pos) : '');
+      const name = 'PC' + (i + 1) + (labeled ? ' ' + al.label : '');
+      // Show the actual voice at each end — always unique, always descriptive
+      const negName = String(ext ? ext.negative_end : '').replace(/\.voice$/, '');
+      const posName = String(ext ? ext.positive_end : '').replace(/\.voice$/, '');
+      const dir = negName + ' ←→ ' + posName;
       html += '<div class="pca-axis">' +
         '<span class="pca-axis-name">' + name + '</span>' +
         '<span class="pca-axis-dir">' + dir + '</span>' +
@@ -2304,17 +2307,15 @@
     const np = Math.min(N_PCA_PCS, d.n_components);
     let html = "";
     for (let k = 0; k < np; k++) {
-      const al = d.axis_labels && d.axis_labels[k];
-      const labeled = al && al.score > 0;
+      const ext = d.pc_extremes && d.pc_extremes[k];
       const varp = ((d.explained_variance_ratio[k] || 0) * 100).toFixed(0);
-      const name = labeled ? al.label : ('PC' + (k + 1));
-      const negTag = labeled ? al.neg : '−';
-      const posTag = labeled ? al.pos : '+';
+      const posName = String(ext ? ext.positive_end : '?').replace(/\.voice$/, '');
+      const negName = String(ext ? ext.negative_end : '?').replace(/\.voice$/, '');
       html += '<div class="pca-sweep-group">';
-      html += '<span class="pca-sweep-label">' + name + ' · ' + varp + '%</span>';
+      html += '<span class="pca-sweep-label">PC' + (k+1) + ' · ' + varp + '%</span>';
       html += '<div class="pca-sweep-btns">';
-      html += '<button class="pca-sweep-btn" data-pca="' + k + '" data-sign="-1" type="button" title="' + negTag + '">− ' + negTag + '</button>';
-      html += '<button class="pca-sweep-btn" data-pca="' + k + '" data-sign="1" type="button" title="' + posTag + '">+ ' + posTag + '</button>';
+      html += '<button class="pca-sweep-btn" data-pca="' + k + '" data-sign="-1" type="button" title="−' + negName + '">− ' + esc(negName) + '</button>';
+      html += '<button class="pca-sweep-btn" data-pca="' + k + '" data-sign="1" type="button" title="+' + posName + '">+ ' + esc(posName) + '</button>';
       html += '</div></div>';
     }
     host.innerHTML = html;
@@ -2386,24 +2387,24 @@
                '" x2="' + nx.toFixed(1) + '" y2="' + ny.toFixed(1) +
                '" stroke="var(--border)" stroke-width="1" opacity="0.5"/>';
       }
-      // labels at both ends of each diameter
+      // labels at both ends of each diameter — show the ACTUAL voice at each
+      // extreme (from pc_extremes), not the repetitive semantic tag.
       for (let vi = 0; vi < nVerts; vi++) {
         const k = pcaIdx(vi);
-        const al = d.axis_labels && d.axis_labels[k];
+        const ext = d.pc_extremes && d.pc_extremes[k];
         const varp = ((d.explained_variance_ratio[k] || 0) * 100).toFixed(0);
         const isPos = vi < np;
-        const tag = (al && al.score > 0)
-          ? (isPos ? al.pos : al.neg)
-          : (isPos ? ('+' + (al ? al.pos : 'PC' + (k+1))) : ('−' + (al ? al.neg : '')));
-        const lbl = (al && al.score > 0) ? al.label : 'PC' + (k + 1);
-        const lx = cx + dirs[vi].x * (R + 26), ly = cy + dirs[vi].y * (R + 26);
+        // Voice name at this pole (strip .voice extension for readability)
+        const rawName = isPos ? (ext ? ext.positive_end : '?') : (ext ? ext.negative_end : '?');
+        const voiceName = String(rawName).replace(/\.voice$/, '');
+        const lx = cx + dirs[vi].x * (R + 28), ly = cy + dirs[vi].y * (R + 28);
         svg += '<text x="' + lx.toFixed(1) + '" y="' + ly.toFixed(1) + '" text-anchor="middle" ' +
-               'font-size="9" fill="var(--text-dim)">' + tag + '</text>';
-        // PCA label + variance only on the positive end (to avoid clutter)
+               'font-size="8" fill="var(--text)">' + esc(voiceName) + '</text>';
+        // PC label + variance on the positive end
         if (isPos) {
-          const vx = cx + dirs[vi].x * (R + 42), vy = cy + dirs[vi].y * (R + 42);
+          const vx = cx + dirs[vi].x * (R + 44), vy = cy + dirs[vi].y * (R + 44);
           svg += '<text x="' + vx.toFixed(1) + '" y="' + vy.toFixed(1) + '" text-anchor="middle" ' +
-                 'font-size="8" fill="var(--text-dim)" opacity="0.6">' + varp + '%</text>';
+                 'font-size="8" fill="var(--text-dim)" opacity="0.7">PC' + (k+1) + ' · ' + varp + '%</text>';
         }
       }
       // center dot
@@ -2498,17 +2499,16 @@
     const c = document.getElementById("pca-coords");
     if (c && PCA.data) {
       const d = PCA.data;
-      const lbl = (i) => {
-        const al = d.axis_labels && d.axis_labels[i];
-        return (al && al.score > 0) ? al.label : ('PC' + (i + 1));
-      };
-      // Show all 5 polygon PCA values as "name: ±value" pairs
+      // Show all 5 polygon PCA values with the voice they lean toward
       const np = Math.min(N_PCA_PCS, d.n_components);
       let parts = [];
       for (let i = 0; i < np; i++) {
         const w = PCA.weights[i] || 0;
+        const ext = d.pc_extremes && d.pc_extremes[i];
         const sign = w >= 0 ? '+' : '';
-        parts.push(lbl(i) + ' ' + sign + w.toFixed(2));
+        const voiceName = String(w >= 0 ? (ext?.positive_end || '?') : (ext?.negative_end || '?'))
+                          .replace(/\.voice$/, '');
+        parts.push('PC' + (i+1) + ':' + sign + w.toFixed(2) + '→' + voiceName);
       }
       c.textContent = parts.join(' · ');
     }
@@ -2943,6 +2943,71 @@
     if (!files.length) { toast("Pick a file first", "err"); return; }
     await upload_files("/v1/clips/upload", files, $("#clip-status"), () => load_clips());
     $("#clip-upload-file").value = "";
+  });
+
+  // ── Generate PCA sample clips ────────────────────────────────────────
+  // For each PC: synthesise speech at +max and −max so you can HEAR what
+  // each axis does. Uses a fixed seed + fixed text so the only variable is
+  // the PCA weight. Clips are saved to the clips library.
+  $("#clip-pca-samples")?.addEventListener("click", async () => {
+    const btn = $("#clip-pca-samples");
+    if (!PCA.data) { toast("Analyze voices first (Voice Design tab)", "err"); return; }
+    if (!ACTIVE_TTS) { toast("Load a qwen3_tts model first", "err"); return; }
+    const d = PCA.data;
+    const nc = d.n_components;
+    const sampleText = "Hey, I'm so happy to meet you. Tell me everything.";
+    const seed = 12345;
+    const statusEl = $("#clip-status");
+    btn.disabled = true;
+    let done = 0;
+    const total = nc * 2;
+    for (let k = 0; k < nc; k++) {
+      const ext = d.pc_extremes && d.pc_extremes[k];
+      const varp = ((d.explained_variance_ratio[k] || 0) * 100).toFixed(0);
+      for (const sign of [1, -1]) {
+        const w = new Array(nc).fill(0);
+        w[k] = sign * (PCA.ranges[k] || 1);
+        const emb = pca_reconstruct_from(w, 0);
+        if (!emb) continue;
+        const voiceLabel = sign > 0
+          ? String(ext?.positive_end || '?').replace(/\.voice$/, '')
+          : String(ext?.negative_end || '?').replace(/\.voice$/, '');
+        const clipName = 'PCA_PC' + (k+1) + (sign > 0 ? '+' : '-') + '_'
+                       + voiceLabel.replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 20)
+                       + '_v' + varp + '.wav';
+        if (statusEl) status(statusEl,
+          `Generating ${done+1}/${total}: PC${k+1}${sign>0?'+':'−'} ${voiceLabel}`, "loading");
+        try {
+          const body = {
+            model: ACTIVE_TTS,
+            input: sampleText,
+            mode: "voice_clone",
+            speaker_embedding: f32_to_b64(emb),
+            embedding_strength: 1.0,
+            seed: seed,
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 50,
+            max_tokens: 200,
+          };
+          const r = await fetch("/v1/audio/speech", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!r.ok) { console.error("TTS failed for " + clipName); continue; }
+          const blob = await r.blob();
+          const form = new FormData();
+          form.append("file", blob, clipName);
+          const ur = await fetch("/v1/clips/upload", { method: "POST", body: form });
+          const uj = await ur.json().catch(() => ({}));
+          if (!uj.ok) console.error("Upload failed for " + clipName);
+        } catch (e) { console.error("Error generating " + clipName, e); }
+        done++;
+      }
+    }
+    btn.disabled = false;
+    if (statusEl) status(statusEl, `Generated ${done} PCA sample clips`, "ok");
+    load_clips();
   });
 
   // Shared upload helper used by both buttons and drag-drop.
