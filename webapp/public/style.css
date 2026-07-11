@@ -942,3 +942,237 @@ select[multiple] { background-image: none; padding-right: 12px; }
   color: var(--accent-2);
 }
 .knob-doc em { color: var(--accent-2); font-style: normal; font-weight: 500; }
+
+/* ── PCA draggable explorer ──────────────────────────────────────────── */
+.pca-explorer {
+  margin-top: 1em;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1em;
+  background: var(--bg-card);
+}
+.pca-explorer-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75em;
+}
+#pca-plot svg { touch-action: none; display: block; }
+#pca-marker circle { fill: rgba(245, 158, 11, 0.14); transition: fill 0.15s ease; }
+#pca-marker:hover circle { fill: rgba(245, 158, 11, 0.26); }
+#pca-plot .pca-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin: 0.5em 0 0;
+  text-align: center;
+}
+.pca-legend-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 0.5em;
+}
+.pca-poly-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0.25em 0 0.5em;
+  color: var(--text);
+}
+#pca-polygon { display: flex; justify-content: center; margin: 0.25em 0; }
+#pca-polygon .pca-vert { transition: r 0.1s ease; }
+#pca-polygon .pca-vert:hover { r: 9; }
+
+/* ── PCA axis instruments + sampling + snapshots ────────────────────── */
+.pca-axes-block, .pca-snapshots-block {
+  margin: 0.5em 0 0.75em;
+}
+.pca-axes-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.4em;
+}
+.pca-axes-title { font-size: 12px; font-weight: 600; color: var(--text); }
+.pca-axes-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 14px;
+}
+.pca-axis {
+  display: grid;
+  grid-template-columns: 68px 1fr 30px 1fr 54px;
+  align-items: center;
+  gap: 6px;
+}
+.pca-axis-name { font-size: 11px; font-weight: 600; color: var(--accent-2); }
+.pca-axis-dir { font-size: 9px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pca-axis-var { font-size: 10px; color: var(--text-dim); text-align: right; }
+.pca-axis-slider { height: 4px; padding: 0; min-width: 0; }
+.pca-axis-num {
+  font-size: 11px;
+  padding: 2px 4px;
+  text-align: right;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  width: 54px;
+}
+.pca-sampling { gap: 0.5em; flex-wrap: wrap; }
+.pca-num-mini { max-width: 6.5em; padding: 2px 4px; font-size: 12px;
+  border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); }
+.pca-snapshots { display: flex; flex-direction: column; gap: 4px; }
+.pca-snap {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.pca-snap .btn { padding: 3px 8px; font-size: 12px; }
+.pca-snap-recall { flex: 1; text-align: left; justify-content: flex-start; }
+.pca-snap-recall:hover { border-color: var(--accent); color: var(--accent); }
+.pca-snap-ab:hover { border-color: var(--accent-2); color: var(--accent-2); }
+.pca-snap-empty { font-size: 11px; color: var(--text-dim); padding: 0.3em 0.2em; }
+@media (max-width: 720px) {
+  .pca-axes-grid { grid-template-columns: 1fr; }
+}
+
+/* ── Clips: rating + score + A/B compare ────────────────────────────── */
+.clip-actions { display: flex; gap: 0.35em; align-items: center; }
+.clip-actions .btn { padding: 0.25em 0.5em; font-size: 13px; }
+.clip-actions .btn.on { background: var(--accent); color: #0b0d14; border-color: var(--accent); }
+.clip-stars { margin-top: 0.3em; user-select: none; }
+.clip-stars .star {
+  font-size: 16px; color: var(--border-strong); cursor: pointer; line-height: 1;
+  transition: color 0.1s ease, transform 0.1s ease;
+}
+.clip-stars .star:hover { transform: scale(1.2); }
+.clip-stars .star.on { color: #f59e0b; }
+.clip-transcript {
+  margin-top: 0.3em; font-size: 11px; color: var(--text-dim);
+  font-style: italic; line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tag-score { background: rgba(99,102,241,0.15); color: var(--accent); border: 1px solid var(--border); }
+.compare-card {
+  border: 1px solid var(--border-strong); border-radius: 12px;
+  padding: 0.75em 1em; margin-bottom: 1em; background: var(--bg-card-2);
+}
+.compare-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5em; }
+.compare-row { display: flex; align-items: center; gap: 0.75em; margin: 0.4em 0; }
+.compare-label {
+  width: 1.5em; height: 1.5em; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 12px; background: var(--accent); color: #0b0d14;
+}
+.compare-name { font-size: 13px; min-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compare-row audio { flex: 1; height: 32px; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   VOICE COCKPIT — the polygon is the hero, not a form
+   ═══════════════════════════════════════════════════════════════════ */
+.cockpit {
+  grid-column: 1 / -1;                       /* span the whole panel-grid */
+  display: grid;
+  grid-template-columns: minmax(280px, 360px) 1fr;
+  gap: 1.25em;
+  align-items: start;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  padding: 1.25em;
+  background: linear-gradient(180deg, var(--bg-card-2), var(--bg-card));
+}
+.cockpit-controls { display: flex; flex-direction: column; gap: 0.4em; }
+.cockpit-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 0.35em;
+}
+.cockpit-head h2 { margin: 0; font-size: 18px; }
+.cockpit-stage {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; min-height: 420px;
+}
+.cockpit-polygon { width: 100%; display: flex; justify-content: center; }
+.cockpit-polygon:empty::before {
+  content: "Loading voice space…";
+  color: var(--text-dim); font-size: 13px; padding: 6em 0;
+}
+.cockpit-polygon svg { width: 100%; max-width: 600px; height: auto; }
+
+/* Staged steps — numbered badges guide the eye left-to-right */
+.ck-step {
+  display: flex; align-items: center; gap: 0.5em; margin: 0.35em 0 0.1em;
+  font-size: 13px; font-weight: 600; color: var(--text);
+}
+.ck-num {
+  width: 1.5em; height: 1.5em; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 12px; background: var(--accent); color: #0b0d14;
+}
+.ck-minibtns { display: flex; gap: 0.4em; align-items: center; flex-wrap: wrap; padding-left: 2em; }
+.ck-row {
+  display: flex; align-items: center; gap: 0.6em; margin: 0.3em 0;
+  font-size: 12px;
+}
+.ck-row label { min-width: 7.5em; color: var(--text-dim); }
+.ck-actions { display: flex; gap: 0.5em; margin-top: 0.6em; flex-wrap: wrap; }
+select.grow { flex: 1; min-width: 0; }
+.cockpit-controls input[type="text"].grow { width: 100%; }
+.ck-advanced {
+  margin-top: 0.75em; border-top: 1px dashed var(--border); padding-top: 0.5em;
+}
+.ck-advanced > summary {
+  cursor: pointer; font-size: 12px; color: var(--text-dim);
+  font-weight: 600; padding: 0.25em 0;
+}
+.ck-advanced[open] > summary { margin-bottom: 0.5em; }
+
+@media (max-width: 900px) {
+  .cockpit { grid-template-columns: 1fr; }
+}
+
+/* ── Emotion matrix ── */
+.emo-matrix {
+  display: grid; grid-template-columns: 150px 1fr; gap: 0.75em;
+  margin: 0.5em 0 0.25em; padding: 0.5em;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
+}
+.emo-pad-wrap { display: flex; flex-direction: column; align-items: center; }
+.emo-pad {
+  position: relative; width: 150px; height: 150px;
+  border-radius: 10px; touch-action: none; cursor: crosshair;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(245,158,11,0.06), transparent 70%),
+    linear-gradient(135deg, #1a1f2e, #0f131c);
+  border: 1px solid var(--border-strong);
+}
+.emo-cross-h, .emo-cross-v {
+  position: absolute; background: var(--border); opacity: 0.5;
+}
+.emo-cross-h { left: 6%; right: 6%; top: 50%; height: 1px; }
+.emo-cross-v { top: 6%; bottom: 6%; left: 50%; width: 1px; }
+.emo-dot {
+  position: absolute; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--accent); border: 2px solid #fff;
+  transform: translate(-50%, -50%); pointer-events: none;
+  box-shadow: 0 0 10px rgba(245,158,11,0.6);
+}
+.emo-axis-x, .emo-axis-y {
+  font-size: 9px; color: var(--text-dim); display: flex;
+  justify-content: space-between; width: 150px; margin-top: 3px;
+}
+.emo-axis-y {
+  position: absolute; writing-mode: vertical-rl; transform: rotate(180deg);
+  height: 150px; justify-content: space-between; left: -16px; top: 0;
+}
+.emo-side { display: flex; flex-direction: column; gap: 0.4em; }
+.emo-presets { display: flex; flex-wrap: wrap; gap: 0.25em; }
+.emo-presets .btn { padding: 0.25em 0.5em; font-size: 11px; }
+.emo-readout { font-size: 11px; color: var(--text-dim); }
+
+/* ── DSP / prosody subsections inside Advanced ── */
+.ck-subsection {
+  margin-top: 0.75em; padding-top: 0.5em; border-top: 1px dashed var(--border);
+}

@@ -68,6 +68,175 @@
   <!-- ════════════════ VOICE DESIGN ════════════════ -->
   <section class="panel active" id="tab-design">
     <div class="panel-grid">
+
+      <!-- ═══════════ VOICE COCKPIT — the polygon is the hero ═══════════ -->
+      <div class="cockpit" id="pca-explorer">
+        <div class="cockpit-controls">
+          <div class="cockpit-head">
+            <h2>🎙️ Voice Cockpit</h2>
+            <span class="slider-val" id="pca-coords">PC1 0.00 · 0 axes</span>
+          </div>
+
+          <div class="ck-step">
+            <span class="ck-num">1</span>
+            <label>Base voice</label>
+            <select id="ck-base" class="grow">
+              <option value="__mean__">✨ Default (mean)</option>
+            </select>
+          </div>
+
+          <div class="ck-step">
+            <span class="ck-num">2</span>
+            <label>Sculpt — drag the polygon</label>
+          </div>
+          <div class="ck-minibtns">
+            <button class="btn btn-ghost" id="pca-reset" type="button">⟲ Reset</button>
+            <input type="range" id="pca-mutate-amt" min="0.02" max="0.5" step="0.02" value="0.15" class="slider" style="max-width:90px">
+            <span class="slider-val" id="pca-mutate-val">15%</span>
+            <button class="btn btn-ghost" id="pca-mutate" type="button">🎲 Mutate</button>
+          </div>
+
+          <div class="ck-step">
+            <span class="ck-num">3</span>
+            <label>Emotion / instruct</label>
+          </div>
+          <input type="text" id="pca-instruct" class="grow"
+                 value="Warm, playful, slightly teasing."
+                 placeholder="e.g. 'Whispered, full of wonder.'">
+
+          <!-- Emotion matrix: 2D pad (warmth × energy) + intimacy -->
+          <div class="emo-matrix">
+            <div class="emo-pad-wrap">
+              <div class="emo-pad" id="emo-pad">
+                <div class="emo-cross-h"></div>
+                <div class="emo-cross-v"></div>
+                <div class="emo-dot" id="emo-dot"></div>
+              </div>
+              <div class="emo-axis-x"><span>calm</span><span>energy</span><span>excited</span></div>
+              <div class="emo-axis-y"><span>cold</span><span>warm</span></div>
+            </div>
+            <div class="emo-side">
+              <div class="emo-presets">
+                <button class="btn btn-ghost emo-preset" data-w="0.0"  data-e="-0.7" type="button">😌 Calm</button>
+                <button class="btn btn-ghost emo-preset" data-w="0.5"  data-e="0.5"  type="button">😊 Playful</button>
+                <button class="btn btn-ghost emo-preset" data-w="0.8"  data-e="-0.3" type="button">🥰 Intimate</button>
+                <button class="btn btn-ghost emo-preset" data-w="-0.3" data-e="0.8"  type="button">⚡ Excited</button>
+                <button class="btn btn-ghost emo-preset" data-w="-0.7" data-e="0.0"  type="button">❄️ Cold</button>
+              </div>
+              <div class="ck-row">
+                <label>Intimacy <span class="slider-val" id="emo-intimacy-val">0.30</span></label>
+                <input type="range" id="emo-intimacy" min="0" max="1" step="0.05" value="0.3" class="slider grow">
+              </div>
+              <div class="emo-readout" id="emo-readout">warmth +0.50 · energy +0.50</div>
+            </div>
+          </div>
+
+          <div class="form-row" style="margin-top:0.4em">
+            <label>Sample text</label>
+            <input type="text" id="pca-text" class="grow"
+                   value="Hey there, I'm your favorite voice — nice to meet you!">
+          </div>
+
+          <div class="ck-row">
+            <label>Strength <span class="slider-val" id="pca-strength-val">1.0</span></label>
+            <input type="range" id="pca-strength" min="0.1" max="3.0" step="0.1" value="1.0" class="slider grow">
+          </div>
+          <div class="ck-row">
+            <label>Constrain <span class="slider-val" id="pca-constrain-val">0.00</span></label>
+            <input type="range" id="pca-constrain" min="0" max="1" step="0.05" value="0" class="slider grow">
+          </div>
+
+          <div class="ck-actions">
+            <button class="btn btn-primary" id="pca-play" type="button">▶️ Play</button>
+            <button class="btn btn-ghost" id="pca-save" type="button">💾 Save .voice</button>
+            <button class="btn btn-ghost" id="pca-snap-add" type="button" title="Save shape">📸</button>
+            <button class="btn btn-ghost" id="pca-profile-export" type="button" title="Export full profile">⬇️ Profile</button>
+            <button class="btn btn-ghost" id="pca-profile-import" type="button" title="Import profile">⬆️ Import</button>
+            <input type="file" id="pca-profile-file" accept=".voiceprofile,.json" hidden>
+          </div>
+          <div class="player-area" id="pca-player" hidden></div>
+
+          <details class="ck-advanced">
+            <summary>Advanced — axis values · sampling · snapshots</summary>
+            <div class="pca-axes-block">
+              <div class="pca-axes-head"><span class="pca-axes-title">Axis weights (these ARE the vertices)</span></div>
+              <div id="pca-axes" class="pca-axes-grid"></div>
+            </div>
+            <div class="form-row pca-sampling">
+              <label>Temp <span class="slider-val" id="pca-temp-val">0.70</span></label>
+              <input type="range" id="pca-temp" min="0.1" max="1.5" step="0.05" value="0.7" class="slider grow">
+              <label>Top-p <span class="slider-val" id="pca-topp-val">0.90</span></label>
+              <input type="range" id="pca-topp" min="0.1" max="1" step="0.05" value="0.9" class="slider grow">
+            </div>
+            <div class="form-row pca-sampling">
+              <label>Top-k</label>
+              <input type="number" id="pca-topk" min="1" max="200" step="1" value="50" class="grow pca-num-mini">
+              <label>Max tok</label>
+              <input type="number" id="pca-maxtok" min="64" max="8192" step="64" value="200" class="grow pca-num-mini">
+              <label>Seed</label>
+              <input type="number" id="pca-seed" placeholder="random" class="grow pca-num-mini">
+            </div>
+            <div class="form-row pca-sampling">
+              <label>Pitch <span class="slider-val" id="pca-pitch-val">0.0</span></label>
+              <input type="range" id="pca-pitch" min="-12" max="12" step="0.5" value="0" class="slider grow">
+              <label>Speed <span class="slider-val" id="pca-speed-val">1.00</span></label>
+              <input type="range" id="pca-speed" min="0.5" max="2.0" step="0.05" value="1.0" class="slider grow">
+            </div>
+
+            <!-- Voice character DSP: formant shaper + airiness + breathiness -->
+            <div class="ck-subsection">
+              <div class="pca-axes-head"><span class="pca-axes-title">🎚️ Voice character — formant · airiness · breathiness</span></div>
+              <div class="form-row pca-sampling">
+                <label>Warmth <span class="slider-val" id="dsp-warmth-val">0.0</span></label>
+                <input type="range" id="dsp-warmth" min="-1" max="1" step="0.05" value="0" class="slider grow">
+                <label>Formant <span class="slider-val" id="dsp-formant-val">0.0</span></label>
+                <input type="range" id="dsp-formant" min="-1" max="1" step="0.05" value="0" class="slider grow">
+              </div>
+              <div class="form-row pca-sampling">
+                <label>Bright <span class="slider-val" id="dsp-brightness-val">0.0</span></label>
+                <input type="range" id="dsp-brightness" min="-1" max="1" step="0.05" value="0" class="slider grow">
+                <label>Airiness <span class="slider-val" id="dsp-airiness-val">0.0</span></label>
+                <input type="range" id="dsp-airiness" min="-1" max="1" step="0.05" value="0" class="slider grow">
+              </div>
+              <div class="form-row pca-sampling">
+                <label>Breathiness <span class="slider-val" id="dsp-breathiness-val">0.0</span></label>
+                <input type="range" id="dsp-breathiness" min="0" max="1" step="0.05" value="0" class="slider grow">
+              </div>
+            </div>
+
+            <!-- Prosody: pitch contour + breath insertion -->
+            <div class="ck-subsection">
+              <div class="pca-axes-head"><span class="pca-axes-title">🎶 Prosody — intonation · breaths</span></div>
+              <div class="form-row pca-sampling">
+                <label>Contour</label>
+                <select id="prosody-contour" class="grow">
+                  <option value="flat">flat</option>
+                  <option value="rise">rising ↗</option>
+                  <option value="fall">falling ↘</option>
+                  <option value="dip">dip ∨</option>
+                  <option value="wave">wave ∿</option>
+                </select>
+                <label>Depth <span class="slider-val" id="prosody-contour-depth-val">0.0</span></label>
+                <input type="range" id="prosody-contour-depth" min="0" max="6" step="0.5" value="0" class="slider grow">
+              </div>
+              <div class="form-row pca-sampling">
+                <label>Breaths <span class="slider-val" id="prosody-breath-val">0.0</span></label>
+                <input type="range" id="prosody-breath" min="0" max="1" step="0.05" value="0" class="slider grow">
+              </div>
+            </div>
+            <div class="pca-snapshots-block">
+              <div class="pca-axes-head"><span class="pca-axes-title">Saved shapes</span></div>
+              <div id="pca-snapshots" class="pca-snapshots"></div>
+            </div>
+          </details>
+        </div>
+
+        <div class="cockpit-stage">
+          <div id="pca-polygon" class="cockpit-polygon"></div>
+          <p class="pca-legend-note">Each axis is one principal component of your voice library (% = how strongly it shapes the voice). <b>Drag a vertex toward an edge to push that trait; through the centre for the opposite pole.</b> The filled shape IS the voice.</p>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-head">
           <div>
@@ -330,6 +499,7 @@
             <option value="uploaded">Uploaded / Saved .voice</option>
             <option value="designed">🎤 Last designed voice</option>
             <option value="reference">Reference audio (clone)</option>
+            <option value="identity_style">🎭 Identity + Style (clone acting)</option>
             <option value="none">None (plain TTS)</option>
           </select>
           <select id="syn-preset" class="grow"></select>
@@ -340,7 +510,14 @@
           <label>Reference</label>
           <input type="file" id="syn-ref-file" accept="audio/*">
           <input type="text" id="syn-ref-text" class="grow"
-                 placeholder="Reference transcript (optional, improves clone)">
+                  placeholder="Reference transcript (optional, improves clone)">
+        </div>
+
+        <div class="form-row" id="syn-style-row" hidden>
+          <label>Style (acting)</label>
+          <input type="file" id="syn-style-file" accept="audio/*">
+          <input type="text" id="syn-style-text" class="grow"
+                  placeholder="Expressive reference transcript (optional) — prosody/acting copied from this clip">
         </div>
 
         <div class="form-row" id="syn-strength-row" hidden>
@@ -665,6 +842,7 @@
         <button class="btn btn-ghost" id="clip-refresh" type="button">↻ Refresh</button>
       </div>
       <div class="status" id="clip-status"></div>
+      <div id="clips-compare"></div>
       <div class="clips-grid" id="clips-list">
         <div class="empty"><div class="empty-icon">🎬</div><div class="empty-title">Loading clips…</div></div>
       </div>

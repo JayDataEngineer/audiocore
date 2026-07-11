@@ -45,6 +45,98 @@
     return d.innerHTML;
   }
 
+  // ── Draggable PCA explorer shared state ──────────────────────────────
+  // Holds the last /v1/voices/analyze result plus the pixel↔PC coordinate
+  // transforms so we can map a dragged marker back to (PC1, PC2) weights and
+  // reconstruct an embedding client-side (emb = mean + Σ wᵢ·componentsᵢ).
+  const PCA = {
+    data: null,         // full analyze JSON (incl. mean + components)
+    weights: [],        // one signed weight per principal component
+    ranges: [],         // per-PC |max| used to normalise the polygon axes
+    constrain: 0,       // 0..1 manifold pull toward nearest real voice
+    W: 560, H: 420, PAD: 50,
+    min1: 0, max1: 1, min2: 0, max2: 1,
+    // pixel → PC coordinate
+    toPcX(px) { const r = (this.max1 - this.min1) + 0.01; return this.min1 + ((px - this.PAD) / (this.W - 2 * this.PAD)) * r; },
+    toPcY(py) { const r = (this.max2 - this.min2) + 0.01; return this.max2 - ((py - this.PAD) / (this.H - 2 * this.PAD)) * ((this.max2 - this.min2) + 0.01); },
+    // PC coordinate → pixel
+    toPxX(v) { const r = (this.max1 - this.min1) + 0.01; return this.PAD + ((v - this.min1) / r) * (this.W - 2 * this.PAD); },
+    toPxY(v) { const r = (this.max2 - this.min2) + 0.01; return this.H - this.PAD - ((v - this.min2) / r) * (this.H - 2 * this.PAD); },
+  };
+
+  function f32_to_b64(arr) {
+    const buf = new ArrayBuffer(arr.length * 4);
+    new Float32Array(buf).set(arr);
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+
+  // Core reconstruction: emb = mean + Σᵢ wᵢ·componentᵢ, then optional
+  // manifold pull toward the nearest real voice (in PC space). Accepts an
+  // explicit weight vector + constrain value so LIVE sculpting and SAVED
+  // snapshots share the exact same math — an A/B comparison is truthful.
+  function pca_reconstruct_from(weights, constrain) {
+    const d = PCA.data;
+    if (!d || !d.mean) return null;
+    const mean = d.mean, comps = d.components, w = weights;
+    const dim = mean.length;
+    const emb = new Float32Array(dim);
+    for (let i = 0; i < dim; i++) emb[i] = mean[i];
+    for (let i = 0; i < w.length; i++) {
+      const c = comps[i];
+      if (!c) continue;
+      const wi = w[i];
+      if (wi === 0) continue;
+      for (let j = 0; j < dim; j++) emb[j] += wi * c[j];
+    }
+    // Manifold constraint: pull the reconstructed embedding toward the
+    // nearest real voice (in PC space) so extreme drags stay within the
+    // distribution of natural speech instead of collapsing to noise.
+    const c = constrain || 0;
+    if (c > 0 && d.voices && d.voices.length) {
+      let best = -1, bestD = Infinity;
+      for (let k = 0; k < d.voices.length; k++) {
+        const pc = d.voices[k].pc; let s = 0;
+        for (let i = 0; i < w.length; i++) { const dd = (pc[i] || 0) - (w[i] || 0); s += dd * dd; }
+        if (s < bestD) { bestD = s; best = k; }
+      }
+      if (best >= 0) {
+        const pc = d.voices[best].pc;
+        const tv = new Float32Array(dim);
+        for (let j = 0; j < dim; j++) tv[j] = mean[j];
+        for (let i = 0; i < pc.length; i++) {
+          const cc = comps[i]; if (!cc) continue;
+          const wi = pc[i] || 0; if (wi === 0) continue;
+          for (let j = 0; j < dim; j++) tv[j] += wi * cc[j];
+        }
+        for (let j = 0; j < dim; j++) emb[j] = emb[j] * (1 - c) + tv[j] * c;
+      }
+    }
+    return emb;
+  }
+
+  function pca_reconstruct() { return pca_reconstruct_from(PCA.weights, PCA.constrain); }
+
+  function pca_build_voice_blob(emb) {
+    // QWEN3VOICE container: 16-byte magic/pad + 4×uint32 (ver,dim,flags,rs) + f32s
+    const MAGIC = "QWEN3VOICE";
+    const head = new Uint8Array(16);
+    for (let i = 0; i < MAGIC.length; i++) head[i] = MAGIC.charCodeAt(i);
+    const meta = new Uint8Array(16); // ver(1), dim, flags(0), rs(0)
+    new DataView(meta.buffer).setUint32(0, 1, true);
+    new DataView(meta.buffer).setUint32(4, emb.length, true);
+    new DataView(meta.buffer).setUint32(8, 0, true);
+    new DataView(meta.buffer).setUint32(12, 0, true);
+    const f32 = new Uint8Array(emb.buffer);
+    const out = new Uint8Array(head.length + meta.length + f32.length);
+    out.set(head, 0);
+    out.set(meta, head.length);
+    out.set(f32, head.length + meta.length);
+    return new Blob([out], { type: "application/octet-stream" });
+  }
+
   function set_player(el, blob_url, meta) {
     el.innerHTML = "";
     el.classList.add("has-audio");
@@ -776,12 +868,13 @@
   // Voice source change → toggle selects
   $("#syn-voice-source").addEventListener("change", (e) => {
     const v = e.target.value;
-    $("#syn-preset").hidden   = v !== "preset";
-    $("#syn-uploaded").hidden = v !== "uploaded";
-    $("#syn-ref-row").hidden  = v !== "reference";
+    $("#syn-preset").hidden       = v !== "preset";
+    $("#syn-uploaded").hidden     = !(v === "uploaded" || v === "identity_style");
+    $("#syn-ref-row").hidden      = v !== "reference";
+    $("#syn-style-row").hidden    = v !== "identity_style";
     // Voice strength slider: show for any voice source except "none".
     $("#syn-strength-row").hidden = v === "none";
-    if (v === "uploaded") load_syn_voice_meta();
+    if (v === "uploaded" || v === "identity_style") load_syn_voice_meta();
     if (v === "designed") {
       if (vd_saved_name) {
         status($("#syn-status"), "Using last designed voice: " + vd_saved_name, "info");
@@ -899,6 +992,33 @@
         body.mode = "voice_clone";
       } catch (err) {
         status(st, "Ref upload error: " + err.message, "err"); return;
+      }
+    } else if (src === "identity_style") {
+      // Cross-speaker style transfer: identity comes from a saved .voice
+      // (your tts_remote), acting/prosody is copied from a separate expressive
+      // reference WAV. The backend keeps the .voice embedding and ALSO
+      // encodes the style WAV into codec ref-codes — so you hear your
+      // character performing the other clip's delivery.
+      const idV = $("#syn-uploaded").value;
+      if (!idV) { status(st, "Pick an identity voice (.voice) first.", "err"); return; }
+      const sf = $("#syn-style-file").files[0];
+      if (!sf) { status(st, "Pick a style reference audio file.", "err"); return; }
+      btn.disabled = true; btn.textContent = "Uploading style…";
+      status(st, "Uploading style reference…", "loading");
+      try {
+        const form = new FormData();
+        form.append("file", sf, sf.name);
+        const up = await fetch("/v1/clips/upload", { method: "POST", body: form });
+        const uj = await up.json();
+        if (!uj.ok || !uj.saved || !uj.saved.length) {
+          status(st, "Style upload failed", "err"); return;
+        }
+        body.voice          = idV;                       // identity (embedding)
+        body.reference_audio = uj.saved[0];               // style (ref-codes)
+        body.reference_text  = $("#syn-style-text").value.trim();
+        body.mode = "voice_clone";
+      } catch (err) {
+        status(st, "Style upload error: " + err.message, "err"); return;
       }
     }
 
@@ -1582,12 +1702,17 @@
     const plotEl = $("#pca-plot");
     const detEl  = $("#pca-details");
 
+    // Persist state for the draggable explorer.
+    PCA.data = data;
+
     // ── Scatter plot (PC1 × PC2, coloured by cluster) ──
     const pc1 = voices.map(v => v.pc[0]);
     const pc2 = voices.map(v => v.pc[1] || 0);
     const min1 = Math.min(...pc1), max1 = Math.max(...pc1);
     const min2 = Math.min(...pc2), max2 = Math.max(...pc2);
     const W = 560, H = 420, PAD = 50;
+    PCA.W = W; PCA.H = H; PCA.PAD = PAD;
+    PCA.min1 = min1; PCA.max1 = max1; PCA.min2 = min2; PCA.max2 = max2;
     const range1 = max1 - min1 + 0.01;
     const range2 = max2 - min2 + 0.01;
     const sx = v => PAD + ((v - min1) / range1) * (W - 2 * PAD);
@@ -1629,6 +1754,19 @@
       svg += '<text x="' + (parseFloat(cx) + 7) + '" y="' + (parseFloat(cy) + 4) +
              '" font-size="9" fill="var(--text-dim)">' + esc(label) + "</text>";
     }
+    // ── Draggable explorer marker (initialized at the centroid = mean) ──
+    // mean maps to PC (0,0); if (0,0) is outside the data range we pin it to
+    // the centre of the plot so it's always grabbable.
+    let mkX = (min1 <= 0 && max1 >= 0) ? PCA.toPxX(0) : (PAD + (W - 2 * PAD) / 2);
+    let mkY = (min2 <= 0 && max2 >= 0) ? PCA.toPxY(0) : (PAD + (H - 2 * PAD) / 2);
+    svg += '<g id="pca-marker" style="cursor:grab">';
+    svg += '<line x1="' + (mkX - 9) + '" y1="' + mkY + '" x2="' + (mkX + 9) + '" y2="' + mkY +
+           '" stroke="#f59e0b" stroke-width="1.5"/>';
+    svg += '<line x1="' + mkX + '" y1="' + (mkY - 9) + '" x2="' + mkX + '" y2="' + (mkY + 9) +
+           '" stroke="#f59e0b" stroke-width="1.5"/>';
+    svg += '<circle cx="' + mkX + '" cy="' + mkY + '" r="8" fill="none" stroke="#f59e0b" ' +
+           'stroke-width="2" opacity="0.9"/>';
+    svg += '</g>';
     // Legend
     const clusters = [...new Set(voices.map(v => v.cluster))].sort();
     let lx = W - PAD - 60;
@@ -1642,6 +1780,9 @@
     }
     svg += "</svg>";
     plotEl.innerHTML = svg;
+
+    // ── Draggable explorer wiring ──
+    pca_init_explorer();
 
     // ── PC extremes table ──
     let html = '<div style="overflow-x:auto;margin-top:1em">';
@@ -1691,6 +1832,828 @@
     detEl.innerHTML = html;
   }
 
+  // ── Per-axis numeric instruments ─────────────────────────────────────
+  // Each principal component gets a precise numeric readout AND a slim
+  // slider, both bidirectionally bound to the polygon vertex. This is the
+  // cockpit: drag the polygon for feel, type here for exact values.
+  function pca_render_axes() {
+    const host = document.getElementById("pca-axes");
+    if (!host || !PCA.data) return;
+    const d = PCA.data;
+    const axes = Math.min(d.n_components, 16);
+    let html = "";
+    for (let i = 0; i < axes; i++) {
+      const rg = PCA.ranges[i] || 1;
+      const varp = ((d.explained_variance_ratio[i] || 0) * 100).toFixed(0);
+      const step = (rg / 200).toFixed(4);
+      const al = d.axis_labels && d.axis_labels[i];
+      const labeled = al && al.score > 0;
+      const name = labeled ? al.label : 'PC' + (i + 1);
+      const dir = labeled ? (al.neg + ' ←→ ' + al.pos) :
+                  ((al && al.neg) ? (al.neg + ' ←→ ' + al.pos) : '');
+      html += '<div class="pca-axis">' +
+        '<span class="pca-axis-name">' + name + '</span>' +
+        '<span class="pca-axis-dir">' + dir + '</span>' +
+        '<span class="pca-axis-var">' + varp + '%</span>' +
+        '<input type="range" class="slider pca-axis-slider" data-axis="' + i + '" ' +
+          'min="' + (-rg).toFixed(3) + '" max="' + rg.toFixed(3) + '" step="' + step + '" value="0">' +
+        '<input type="number" class="pca-axis-num" data-axis="' + i + '" ' +
+          'min="' + (-rg).toFixed(3) + '" max="' + rg.toFixed(3) + '" step="0.01" value="0.000">' +
+        '</div>';
+    }
+    host.innerHTML = html;
+    host.querySelectorAll(".pca-axis-num, .pca-axis-slider").forEach((el) => {
+      el.addEventListener("input", () => {
+        const i = parseInt(el.dataset.axis, 10);
+        pca_set_weight(i, parseFloat(el.value));
+      });
+    });
+  }
+
+  // Central single-source-of-truth setter: clamp to the observed range,
+  // store, and refresh every bound view (polygon, scatter, other inputs).
+  function pca_set_weight(i, val) {
+    if (isNaN(val)) val = 0;
+    const rg = PCA.ranges[i] || 1;
+    PCA.weights[i] = Math.max(-rg, Math.min(rg, val));
+    pca_refresh();
+  }
+
+  // Push the weight vector back into the axis inputs. Whatever element
+  // currently has focus is skipped so typing / dragging is never clobbered.
+  function pca_sync_axes() {
+    const host = document.getElementById("pca-axes");
+    if (!host) return;
+    host.querySelectorAll(".pca-axis-num").forEach((el) => {
+      const i = parseInt(el.dataset.axis, 10);
+      if (document.activeElement !== el) el.value = (PCA.weights[i] || 0).toFixed(3);
+    });
+    host.querySelectorAll(".pca-axis-slider").forEach((el) => {
+      const i = parseInt(el.dataset.axis, 10);
+      if (document.activeElement !== el) el.value = PCA.weights[i] || 0;
+    });
+  }
+
+  // Read the sculptor's sampling/DSP controls into a request-body fragment
+  // so both the live "Play" and snapshot "A/B" speak the backend's language.
+  function pca_sampling_params() {
+    const o = {};
+    const num = (id) => { const el = document.getElementById(id); return el ? parseFloat(el.value) : NaN; };
+    const Int = (id) => { const el = document.getElementById(id); return el ? parseInt(el.value, 10) : NaN; };
+    const t = num("pca-temp"), tp = num("pca-topp"), tk = Int("pca-topk"),
+          mt = Int("pca-maxtok"), sd = Int("pca-seed"), pi = num("pca-pitch"), sp = num("pca-speed");
+    if (!isNaN(t)) o.temperature = t;
+    if (!isNaN(tp)) o.top_p = tp;
+    if (!isNaN(tk)) o.text_top_k = tk;
+    if (!isNaN(pi)) o.pitch_shift = pi;
+    if (!isNaN(sp)) o.speed = sp;
+    if (!isNaN(mt)) o.max_tokens = mt;
+    if (!isNaN(sd)) o.seed = sd;
+    return o;
+  }
+
+  // ── Voice-character DSP + prosody collection ───────────────────────────
+  // Reads the formant/airiness/breathiness + pitch-contour/breath fields.
+  // All default to neutral, so the object only carries non-zero values.
+  function pca_collect_dsp() {
+    const o = {};
+    const f = (id) => { const el = document.getElementById(id); return el ? parseFloat(el.value) : NaN; };
+    const w = f("dsp-warmth"), fo = f("dsp-formant"), br = f("dsp-brightness"),
+          ai = f("dsp-airiness"), bi = f("dsp-breathiness");
+    if (!isNaN(w)  && w  !== 0) o.dsp_warmth = w;
+    if (!isNaN(fo) && fo !== 0) o.dsp_formant = fo;
+    if (!isNaN(br) && br !== 0) o.dsp_brightness = br;
+    if (!isNaN(ai) && ai !== 0) o.dsp_airiness = ai;
+    if (!isNaN(bi) && bi !== 0) o.dsp_breathiness = bi;
+    const sel = document.getElementById("prosody-contour");
+    const shape = sel ? sel.value : "flat";
+    const depth = f("prosody-contour-depth");
+    if (shape && shape !== "flat" && !isNaN(depth) && depth > 0.05) {
+      o.prosody_contour = shape;
+      o.prosody_contour_depth = depth;
+    }
+    const pb = f("prosody-breath");
+    if (!isNaN(pb) && pb > 0.01) o.prosody_breath = pb;
+    return o;
+  }
+
+  // ── Emotion matrix ─────────────────────────────────────────────────────
+  // 2D pad: X = energy (-1..1), Y = warmth (-1..1); plus intimacy (0..1).
+  // Moving the pad composes a descriptive instruct string and modulates
+  // temperature (energy) + embedding strength (intimacy). Manual edits to the
+  // instruct field are preserved until the next pad move.
+  const EMOTION = { warmth: 0.5, energy: 0.5, intimacy: 0.3 };
+  let EMO_USER_INSTRUCT = false;  // user typed their own — don't clobber
+
+  function emo_compose_instruct(w, e, i) {
+    const parts = [];
+    // warmth axis
+    if (w > 0.7) parts.push("tender", "affectionate");
+    else if (w > 0.3) parts.push("warm", "friendly");
+    else if (w < -0.7) parts.push("cold", "detached");
+    else if (w < -0.3) parts.push("cool", "composed");
+    // energy axis
+    if (e > 0.7) parts.push("energetic", "upbeat");
+    else if (e > 0.3) parts.push("lively", "bright");
+    else if (e < -0.7) parts.push("sleepy", "drowsy");
+    else if (e < -0.3) parts.push("calm", "relaxed");
+    // intimacy overlay
+    if (i > 0.7) parts.push("whispered", "intimate");
+    else if (i > 0.4) parts.push("soft", "close");
+    if (!parts.length) return "Neutral, natural speaking voice.";
+    // De-duplicate, capitalise, join.
+    const seen = new Set(), out = [];
+    for (const p of parts) { const lw = p.toLowerCase(); if (!seen.has(lw)) { seen.add(lw); out.push(p); } }
+    out[0] = out[0][0].toUpperCase() + out[0].slice(1);
+    return out.join(", ") + " tone.";
+  }
+
+  function emo_apply() {
+    const dot = document.getElementById("emo-dot");
+    const pad = document.getElementById("emo-pad");
+    if (dot && pad) {
+      // Map -1..1 → 0..100% within the pad.
+      dot.style.left = ((EMOTION.energy  + 1) / 2 * 100) + "%";
+      dot.style.top  = ((1 - EMOTION.warmth) / 2 * 100) + "%";
+    }
+    const ro = document.getElementById("emo-readout");
+    if (ro) {
+      const sgn = (v) => (v >= 0 ? "+" : "") + v.toFixed(2);
+      ro.textContent = "warmth " + sgn(EMOTION.warmth) + " · energy " + sgn(EMOTION.energy);
+    }
+    const iv = document.getElementById("emo-intimacy-val");
+    if (iv) iv.textContent = EMOTION.intimacy.toFixed(2);
+    // Compose instruct unless the user typed their own.
+    if (!EMO_USER_INSTRUCT) {
+      const ins = document.getElementById("pca-instruct");
+      if (ins) ins.value = emo_compose_instruct(EMOTION.warmth, EMOTION.energy, EMOTION.intimacy);
+    }
+    // Modulate temperature from energy, strength from intimacy (only when the
+    // emotion pad is the active driver — i.e. these track the pad).
+    const baseTemp = 0.55 + EMOTION.energy * 0.35;       // 0.20 .. 0.90
+    const baseStr  = 0.8 + EMOTION.intimacy * 1.4;        // 0.8 .. 2.2
+    const tEl = document.getElementById("pca-temp");
+    const sEl = document.getElementById("pca-strength");
+    if (tEl) { tEl.value = Math.max(0.1, Math.min(1.5, baseTemp)); tEl.dispatchEvent(new Event("input")); }
+    if (sEl) { sEl.value = Math.max(0.1, Math.min(3.0, baseStr));  sEl.dispatchEvent(new Event("input")); }
+
+    // ── DSP acoustic modulation ──────────────────────────────────────────
+    // The emotion pad shapes the actual acoustic character via the voice-
+    // enhance DSP chain, not just the instruct text. These map naturally:
+    //   warmth  → low-shelf EQ (chesty ↔ thin)
+    //   energy  → brightness + formant (crisp/bright ↔ dull/flat)
+    //   intimacy → airiness + breathiness (close/breathy ↔ neutral)
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const setSlider = (id, val) => {
+      const el = document.getElementById(id);
+      if (el) { el.value = val; el.dispatchEvent(new Event("input")); }
+    };
+    setSlider("dsp-warmth",     clamp(EMOTION.warmth * 0.6, -1, 1));
+    setSlider("dsp-brightness", clamp(EMOTION.energy * 0.5, -1, 1));
+    setSlider("dsp-formant",    clamp(EMOTION.energy * 0.3, -1, 1));
+    setSlider("dsp-airiness",   clamp(EMOTION.intimacy * 0.5, -1, 1));
+    setSlider("dsp-breathiness", clamp(EMOTION.intimacy * 0.7, 0, 1));
+    // Intimacy also shapes the pitch contour — high intimacy = gentle dip
+    // (softer, more personal), low intimacy = flat (neutral).
+    const contourEl = document.getElementById("prosody-contour");
+    const contourDepthEl = document.getElementById("prosody-contour-depth");
+    if (contourEl && EMOTION.intimacy > 0.4) {
+      contourEl.value = "dip";
+      contourEl.dispatchEvent(new Event("input"));
+      if (contourDepthEl) {
+        contourDepthEl.value = clamp(EMOTION.intimacy * 2.5, 0, 4).toFixed(1);
+        contourDepthEl.dispatchEvent(new Event("input"));
+      }
+    }
+  }
+
+  function emo_init() {
+    const pad = document.getElementById("emo-pad");
+    if (!pad || pad.dataset.bound) return;
+    pad.dataset.bound = "1";
+    const move = (ev) => {
+      const r = pad.getBoundingClientRect();
+      const px = (ev.clientX - r.left) / r.width;    // 0..1
+      const py = (ev.clientY - r.top) / r.height;    // 0..1
+      EMOTION.energy = Math.max(-1, Math.min(1, px * 2 - 1));
+      EMOTION.warmth = Math.max(-1, Math.min(1, 1 - py * 2));
+      EMO_USER_INSTRUCT = false;   // pad is driving again
+      emo_apply();
+    };
+    pad.addEventListener("pointerdown", (e) => { pad.setPointerCapture(e.pointerId); move(e); });
+    pad.addEventListener("pointermove", (e) => { if (e.buttons) move(e); });
+
+    // Presets
+    document.querySelectorAll(".emo-preset").forEach((b) => {
+      b.addEventListener("click", () => {
+        EMOTION.warmth = parseFloat(b.dataset.w);
+        EMOTION.energy = parseFloat(b.dataset.e);
+        EMO_USER_INSTRUCT = false;
+        emo_apply();
+      });
+    });
+    // Intimacy slider
+    const intl = document.getElementById("emo-intimacy");
+    if (intl) intl.addEventListener("input", () => {
+      EMOTION.intimacy = parseFloat(intl.value);
+      EMO_USER_INSTRUCT = false;
+      emo_apply();
+    });
+    // If the user edits the instruct, stop auto-composing.
+    const ins = document.getElementById("pca-instruct");
+    if (ins) ins.addEventListener("input", () => { EMO_USER_INSTRUCT = true; });
+    emo_apply();
+  }
+
+  // ── Profile export / import (client-side, full cockpit state) ──────────
+  function pca_profile_state() {
+    const num = (id) => { const el = document.getElementById(id); return el ? el.value : ""; };
+    return {
+      schema: "audiocore.voiceprofile.v1",
+      base_voice: num("ck-base"),
+      weights: PCA.weights ? PCA.weights.slice() : [],
+      instruct: num("pca-instruct"),
+      text: num("pca-text"),
+      emotion: { warmth: EMOTION.warmth, energy: EMOTION.energy, intimacy: EMOTION.intimacy },
+      sampling: {
+        temp: num("pca-temp"), topp: num("pca-topp"), topk: num("pca-topk"),
+        maxtok: num("pca-maxtok"), seed: num("pca-seed"),
+        pitch: num("pca-pitch"), speed: num("pca-speed"),
+        strength: num("pca-strength"), constrain: num("pca-constrain"),
+      },
+      dsp: {
+        warmth: num("dsp-warmth"), formant: num("dsp-formant"),
+        brightness: num("dsp-brightness"), airiness: num("dsp-airiness"),
+        breathiness: num("dsp-breathiness"),
+      },
+      prosody: {
+        contour: num("prosody-contour"), contour_depth: num("prosody-contour-depth"),
+        breath: num("prosody-breath"),
+      },
+    };
+  }
+
+  function pca_profile_export() {
+    const st = pca_profile_state();
+    const name = (prompt("Profile name:", "my_tts_remote") || "voice").trim().replace(/[^a-z0-9_-]/gi, "_");
+    const blob = new Blob([JSON.stringify(st, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name + ".voiceprofile";
+    document.body.appendChild(a); a.click(); a.remove();
+    toast("Exported " + a.download, "ok");
+  }
+
+  function pca_profile_import(file) {
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const st = JSON.parse(r.result);
+        if (st.schema !== "audiocore.voiceprofile.v1") throw new Error("not a voiceprofile");
+        const set = (id, v) => { const el = document.getElementById(id); if (el && v !== undefined && v !== null) el.value = v; };
+        // Weights
+        if (Array.isArray(st.weights) && PCA.data) {
+          PCA.weights = st.weights.slice(0, PCA.data.n_components);
+          while (PCA.weights.length < PCA.data.n_components) PCA.weights.push(0);
+        }
+        set("ck-base", st.base_voice);
+        set("pca-text", st.text);
+        if (st.emotion) {
+          EMOTION.warmth = st.emotion.warmth ?? 0.5;
+          EMOTION.energy = st.emotion.energy ?? 0.5;
+          EMOTION.intimacy = st.emotion.intimacy ?? 0.3;
+          EMO_USER_INSTRUCT = true;  // respect the imported instruct below
+        }
+        set("pca-instruct", st.instruct);
+        if (st.sampling) {
+          set("pca-temp", st.sampling.temp); set("pca-topp", st.sampling.topp);
+          set("pca-topk", st.sampling.topk); set("pca-maxtok", st.sampling.maxtok);
+          set("pca-seed", st.sampling.seed); set("pca-pitch", st.sampling.pitch);
+          set("pca-speed", st.sampling.speed); set("pca-strength", st.sampling.strength);
+          set("pca-constrain", st.sampling.constrain);
+        }
+        if (st.dsp) {
+          set("dsp-warmth", st.dsp.warmth); set("dsp-formant", st.dsp.formant);
+          set("dsp-brightness", st.dsp.brightness); set("dsp-airiness", st.dsp.airiness);
+          set("dsp-breathiness", st.dsp.breathiness);
+        }
+        if (st.prosody) {
+          set("prosody-contour", st.prosody.contour); set("prosody-contour-depth", st.prosody.contour_depth);
+          set("prosody-breath", st.prosody.breath);
+        }
+        // Refresh every dependent surface.
+        sync_all_sliders();
+        emo_apply();
+        pca_refresh();
+        toast("Imported profile" + (st.base_voice ? " · base " + st.base_voice : ""), "ok");
+      } catch (e) { toast("Import failed: " + e.message, "err"); }
+    };
+    r.readAsText(file);
+  }
+
+  // ── Voice-shape snapshots (localStorage) ─────────────────────────────
+  // A snapshot captures the full weight vector + constrain + strength +
+  // instruct, so a sculpted voice can be recalled EXACTLY, or A/B-played
+  // against the current sculptor WITHOUT disturbing it.
+  const PCA_SNAP_KEY = "audiocore.pca.snaps.v1";
+  function pca_snap_load() {
+    try { return JSON.parse(localStorage.getItem(PCA_SNAP_KEY) || "[]"); } catch (_) { return []; }
+  }
+  function pca_snap_store(arr) {
+    try { localStorage.setItem(PCA_SNAP_KEY, JSON.stringify(arr)); } catch (_) {}
+  }
+  function pca_snap_add() {
+    if (!PCA.data) return;
+    const name = (prompt("Name this voice shape:", "shape " + (pca_snap_load().length + 1)) || "").trim();
+    if (!name) return;
+    const arr = pca_snap_load();
+    arr.push({
+      name: name,
+      weights: PCA.weights.slice(),
+      constrain: PCA.constrain,
+      strength: parseFloat((document.getElementById("pca-strength") || {}).value) || 1.0,
+      instruct: ((document.getElementById("pca-instruct") || {}).value || "").trim(),
+      ts: Date.now(),
+    });
+    pca_snap_store(arr);
+    pca_snap_render();
+    toast("Saved shape: " + name, "ok");
+  }
+  function pca_snap_render() {
+    const host = document.getElementById("pca-snapshots");
+    if (!host) return;
+    const arr = pca_snap_load();
+    if (!arr.length) {
+      host.innerHTML = '<span class="pca-snap-empty">No saved shapes yet — sculpt a voice, then 📸 Save shape to recall or A/B it.</span>';
+      return;
+    }
+    let html = "";
+    for (let i = 0; i < arr.length; i++) {
+      const s = arr[i];
+      html += '<div class="pca-snap">' +
+        '<button class="btn btn-ghost pca-snap-recall" data-i="' + i + '" title="Recall into sculptor">↺ ' + esc(s.name) + '</button>' +
+        '<button class="btn btn-ghost pca-snap-ab" data-i="' + i + '" title="Play without changing the sculptor">▶ A/B</button>' +
+        '<button class="btn btn-ghost pca-snap-del" data-i="' + i + '" title="Delete this shape">✕</button>' +
+        '</div>';
+    }
+    host.innerHTML = html;
+    host.querySelectorAll(".pca-snap-recall").forEach((b) =>
+      b.addEventListener("click", () => pca_snap_recall(parseInt(b.dataset.i, 10))));
+    host.querySelectorAll(".pca-snap-ab").forEach((b) =>
+      b.addEventListener("click", () => pca_snap_play(parseInt(b.dataset.i, 10))));
+    host.querySelectorAll(".pca-snap-del").forEach((b) =>
+      b.addEventListener("click", () => {
+        const a = pca_snap_load();
+        a.splice(parseInt(b.dataset.i, 10), 1);
+        pca_snap_store(a);
+        pca_snap_render();
+      }));
+  }
+  function pca_snap_recall(i) {
+    const s = pca_snap_load()[i];
+    if (!s || !PCA.data) return;
+    const n = PCA.data.n_components;
+    PCA.weights = s.weights.slice();
+    while (PCA.weights.length < n) PCA.weights.push(0);
+    PCA.weights.length = n;
+    PCA.constrain = s.constrain || 0;
+    const cEl = document.getElementById("pca-constrain");
+    if (cEl) cEl.value = PCA.constrain;
+    const cVal = document.getElementById("pca-constrain-val");
+    if (cVal) cVal.textContent = PCA.constrain.toFixed(2);
+    const sEl = document.getElementById("pca-strength");
+    if (sEl) sEl.value = s.strength;
+    const sVal = document.getElementById("pca-strength-val");
+    if (sVal) sVal.textContent = (s.strength || 1).toFixed(1);
+    const iEl = document.getElementById("pca-instruct");
+    if (iEl) iEl.value = s.instruct || "";
+    pca_refresh();
+    toast("Recalled shape: " + s.name, "ok");
+  }
+  async function pca_snap_play(i) {
+    const s = pca_snap_load()[i];
+    if (!s) return;
+    if (!ACTIVE_TTS) { toast("Load a qwen3_tts model first", "err"); return; }
+    const emb = pca_reconstruct_from(s.weights, s.constrain || 0);
+    if (!emb) { toast("Reconstruct failed", "err"); return; }
+    const txtEl = document.getElementById("pca-text");
+    const body = Object.assign({
+      model: ACTIVE_TTS,
+      input: ((txtEl && txtEl.value) || "").trim() || "Hello!",
+      mode: "voice_clone",
+      instruct: (s.instruct || "").trim(),
+      speaker_embedding: f32_to_b64(emb),
+      embedding_strength: s.strength || 1.0,
+    }, pca_sampling_params(), pca_collect_dsp());
+    const btn = document.querySelector('.pca-snap-ab[data-i="' + i + '"]');
+    if (btn) { btn.disabled = true; btn.textContent = "…"; }
+    try {
+      const r = await fetch("/v1/audio/speech", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        toast(j.error || ("HTTP " + r.status), "err");
+      } else {
+        const blob = await r.blob();
+        const player = document.getElementById("pca-player");
+        if (player) {
+          player.hidden = false;
+          set_player(player, URL.createObjectURL(blob),
+            "A/B · " + s.name + " · " + (blob.size / 1024).toFixed(1) + " KB");
+        }
+      }
+    } catch (e) { toast("A/B play failed: " + e.message, "err"); }
+    if (btn) { btn.disabled = false; btn.textContent = "▶ A/B"; }
+  }
+
+  // Randomly perturb every weight within ±(amt × range). The fastest way to
+  // discover an inhuman-but-beautiful voice no human larynx can produce —
+  // iterate mutate → play → save-shape on the keepers.
+  function pca_mutate() {
+    const amtEl = document.getElementById("pca-mutate-amt");
+    const amt = amtEl ? (parseFloat(amtEl.value) || 0.15) : 0.15;
+    for (let i = 0; i < PCA.weights.length; i++) {
+      const rg = PCA.ranges[i] || 1;
+      const delta = (Math.random() * 2 - 1) * amt * rg;
+      PCA.weights[i] = Math.max(-rg, Math.min(rg, (PCA.weights[i] || 0) + delta));
+    }
+    pca_refresh();
+  }
+
+  // ── Draggable PCA explorer: drag the marker, reconstruct the embedding,
+  //    and either play it (POST to /v1/audio/speech) or save it as a .voice. ──
+  // ── PCA polygon (radar) renderer ─────────────────────────────────────
+  // One axis per principal component; each vertex is draggable along its
+  // axis to set that PC's signed weight. The filled polygon IS the voice.
+  function pca_render_polygon() {
+    const host = document.getElementById("pca-polygon");
+    if (!host || !PCA.data) return;
+    const d = PCA.data;
+    const axes = Math.min(d.n_components, 16);   // cap visible axes
+    const W = 600, H = 600, cx = W / 2, cy = H / 2, R = 220;
+    const dirs = [];
+    for (let i = 0; i < axes; i++) {
+      const a = -Math.PI / 2 + i * (2 * Math.PI / axes);
+      dirs.push({ x: Math.cos(a), y: Math.sin(a) });
+    }
+    const vertexPos = (i) => {
+      const w = PCA.weights[i] || 0, rg = PCA.ranges[i] || 1;
+      const rr = (w / rg) * R;                    // signed radius
+      return { x: cx + dirs[i].x * rr, y: cy + dirs[i].y * rr };
+    };
+
+    // Build the scaffold ONCE; refreshes only update points/cx/cy in place.
+    // (Rebuilding innerHTML on every drag tick destroys the dragged vertex and
+    //  its pointer-capture, killing the drag after one move — see pca_refresh.)
+    let svgEl = host.querySelector("svg");
+    const needRebuild = !svgEl ||
+      svgEl.dataset.axes !== String(axes) ||
+      svgEl.dataset.W !== String(W) || svgEl.dataset.R !== String(R);
+    if (needRebuild) {
+      let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
+                '" style="max-width:100%;background:var(--bg-card);border-radius:8px;touch-action:none">';
+      // grid rings
+      for (let g = 1; g <= 3; g++) {
+        let pts = "";
+        for (let i = 0; i < axes; i++) {
+          const x = cx + dirs[i].x * (R * g / 3), y = cy + dirs[i].y * (R * g / 3);
+          pts += x.toFixed(1) + "," + y.toFixed(1) + " ";
+        }
+        svg += '<polygon points="' + pts.trim() + '" fill="none" stroke="var(--border)" stroke-width="1" opacity="0.5"/>';
+      }
+      // axes + labels
+      for (let i = 0; i < axes; i++) {
+        const ex = cx + dirs[i].x * R, ey = cy + dirs[i].y * R;
+        svg += '<line x1="' + cx + '" y1="' + cy + '" x2="' + ex.toFixed(1) + '" y2="' + ey.toFixed(1) +
+               '" stroke="var(--border)" stroke-width="1" opacity="0.6"/>';
+        const lx = cx + dirs[i].x * (R + 28), ly = cy + dirs[i].y * (R + 28);
+        const al = d.axis_labels && d.axis_labels[i];
+        const varp = ((d.explained_variance_ratio[i] || 0) * 100).toFixed(0);
+        const shortLabel = (al && al.score > 0) ? al.label : 'PC' + (i + 1);
+        svg += '<text x="' + lx.toFixed(1) + '" y="' + ly.toFixed(1) + '" text-anchor="middle" ' +
+               'font-size="10" fill="var(--text-dim)">' + shortLabel + ' · ' + varp + '%</text>';
+      }
+      // voice-shape polygon (filled) — class so we can update points in place
+      svg += '<polygon class="pca-shape" points="" fill="rgba(245,158,11,0.18)" stroke="#f59e0b" stroke-width="2"/>';
+      // draggable vertices
+      for (let i = 0; i < axes; i++) {
+        svg += '<circle class="pca-vert" data-axis="' + i + '" cx="0" cy="0" r="7" ' +
+               'fill="#f59e0b" stroke="var(--bg-card)" stroke-width="2" style="cursor:grab"/>';
+      }
+      svg += "</svg>";
+      host.innerHTML = svg;
+      svgEl = host.querySelector("svg");
+      svgEl.dataset.axes = axes; svgEl.dataset.W = W; svgEl.dataset.R = R;
+
+      // Attach drag listeners ONCE. These closures capture dirs/cx/R which are
+      // stable for a given scaffold; we rebuild only if axes/W/R change.
+      svgEl.querySelectorAll(".pca-vert").forEach((v) => {
+        v.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          const axis = parseInt(v.dataset.axis, 10);
+          v.setPointerCapture(e.pointerId);
+          v.style.cursor = "grabbing";
+          const move = (ev) => {
+            const pt = svgEl.createSVGPoint(); pt.x = ev.clientX; pt.y = ev.clientY;
+            const p = pt.matrixTransform(svgEl.getScreenCTM().inverse());
+            const dx = p.x - cx, dy = p.y - cy;
+            const proj = dx * dirs[axis].x + dy * dirs[axis].y;
+            const rg = PCA.ranges[axis] || 1;
+            let w = (proj / R) * rg;
+            w = Math.max(-rg, Math.min(rg, w));
+            PCA.weights[axis] = w;
+            pca_refresh();
+          };
+          const up = () => {
+            v.style.cursor = "grab";
+            svgEl.removeEventListener("pointermove", move);
+            svgEl.removeEventListener("pointerup", up);
+          };
+          svgEl.addEventListener("pointermove", move);
+          svgEl.addEventListener("pointerup", up);
+        });
+      });
+    }
+
+    // In-place update — never destroys the DOM, so drags stay alive.
+    let poly = "";
+    for (let i = 0; i < axes; i++) { const p = vertexPos(i); poly += p.x.toFixed(1) + "," + p.y.toFixed(1) + " "; }
+    const shape = svgEl.querySelector(".pca-shape");
+    if (shape) shape.setAttribute("points", poly.trim());
+    const verts = svgEl.querySelectorAll(".pca-vert");
+    verts.forEach((v, i) => {
+      if (i >= axes) return;
+      const p = vertexPos(i);
+      v.setAttribute("cx", p.x.toFixed(1));
+      v.setAttribute("cy", p.y.toFixed(1));
+    });
+  }
+
+  // Keep the scatter marker + coords label in sync with the weight vector.
+  function pca_set_scatter() {
+    const svg = document.querySelector("#pca-plot svg");
+    if (!svg) return;
+    const m = svg.querySelector("#pca-marker");
+    if (!m) return;
+    const x = PCA.toPxX(PCA.weights[0] || 0);
+    const y = PCA.toPxY(PCA.weights[1] || 0);
+    const c = m.querySelector("circle");
+    c.setAttribute("cx", x); c.setAttribute("cy", y);
+    const ls = m.querySelectorAll("line");
+    ls[0].setAttribute("x1", x - 9); ls[0].setAttribute("x2", x + 9);
+    ls[0].setAttribute("y1", y);      ls[0].setAttribute("y2", y);
+    ls[1].setAttribute("x1", x);      ls[1].setAttribute("x2", x);
+    ls[1].setAttribute("y1", y - 9);  ls[1].setAttribute("y2", y + 9);
+  }
+
+  function pca_refresh() {
+    pca_render_polygon();
+    pca_set_scatter();
+    pca_sync_axes();
+    const c = document.getElementById("pca-coords");
+    if (c && PCA.data) {
+      const d = PCA.data;
+      const lbl = (i) => {
+        const al = d.axis_labels && d.axis_labels[i];
+        return (al && al.score > 0) ? al.label : ('PC' + (i + 1));
+      };
+      c.textContent = lbl(0) + " " + (PCA.weights[0] || 0).toFixed(2) +
+                      " · " + lbl(1) + " " + (PCA.weights[1] || 0).toFixed(2) +
+                      " · " + PCA.weights.length + " axes";
+    }
+  }
+
+  // Load a base voice into the sculptor: the mean (weights=0) or a real voice
+  // (weights = that voice's own PC vector). This is how you START from a single
+  // voice instead of being forced to blend two.
+  function pca_load_base(name) {
+    if (!PCA.data) return;
+    if (!name || name === "__mean__") {
+      PCA.weights = new Array(PCA.data.n_components).fill(0);
+    } else {
+      const v = PCA.data.voices.find(x => x.name === name);
+      if (v && v.pc) {
+        PCA.weights = v.pc.slice(0, PCA.data.n_components);
+        while (PCA.weights.length < PCA.data.n_components) PCA.weights.push(0);
+      }
+    }
+    pca_refresh();
+  }
+
+  // Auto-run PCA on load so the cockpit polygon is live on the landing tab,
+  // without requiring the user to click Analyze or open the Voices tab.
+  let PCA_AUTO_DONE = false;
+  async function auto_pca_analyze() {
+    if (PCA_AUTO_DONE || !VOICES_CACHE.length) return;
+    PCA_AUTO_DONE = true;
+    try {
+      const r = await fetch("/v1/voices/analyze", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ components: 10, clusters: 5, save_dirs: true }),
+      });
+      const data = await r.json();
+      if (data.error) return;
+      render_pca(data);
+    } catch (e) { /* silent — manual analyze still available */ }
+  }
+
+  function pca_init_explorer() {
+    const expl = document.getElementById("pca-explorer");
+    if (!expl) return;
+    expl.hidden = false;
+    const svg  = document.querySelector("#pca-plot svg");
+    const marker = svg && svg.querySelector("#pca-marker");
+
+    const coordsEl    = document.getElementById("pca-coords");
+    const strengthEl  = document.getElementById("pca-strength");
+    const strengthVal = document.getElementById("pca-strength-val");
+    const txtEl       = document.getElementById("pca-text");
+    const instrEl     = document.getElementById("pca-instruct");
+
+    // Initialise the per-PC weight vector + per-axis ranges from the data.
+    const d = PCA.data;
+    PCA.weights = new Array(d.n_components).fill(0);
+    PCA.ranges = [];
+    for (let i = 0; i < d.n_components; i++) {
+      let m = 0;
+      for (const v of d.voices) m = Math.max(m, Math.abs(v.pc[i] || 0));
+      PCA.ranges.push(m < 1e-6 ? 1 : m);
+    }
+
+    // Populate the base-voice selector (start from a default OR any real voice).
+    const baseSel = document.getElementById("ck-base");
+    if (baseSel && !baseSel.dataset.filled) {
+      baseSel.dataset.filled = "1";
+      baseSel.innerHTML = '<option value="__mean__">✨ Default (mean voice)</option>';
+      for (const v of d.voices) {
+        const o = document.createElement("option");
+        o.value = v.name;
+        o.textContent = v.name.replace(/\.voice$/, "");
+        baseSel.appendChild(o);
+      }
+      baseSel.addEventListener("change", () => pca_load_base(baseSel.value));
+    }
+
+    if (marker) {
+      const circle = marker.querySelector("circle");
+      const lines  = marker.querySelectorAll("line");
+
+      function markerXY() {
+        return { x: parseFloat(circle.getAttribute("cx")),
+                 y: parseFloat(circle.getAttribute("cy")) };
+      }
+      function clientToSvg(e) {
+        const pt = svg.createSVGPoint();
+        pt.x = e.clientX; pt.y = e.clientY;
+        return pt.matrixTransform(svg.getScreenCTM().inverse());
+      }
+      function moveMarker(x, y) {
+        x = Math.max(PCA.PAD, Math.min(PCA.W - PCA.PAD, x));
+        y = Math.max(PCA.PAD, Math.min(PCA.H - PCA.PAD, y));
+        circle.setAttribute("cx", x); circle.setAttribute("cy", y);
+        lines[0].setAttribute("x1", x - 9); lines[0].setAttribute("x2", x + 9);
+        lines[0].setAttribute("y1", y);      lines[0].setAttribute("y2", y);
+        lines[1].setAttribute("x1", x);      lines[1].setAttribute("x2", x);
+        lines[1].setAttribute("y1", y - 9);  lines[1].setAttribute("y2", y + 9);
+      }
+
+      // Dragging the 2D scatter marker adjusts PC1/PC2 and syncs the polygon.
+      let dragging = false;
+      marker.addEventListener("pointerdown", (e) => {
+        dragging = true; marker.style.cursor = "grabbing";
+        marker.setPointerCapture(e.pointerId); e.preventDefault();
+      });
+      marker.addEventListener("pointerup", () => { dragging = false; marker.style.cursor = "grab"; });
+      svg.addEventListener("pointermove", (e) => {
+        if (!dragging) return;
+        const p = clientToSvg(e); moveMarker(p.x, p.y);
+        PCA.weights[0] = PCA.toPcX(p.x);
+        PCA.weights[1] = PCA.toPcY(p.y);
+        pca_refresh();
+      });
+      svg.addEventListener("pointerdown", (e) => {
+        if (e.target === marker || marker.contains(e.target)) return;
+        const p = clientToSvg(e); moveMarker(p.x, p.y);
+        PCA.weights[0] = PCA.toPcX(p.x);
+        PCA.weights[1] = PCA.toPcY(p.y);
+        pca_refresh();
+      });
+    }
+
+    strengthEl.addEventListener("input", () => {
+      strengthVal.textContent = parseFloat(strengthEl.value).toFixed(1);
+    });
+
+    const constrainEl  = document.getElementById("pca-constrain");
+    const constrainVal = document.getElementById("pca-constrain-val");
+    constrainEl.addEventListener("input", () => {
+      PCA.constrain = parseFloat(constrainEl.value) || 0;
+      constrainVal.textContent = PCA.constrain.toFixed(2);
+    });
+
+    document.getElementById("pca-reset").addEventListener("click", () => {
+      PCA.weights.fill(0);
+      pca_refresh();
+    });
+
+    document.getElementById("pca-play").addEventListener("click", async () => {
+      if (!PCA.data) return;
+      if (!ACTIVE_TTS) { toast("Load a qwen3_tts model first", "err"); return; }
+      const emb = pca_reconstruct();
+      if (!emb) { toast("Analyze voices first", "err"); return; }
+      const body = {
+        model: ACTIVE_TTS,
+        input: (txtEl.value || "").trim() || "Hello!",
+        mode: "voice_clone",
+        instruct: (instrEl.value || "").trim(),
+        speaker_embedding: f32_to_b64(emb),
+        embedding_strength: parseFloat(strengthEl.value) || 1.0,
+      };
+      Object.assign(body, pca_sampling_params(), pca_collect_dsp());
+      const btn = document.getElementById("pca-play");
+      btn.disabled = true; btn.textContent = "Synthesizing…";
+      try {
+        const r = await fetch("/v1/audio/speech", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.error || ("TTS failed " + r.status));
+        }
+        const blob = await r.blob();
+        const player = document.getElementById("pca-player");
+        player.hidden = false;
+        set_player(player, URL.createObjectURL(blob),
+                   "PCA voice · " + (blob.size / 1024).toFixed(1) + " KB");
+      } catch (err) { toast("Play failed: " + err.message, "err"); }
+      btn.disabled = false; btn.textContent = "▶️ Play";
+    });
+
+    document.getElementById("pca-save").addEventListener("click", async () => {
+      if (!PCA.data) return;
+      const emb = pca_reconstruct();
+      if (!emb) { toast("Analyze voices first", "err"); return; }
+      const blob = pca_build_voice_blob(emb);
+      const name = (prompt("Save reconstructed voice as:", "pca_voice.voice") || "").trim();
+      if (!name || !name.toLowerCase().endsWith(".voice")) return;
+      const form = new FormData();
+      form.append("file", blob, name);
+      try {
+        const r = await fetch("/v1/voices/upload", { method: "POST", body: form });
+        const j = await r.json().catch(() => ({}));
+        if (j.ok) { toast("Saved " + name, "ok"); load_voices(); }
+        else toast(j.error || "Save failed", "err");
+      } catch (e) { toast("Save failed: " + e.message, "err"); }
+    });
+
+    pca_render_axes();
+    pca_snap_render();
+    const snapAdd = document.getElementById("pca-snap-add");
+    if (snapAdd) snapAdd.addEventListener("click", pca_snap_add);
+    const mutBtn = document.getElementById("pca-mutate");
+    if (mutBtn) mutBtn.addEventListener("click", pca_mutate);
+    // Live value labels + track fill for the sculptor's sampling sliders.
+    [["pca-temp", "pca-temp-val", 2], ["pca-topp", "pca-topp-val", 2],
+     ["pca-pitch", "pca-pitch-val", 1], ["pca-speed", "pca-speed-val", 2],
+     ["pca-mutate-amt", "pca-mutate-val", 0, "pct"],
+     ["dsp-warmth", "dsp-warmth-val", 2], ["dsp-formant", "dsp-formant-val", 2],
+     ["dsp-brightness", "dsp-brightness-val", 2], ["dsp-airiness", "dsp-airiness-val", 2],
+     ["dsp-breathiness", "dsp-breathiness-val", 2],
+     ["prosody-contour-depth", "prosody-contour-depth-val", 1],
+     ["prosody-breath", "prosody-breath-val", 2]].forEach((spec) => {
+      const id = spec[0], vid = spec[1], dp = spec[2], kind = spec[3];
+      const el = document.getElementById(id), vEl = document.getElementById(vid);
+      if (!el || !vEl) return;
+      const upd = () => {
+        vEl.textContent = kind === "pct"
+          ? Math.round(parseFloat(el.value) * 100) + "%"
+          : parseFloat(el.value).toFixed(dp);
+        sync_slider_fill(el);
+      };
+      el.addEventListener("input", upd);
+      upd();
+    });
+
+    // Emotion matrix + profile export/import.
+    emo_init();
+    const exBtn = document.getElementById("pca-profile-export");
+    if (exBtn) exBtn.addEventListener("click", pca_profile_export);
+    const imBtn = document.getElementById("pca-profile-import");
+    const imFile = document.getElementById("pca-profile-file");
+    if (imBtn && imFile) {
+      imBtn.addEventListener("click", () => imFile.click());
+      imFile.addEventListener("change", () => {
+        if (imFile.files && imFile.files[0]) pca_profile_import(imFile.files[0]);
+        imFile.value = "";
+      });
+    }
+
+    pca_refresh();
+  }
+
   // ── Clips library ──────────────────────────────────────────────────
   function apply_clip_filter() {
     const q = ($("#clip-search").value || "").trim().toLowerCase();
@@ -1718,19 +2681,94 @@
       const el = document.createElement("div");
       el.className = "clip";
       const ts = c.mtime ? new Date(c.mtime * 1000).toLocaleString() : "";
+      const enc = encodeURIComponent(c.name);
+      const rating = c.rating || 0;
+      let starsHtml = '<div class="clip-stars" data-clip-stars="' + esc(c.name) + '">';
+      for (let s = 1; s <= 5; s++)
+        starsHtml += '<span class="star' + (s <= rating ? " on" : "") + '" data-rate="' + s + '">★</span>';
+      starsHtml += "</div>";
+      const scoreTag = (c.naturalness != null && c.naturalness >= 0)
+        ? '<span class="tag tag-score" title="VLM naturalness / intelligibility">🎯 N' + c.naturalness + ' · I' + (c.intelligibility != null ? c.intelligibility : "?") + '</span>'
+        : "";
+      const transcriptHtml = c.transcript
+        ? '<div class="clip-transcript" title="' + esc(c.transcript) + '">“' + esc((c.transcript || "").trim().slice(0, 70)) + '”</div>'
+        : "";
+      const cmpOn = COMPARE.indexOf(c.name) >= 0;
       el.innerHTML =
-        '<audio controls preload="metadata" src="/v1/clips/raw/' + encodeURIComponent(c.name) + '"></audio>' +
+        '<audio controls preload="metadata" src="/v1/clips/raw/' + enc + '"></audio>' +
         '<div class="clip-info">' +
           '<div class="clip-name" title="' + esc(c.name) + '">' + esc(c.name) + '</div>' +
           '<div class="clip-meta">' +
             (c.duration ? '<span class="tag">' + fmt_dur(c.duration) + '</span>' : '') +
             '<span class="tag">' + fmt_size(c.size) + '</span>' +
             (ts ? '<span class="tag">📅 ' + ts + '</span>' : '') +
+            scoreTag +
           '</div>' +
+          starsHtml +
+          transcriptHtml +
         '</div>' +
-        '<button class="btn btn-danger" data-del-clip="' + esc(c.name) + '">Delete</button>';
+        '<div class="clip-actions">' +
+          '<button class="btn btn-ghost" data-score-clip="' + esc(c.name) + '" title="VLM score">📊</button>' +
+          '<button class="btn btn-ghost' + (cmpOn ? " on" : "") + '" data-cmp-clip="' + esc(c.name) + '" title="Add to A/B compare">⇄</button>' +
+          '<button class="btn btn-danger" data-del-clip="' + esc(c.name) + '">Delete</button>' +
+        '</div>';
       list.appendChild(el);
     }
+
+    // Star rating.
+    $$("[data-clip-stars]").forEach((grp) => {
+      grp.querySelectorAll(".star").forEach((sp) => {
+        sp.addEventListener("click", async () => {
+          const name = grp.dataset.clipStars;
+          const rate = parseInt(sp.dataset.rate, 10);
+          try {
+            const r = await fetch("/v1/clips/rate", {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ name, rating: rate }),
+            });
+            const j = await r.json();
+            if (j.ok) {
+              grp.querySelectorAll(".star").forEach((s, i) => s.classList.toggle("on", i < rate));
+              const clip = CLIPS_CACHE.find((x) => x.name === name);
+              if (clip) clip.rating = rate;
+            } else toast(j.error || "Rating failed", "err");
+          } catch (_) { toast("Rating failed", "err"); }
+        });
+      });
+    });
+
+    // VLM score.
+    $$("[data-score-clip]").forEach((b) => b.addEventListener("click", async (e) => {
+      const name = e.currentTarget.dataset.scoreClip;
+      const btn = e.currentTarget;
+      btn.disabled = true; btn.textContent = "⏳";
+      try {
+        const r = await fetch("/v1/clips/score", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        const j = await r.json();
+        if (j.ok) {
+          toast("🎯 N" + j.naturalness + " · I" + j.intelligibility + " — " + name, "ok");
+          load_clips();
+        } else toast(j.error || (j.detail || "Score failed"), "err");
+      } catch (_) { toast("Score failed", "err"); }
+      btn.disabled = false; btn.textContent = "📊";
+    }));
+
+    // A/B compare toggle (max 2).
+    $$("[data-cmp-clip]").forEach((b) => b.addEventListener("click", (e) => {
+      const name = e.currentTarget.dataset.cmpClip;
+      const idx = COMPARE.indexOf(name);
+      if (idx >= 0) { COMPARE.splice(idx, 1); }
+      else {
+        if (COMPARE.length >= 2) COMPARE.shift();
+        COMPARE.push(name);
+      }
+      render_clips(CLIPS_CACHE.filter((c) => clip_matches(c, $("#clip-search").value)));
+      render_compare();
+    }));
+
     $$("[data-del-clip]").forEach((b) => b.addEventListener("click", async (e) => {
       const name = e.target.dataset.delClip;
       if (!confirm('Delete "' + name + '"?')) return;
@@ -1745,6 +2783,38 @@
         else      { toast(j.error || "Delete failed", "err"); }
       } catch (_) { toast("Delete failed", "err"); }
     }));
+  }
+
+  // A/B compare tray: play two clips back-to-back to pick the winner.
+  let COMPARE = [];
+  function render_compare() {
+    const host = $("#clips-compare");
+    if (!host) return;
+    if (!COMPARE.length) { host.innerHTML = ""; return; }
+    let html = '<div class="compare-card"><div class="compare-head"><b>A/B compare</b>' +
+               '<button class="btn btn-ghost" id="cmp-clear">Clear</button></div>';
+    COMPARE.forEach((name, i) => {
+      html += '<div class="compare-row"><span class="compare-label">' + esc(i === 0 ? "A" : "B") + "</span>" +
+              '<span class="compare-name">' + esc(name) + "</span>" +
+              '<audio controls src="/v1/clips/raw/' + encodeURIComponent(name) + '"></audio></div>';
+    });
+    if (COMPARE.length === 2) {
+      html += '<p class="hint">Play A then B. Star-rate each above to lock in the winner.</p>';
+    } else {
+      html += '<p class="hint">Add one more clip (⇄) to compare.</p>';
+    }
+    html += "</div>";
+    host.innerHTML = html;
+    const clr = $("#cmp-clear");
+    if (clr) clr.addEventListener("click", () => {
+      COMPARE = [];
+      render_clips(CLIPS_CACHE.filter((c) => clip_matches(c, $("#clip-search").value)));
+      render_compare();
+    });
+  }
+  function clip_matches(c, q) {
+    q = (q || "").trim().toLowerCase();
+    return !q || (c.name || "").toLowerCase().indexOf(q) >= 0;
   }
 
   async function load_clips() {
@@ -2038,7 +3108,10 @@
 
   // ── Init ───────────────────────────────────────────────────────────
   sync_all_sliders();
-  Promise.all([load_models()]).then(() => {
-    // Optional: load voices + clips lazily on tab open
+  Promise.all([load_models()]).then(async () => {
+    // The cockpit polygon is the hero of the landing tab — load the voice
+    // library and run PCA immediately so it's live on arrival, not buried.
+    try { await load_voices(); } catch (e) {}
+    auto_pca_analyze();
   });
 })();
