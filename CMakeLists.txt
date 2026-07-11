@@ -169,6 +169,7 @@ add_library(audiocore_framework STATIC
     # same routing code path.
     src/server/server.cpp
     src/server/acestep_proxy.cpp
+    src/server/qwen3tts_proxy.cpp
 )
 if(ENGINE_ENABLE_MP3)
     target_sources(audiocore_framework PRIVATE src/framework/io/mp3_encoder.cpp)

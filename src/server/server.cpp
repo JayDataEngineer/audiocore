@@ -21,6 +21,7 @@
 #include "audiocore/framework/audio/dsp.h"   // pitch_shift, change_speed
 #include "audiocore/models/ace_step/family.h"    // MusicRequest / MusicResponse
 #include "audiocore/server/acestep_proxy.h"     // reference ace-server proxy
+#include "audiocore/server/qwen3tts_proxy.h"    // reference qwen_tts-server proxy
 #ifdef AUDIOCORE_ENABLE_MP3
 #include "audiocore/framework/io/mp3_encoder.h"
 #endif
@@ -363,15 +364,19 @@ std::shared_ptr<httplib::Server> build_server(
         const std::string& clips_dir,
         std::shared_ptr<ModelRegistry> registry,
         const std::string& weights_dir,
-        std::shared_ptr<std::unordered_map<std::string, AceStepProxyConfig>> acestep_proxies) {
+        std::shared_ptr<std::unordered_map<std::string, AceStepProxyConfig>> acestep_proxies,
+        std::shared_ptr<std::unordered_map<std::string, Qwen3TtsProxyConfig>> qwen3tts_proxies) {
     auto svr = std::make_shared<httplib::Server>();
     auto slots_ref = slots;
     auto registry_raw = registry.get();
     auto proxies_ref = acestep_proxies ?
         acestep_proxies :
         std::make_shared<std::unordered_map<std::string, AceStepProxyConfig>>();
+    auto q3_proxies_ref = qwen3tts_proxies ?
+        qwen3tts_proxies :
+        std::make_shared<std::unordered_map<std::string, Qwen3TtsProxyConfig>>();
 
-    svr->Get("/health", [slots_ref, proxies_ref](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/health", [slots_ref, proxies_ref, q3_proxies_ref](const httplib::Request&, httplib::Response& res) {
         // Lightweight liveness + readiness probe. Counts are O(n_slots)
         // and lock-free (we only read booleans, no session deref), so this
         // is cheap enough for a k8s-style probe hitting it every few seconds.
@@ -380,10 +385,11 @@ std::shared_ptr<httplib::Server> build_server(
             ++total;
             if (slot->loaded) ++loaded;
         }
-        // Proxy models are always "loaded" (served by the external ace-server).
+        // Proxy models are always "loaded" (served by the external servers).
         int proxy_count = static_cast<int>(proxies_ref->size());
-        total  += proxy_count;
-        loaded += proxy_count;
+        int q3_proxy_count = static_cast<int>(q3_proxies_ref->size());
+        total  += proxy_count + q3_proxy_count;
+        loaded += proxy_count + q3_proxy_count;
         auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::steady_clock::now() - kServerStart)
                             .count();
@@ -398,13 +404,13 @@ std::shared_ptr<httplib::Server> build_server(
             {"uptime_s", static_cast<int64_t>(uptime_s)},
             {"models_total", total},
             {"models_loaded", loaded},
-            {"proxy_models", proxy_count},
+            {"proxy_models", proxy_count + q3_proxy_count},
             {"webapp", kHasWebapp},
         };
         res.set_content(j.dump(), "application/json");
     });
 
-    svr->Get("/v1/models", [slots_ref, proxies_ref](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/v1/models", [slots_ref, proxies_ref, q3_proxies_ref](const httplib::Request&, httplib::Response& res) {
         json arr = json::array();
         for (const auto& [id, slot] : *slots_ref) {
             std::lock_guard<std::mutex> g(slot->mtx);
@@ -415,7 +421,7 @@ std::shared_ptr<httplib::Server> build_server(
                 {"loaded", slot->loaded},
             });
         }
-        // Proxy models are served by the reference ace-server, not loaded
+        // Proxy models are served by the reference servers, not loaded
         // locally. Surface them so the webapp can select them for generation.
         for (const auto& [id, cfg] : *proxies_ref) {
             arr.push_back({
@@ -423,6 +429,14 @@ std::shared_ptr<httplib::Server> build_server(
                 {"family", "ace_step"},
                 {"loaded", true},
                 {"backend", "acestep_proxy"},
+            });
+        }
+        for (const auto& [id, cfg] : *q3_proxies_ref) {
+            arr.push_back({
+                {"id", id},
+                {"family", "qwen3_tts"},
+                {"loaded", true},
+                {"backend", "qwen3tts_proxy"},
             });
         }
         res.set_content(json{{"object", "list"}, {"data", arr}}.dump(),
@@ -563,7 +577,82 @@ std::shared_ptr<httplib::Server> build_server(
     });
 
     svr->Post("/v1/audio/speech",
-              [slots_ref, clips_dir](const httplib::Request& req, httplib::Response& res) {
+              [slots_ref, clips_dir, q3_proxies_ref](const httplib::Request& req, httplib::Response& res) {
+        // ── Qwen3-TTS proxy short-circuit ───────────────────────────────
+        // Models with backend="qwen3tts_proxy" are served by the external
+        // reference qwen_tts-server (VLM-verified clean audio). Parse the
+        // body early and forward the request instead of resolving a local
+        // slot — the proxy server does all the heavy lifting.
+        {
+            json body_peek;
+            bool body_ok = true;
+            try { body_peek = json::parse(req.body); }
+            catch (...) { body_ok = false; }
+            if (body_ok) {
+                const std::string model_id = body_peek.value("model", "");
+                auto qit = q3_proxies_ref->find(model_id);
+                if (qit != q3_proxies_ref->end()) {
+                    fprintf(stderr, "[speech] proxying '%s' → qwen_tts-server (%s)\n",
+                            model_id.c_str(), qit->second.server_url.c_str());
+
+                    TtsRequest tr;
+                    tr.text         = body_peek.value("input", "");
+                    tr.language     = body_peek.value("language", "");
+                    tr.voice_path   = body_peek.value("voice", "");
+                    tr.instruct     = body_peek.value("instruct", "");
+                    tr.speaker_name = body_peek.value("speaker", "");
+                    tr.speed        = body_peek.value("speed", 1.0f);
+                    if (body_peek.contains("seed"))
+                        tr.seed = body_peek["seed"].get<int32_t>();
+                    if (body_peek.contains("temperature"))
+                        tr.temperature = body_peek["temperature"].get<float>();
+                    if (body_peek.contains("top_p"))
+                        tr.top_p = body_peek["top_p"].get<float>();
+                    if (body_peek.contains("max_new_tokens"))
+                        tr.max_new_tokens = body_peek["max_new_tokens"].get<int32_t>();
+                    if (body_peek.contains("max_tokens"))
+                        tr.max_new_tokens = body_peek["max_tokens"].get<int32_t>();
+                    if (body_peek.contains("messages") && body_peek["messages"].is_array()) {
+                        for (const auto& m : body_peek["messages"]) {
+                            ChatMessage cm;
+                            cm.role    = m.value("role", "");
+                            cm.content = m.value("content", "");
+                            if (!cm.role.empty() && !cm.content.empty())
+                                tr.messages.push_back(std::move(cm));
+                        }
+                    }
+
+                    std::string error;
+                    auto wav = audiocore::qwen3tts_proxy_generate(qit->second, tr, &error);
+                    if (wav.empty()) {
+                        res.status = 502;
+                        json e = {{"error", "qwen_tts-server proxy failed"}, {"detail", error}};
+                        res.set_content(e.dump(), "application/json");
+                        return;
+                    }
+
+                    // Optional: save the clip to the library when the
+                    // caller asks (mirrors the local-slot path).
+                    bool save = body_peek.value("save", false);
+                    if (save && !clips_dir.empty()) {
+                        std::string fname = iso_timestamp_for_filename() + "_" +
+                                            model_id + ".wav";
+                        std::string fpath = clips_dir + "/" + fname;
+                        std::ofstream f(fpath, std::ios::binary);
+                        if (f.is_open()) {
+                            f.write(reinterpret_cast<const char*>(wav.data()), wav.size());
+                            res.set_header("X-Audiocore-Clip", fname);
+                            fprintf(stderr, "[speech] saved clip: %s\n", fpath.c_str());
+                        }
+                    }
+
+                    res.set_content(reinterpret_cast<const char*>(wav.data()),
+                                    wav.size(), "audio/wav");
+                    return;
+                }
+            }
+        }
+
         auto sg = resolve_slot(req, *slots_ref, res);
         if (!sg) return;
         const auto& body = sg->body;

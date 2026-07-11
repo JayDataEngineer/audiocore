@@ -25,6 +25,7 @@
 #include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/server/server.h"
 #include "audiocore/server/acestep_proxy.h"
+#include "audiocore/server/qwen3tts_proxy.h"
 
 namespace {
 
@@ -73,6 +74,16 @@ struct ServerConfig {
     };
     bool has_proxy = false;
     AceProxyCfg proxy;
+    // Reference qwen_tts server subprocess configuration.
+    struct Qwen3TtsProxyCfg {
+        std::string server_url = "http://localhost:8086";
+        std::string binary;      // path to qwen_tts executable
+        std::string model_dir;   // model directory for qwen_tts (-d)
+        std::string library_dir; // LD_LIBRARY_PATH for qwen_tts
+        std::vector<std::string> extra_args;
+    };
+    bool has_qwen3tts_proxy = false;
+    Qwen3TtsProxyCfg qwen3tts_proxy;
     // Lazy mode: register every model but load NONE at startup. Models are
     // materialised on first /v1/models/load request from the webapp. Keeps
     // VRAM free on small boxes and lets the server boot past a broken file.
@@ -135,6 +146,19 @@ bool load_config(const std::string& path, ServerConfig& out) {
         if (p.contains("extra_args") && p["extra_args"].is_array()) {
             for (const auto& a : p["extra_args"])
                 out.proxy.extra_args.push_back(a.get<std::string>());
+        }
+    }
+    // Parse qwen3tts_proxy config (reference qwen_tts subprocess).
+    if (j.contains("qwen3tts_proxy") && j["qwen3tts_proxy"].is_object()) {
+        const auto& p = j["qwen3tts_proxy"];
+        out.has_qwen3tts_proxy = true;
+        out.qwen3tts_proxy.server_url  = p.value("server_url", out.qwen3tts_proxy.server_url);
+        out.qwen3tts_proxy.binary      = p.value("binary", "");
+        out.qwen3tts_proxy.model_dir   = p.value("model_dir", "");
+        out.qwen3tts_proxy.library_dir = p.value("library_dir", "");
+        if (p.contains("extra_args") && p["extra_args"].is_array()) {
+            for (const auto& a : p["extra_args"])
+                out.qwen3tts_proxy.extra_args.push_back(a.get<std::string>());
         }
     }
     return true;
@@ -266,6 +290,8 @@ int main(int argc, char** argv) {
         std::unordered_map<std::string, std::shared_ptr<ModelSlot>>>();
     auto proxies = std::make_shared<
         std::unordered_map<std::string, audiocore::AceStepProxyConfig>>();
+    auto qwen3_proxies = std::make_shared<
+        std::unordered_map<std::string, audiocore::Qwen3TtsProxyConfig>>();
     // --lazy / "lazy_models": defer ALL models (load on demand from webapp).
     const bool lazy_mode = cfg.lazy_models || lazy_flag;
 
@@ -291,6 +317,20 @@ int main(int argc, char** argv) {
                 m.id.c_str(), pc.ace_server_url.c_str(),
                 pc.dit_variant.empty() ? "auto" : pc.dit_variant.c_str(),
                 pc.vae_override.empty() ? "default" : pc.vae_override.c_str());
+            continue;
+        }
+        if (m.backend == "qwen3tts_proxy") {
+            audiocore::Qwen3TtsProxyConfig pc;
+            pc.server_url = cfg.has_qwen3tts_proxy
+                ? cfg.qwen3tts_proxy.server_url
+                : "http://localhost:8086";
+            pc.model_dir  = cfg.has_qwen3tts_proxy
+                ? cfg.qwen3tts_proxy.model_dir
+                : m.path;
+            (*qwen3_proxies)[m.id] = pc;
+            std::fprintf(stderr,
+                "audiocore_server: proxy '%s' → qwen_tts-server (%s)\n",
+                m.id.c_str(), pc.server_url.c_str());
             continue;
         }
         audiocore::ModelLoadRequest req;
@@ -467,9 +507,119 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ── Start the reference qwen_tts subprocess (if configured) ──────────
+    // The proxy routes /v1/audio/speech for backend="qwen3tts_proxy" models to
+    // this external process. We fork/exec it with the model dir, then block
+    // until /v1/health responds.
+    pid_t qwen3tts_server_pid = -1;
+    if (cfg.has_qwen3tts_proxy && !cfg.qwen3tts_proxy.binary.empty()) {
+        std::fprintf(stderr,
+            "audiocore_server: starting qwen_tts-server subprocess\n"
+            "  binary     : %s\n"
+            "  model_dir  : %s\n"
+            "  server_url : %s\n",
+            cfg.qwen3tts_proxy.binary.c_str(),
+            cfg.qwen3tts_proxy.model_dir.c_str(),
+            cfg.qwen3tts_proxy.server_url.c_str());
+
+        qwen3tts_server_pid = fork();
+        if (qwen3tts_server_pid < 0) {
+            std::perror("fork");
+            return 1;
+        }
+        if (qwen3tts_server_pid == 0) {
+            // ── Child process ──
+            if (!cfg.qwen3tts_proxy.library_dir.empty()) {
+                const char* old = std::getenv("LD_LIBRARY_PATH");
+                std::string lp = cfg.qwen3tts_proxy.library_dir;
+                if (old && *old) lp += std::string(":") + old;
+                setenv("LD_LIBRARY_PATH", lp.c_str(), 1);
+            }
+            // Parse the port out of server_url to pass via --serve.
+            std::string port_str;
+            {
+                std::string u = cfg.qwen3tts_proxy.server_url;
+                auto colon = u.rfind(':');
+                if (colon != std::string::npos) {
+                    std::string tail = u.substr(colon + 1);
+                    auto slash = tail.find('/');
+                    port_str = slash == std::string::npos ? tail : tail.substr(0, slash);
+                }
+            }
+
+            std::vector<std::string> argv_str;
+            argv_str.push_back(cfg.qwen3tts_proxy.binary);
+            if (!cfg.qwen3tts_proxy.model_dir.empty()) {
+                argv_str.push_back("-d");
+                argv_str.push_back(cfg.qwen3tts_proxy.model_dir);
+            }
+            if (!port_str.empty()) {
+                argv_str.push_back("--serve");
+                argv_str.push_back(port_str);
+            }
+            for (const auto& a : cfg.qwen3tts_proxy.extra_args)
+                argv_str.push_back(a);
+
+            std::vector<char*> argv_c;
+            argv_c.reserve(argv_str.size() + 1);
+            for (auto& s : argv_str) argv_c.push_back(&s[0]);
+            argv_c.push_back(nullptr);
+
+            execv(cfg.qwen3tts_proxy.binary.c_str(), argv_c.data());
+            std::perror("execv(qwen_tts)");
+            std::_Exit(127);
+        }
+
+        // ── Parent: wait for qwen_tts /v1/health ──
+        audiocore::Qwen3TtsProxyConfig hc;
+        hc.server_url = cfg.qwen3tts_proxy.server_url;
+        hc.timeout_seconds = 120;
+        bool healthy = false;
+        for (int attempt = 0; attempt < 240; ++attempt) {
+            int status = 0;
+            pid_t w = waitpid(qwen3tts_server_pid, &status, WNOHANG);
+            if (w == qwen3tts_server_pid || (w == -1 && errno != EINTR)) {
+                std::fprintf(stderr,
+                    "audiocore_server: qwen_tts-server process exited (status=%d) — "
+                    "check model paths\n", status);
+                qwen3tts_server_pid = -1;
+                break;
+            }
+            if (audiocore::qwen3tts_proxy_health(hc)) {
+                healthy = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (healthy) {
+            std::fprintf(stderr,
+                "audiocore_server: qwen_tts-server healthy (pid=%d)\n",
+                qwen3tts_server_pid);
+        } else if (qwen3tts_server_pid > 0) {
+            std::fprintf(stderr,
+                "audiocore_server: WARNING — qwen_tts-server did not become healthy "
+                "within 120s; proxy requests will fail until it starts.\n");
+        }
+    } else if (!qwen3_proxies->empty()) {
+        audiocore::Qwen3TtsProxyConfig hc;
+        hc.server_url = cfg.has_qwen3tts_proxy ? cfg.qwen3tts_proxy.server_url : "http://localhost:8086";
+        if (audiocore::qwen3tts_proxy_health(hc)) {
+            std::fprintf(stderr,
+                "audiocore_server: qwen_tts-server already running at %s\n",
+                hc.server_url.c_str());
+        } else {
+            std::fprintf(stderr,
+                "audiocore_server: WARNING — %zu qwen3tts proxy model(s) configured "
+                "but qwen_tts-server is not reachable at %s. Start it manually or "
+                "add a \"qwen3tts_proxy.binary\" to the config.\n",
+                qwen3_proxies->size(), hc.server_url.c_str());
+        }
+    }
+
     // Pass registry + model dir so the webapp can load/unload models at runtime.
     // cfg.model_dir is the discovery scan root (may be empty in single-model mode).
-    auto svr = audiocore::build_server(slots, cfg.clips_dir, registry, cfg.model_dir, proxies);
+    auto svr = audiocore::build_server(slots, cfg.clips_dir, registry, cfg.model_dir,
+                                       proxies, qwen3_proxies);
 
     // Logger: skip per-byte noise from static-asset GETs (the browser fetches
     // /, /style.css, /app.js on every page load) and from /health probes

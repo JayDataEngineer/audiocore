@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# pre-commit hook — Qwen3-TTS proxy e2e regression gate.
+#
+# WHY: our Qwen3-TTS through our llama.cpp fork once produced corrupted,
+# machine-gun-stuttering audio (VLM FAIL) and it slipped through because
+# there was no end-to-end gate. This hook runs the proxy e2e test (which
+# generates a clip through the full HTTP chain and verifies it with the
+# mandatory audio VLM) before ANY commit that touches the TTS code path.
+#
+# It is INTENTIONALLY slow (60–180s on CPU). The user explicitly accepted
+# this: "It will be extremely slow, but, damnit, I never want this to
+# happen again."
+#
+# Install with:    scripts/install-git-hooks.sh
+# Bypass (emergency, NOT recommended):   git commit --no-verify
+#
+# The test only runs when files on the TTS/proxy path change — doc-only
+# commits skip the gate so day-to-day work isn't blocked. Override:
+#   AUDIOCORE_REGRESSION=0   skip even on relevant changes (NOT recommended)
+#   AUDIOCORE_REGRESSION=1   force the gate even with no relevant changes
+#
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+TEST="$ROOT/tests/test_qwen3tts_proxy_e2e.py"
+
+# ── Decide whether to run ────────────────────────────────────────────────
+# Files that, if changed, MUST gate on the regression test. Anything that
+# could break the TTS output path: the proxy translation layer, the server
+# routing, the Qwen3-TTS session/runner, the build graph for those objects,
+# the server config, or the test/hook itself.
+PATTERNS=(
+    'src/server/qwen3tts_proxy\.cpp'
+    'src/server/qwen3tts_proxy\.h'
+    'include/audiocore/server/qwen3tts_proxy\.h'
+    'src/server/server\.cpp'
+    'src/server/main\.cpp'
+    'include/audiocore/server/server\.h'
+    'src/models/qwen3_tts/'
+    'src/framework/models/qwen3/'
+    'CMakeLists\.txt'
+    'build/server\.json'
+    'tests/test_qwen3tts_proxy_e2e\.py'
+    'tools/audio_vlm\.py'
+    'scripts/hooks/pre-commit'
+)
+
+# Gather staged (about-to-be-committed) file list.
+staged=$(git diff --cached --name-only --diff-filter=ACMR || true)
+
+force=${AUDIOCORE_REGRESSION:-auto}
+relevant=0
+if [[ "$force" == "1" ]]; then
+    relevant=1
+else
+    for pat in "${PATTERNS[@]}"; do
+        if echo "$staged" | grep -qE "$pat"; then
+            relevant=1
+            break
+        fi
+    done
+fi
+
+if [[ "$relevant" -eq 0 ]]; then
+    # No TTS-path files in this commit — fast skip.
+    exit 0
+fi
+
+if [[ "${AUDIOCORE_REGRESSION:-auto}" == "0" ]]; then
+    echo "[pre-commit] ⚠  AUDIOCORE_REGRESSION=0 — skipping TTS regression gate"
+    exit 0
+fi
+
+echo "[pre-commit] TTS-path files staged — running Qwen3-TTS proxy regression test"
+echo "[pre-commit]   (this is slow: ~60-180s on CPU; bypass with --no-verify)"
+
+# ── Run the test ─────────────────────────────────────────────────────────
+# The test skips (exit 2) if the server isn't running. We treat a skip as
+# a soft warning — the user may be committing from a machine where starting
+# the server isn't practical (no model weights, no CPU headroom). But we
+# LOUDLY nag so this path isn't silently taken.
+python3 "$TEST"
+status=$?
+
+case $status in
+    0)
+        echo "[pre-commit] ✅  TTS regression PASSED"
+        exit 0
+        ;;
+    2)
+        cat >&2 <<'MSG'
+[pre-commit] ⚠  TTS regression SKIPPED — audiocore_server not reachable.
+[pre-commit]    Start it (cd build && ./audiocore_server --config server.json)
+[pre-commit]    and re-commit to exercise the gate. Bypass for now with
+[pre-commit]    --no-verify, but DO NOT let this become routine.
+MSG
+        # Block by default — the user wanted this FORCED. If the server
+        # isn't up, that's exactly when a regression would slip in.
+        exit 1
+        ;;
+    *)
+        cat >&2 <<'MSG'
+[pre-commit] ❌  TTS regression FAILED — commit aborted.
+[pre-commit]     The proxy output is corrupted (VLM FAIL, non-WAV, or too short).
+[pre-commit]     Fix the regression before committing. Emergency bypass:
+[pre-commit]         git commit --no-verify
+MSG
+        exit 1
+        ;;
+esac
