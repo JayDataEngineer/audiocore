@@ -73,6 +73,10 @@ struct ServerConfig {
     };
     bool has_proxy = false;
     AceProxyCfg proxy;
+    // Lazy mode: register every model but load NONE at startup. Models are
+    // materialised on first /v1/models/load request from the webapp. Keeps
+    // VRAM free on small boxes and lets the server boot past a broken file.
+    bool lazy_models = false;
 };
 
 bool load_config(const std::string& path, ServerConfig& out) {
@@ -93,6 +97,7 @@ bool load_config(const std::string& path, ServerConfig& out) {
     out.threads= j.value("threads", out.threads);
     out.model_dir = j.value("model_dir", "");
     out.clips_dir = j.value("clips_dir", "");
+    out.lazy_models = j.value("lazy_models", false);
     if (j.contains("models")) {
         if (!j["models"].is_array()) {
             std::fprintf(stderr, "config 'models' must be an array\n");
@@ -143,6 +148,7 @@ int main(int argc, char** argv) {
     std::string model_override;
     std::string family_override;
     std::string alias_override;
+    bool lazy_flag = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--config" && i + 1 < argc)        config_path        = argv[++i];
@@ -150,11 +156,12 @@ int main(int argc, char** argv) {
         else if (a == "--model" && i + 1 < argc)     model_override     = argv[++i];
         else if (a == "--family" && i + 1 < argc)    family_override    = argv[++i];
         else if (a == "--alias" && i + 1 < argc)     alias_override     = argv[++i];
+        else if (a == "--lazy")                      lazy_flag          = true;
     }
     if (config_path.empty()) {
         std::fprintf(stderr,
             "usage: %s --config server.json [--model /path] [--family name] "
-            "[--model-dir /path] [--alias name]\n",
+            "[--model-dir /path] [--alias name] [--lazy]\n",
             argv[0]);
         return 1;
     }
@@ -259,6 +266,9 @@ int main(int argc, char** argv) {
         std::unordered_map<std::string, std::shared_ptr<ModelSlot>>>();
     auto proxies = std::make_shared<
         std::unordered_map<std::string, audiocore::AceStepProxyConfig>>();
+    // --lazy / "lazy_models": defer ALL models (load on demand from webapp).
+    const bool lazy_mode = cfg.lazy_models || lazy_flag;
+
     // Track which families already have an eagerly-loaded representative.
     std::set<std::string> eager_families;
 
@@ -296,7 +306,9 @@ int main(int argc, char** argv) {
         req.options["device"] = std::to_string(cfg.device);
 
         // First model of each family is eager; the rest wait for webapp load.
-        const bool defer = !eager_families.insert(m.family).second;
+        // In lazy mode ALL models defer — nothing touches VRAM until the
+        // webapp requests a model via /v1/models/load.
+        const bool defer = lazy_mode || !eager_families.insert(m.family).second;
 
         auto slot = std::make_shared<ModelSlot>();
         slot->load_req = req;
@@ -310,12 +322,21 @@ int main(int argc, char** argv) {
                     {VoiceTaskKind::Tts}, {});
                 slot->loaded = true;
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "load failed for '%s': %s\n",
-                             m.id.c_str(), e.what());
-                return 1;
+                // Non-fatal: a corrupt/partial GGUF must NOT take the server
+                // down. Register the slot as load-on-demand so the webapp can
+                // surface the error per-model and everything else still works.
+                std::fprintf(stderr,
+                    "audiocore_server: WARNING load failed for '%s': %s "
+                    "(registered load-on-demand; booting anyway)\n",
+                    m.id.c_str(), e.what());
             }
-            std::fprintf(stderr, "audiocore_server: loaded '%s' (%s)\n",
-                         m.id.c_str(), m.family.c_str());
+            if (slot->loaded)
+                std::fprintf(stderr, "audiocore_server: loaded '%s' (%s)\n",
+                             m.id.c_str(), m.family.c_str());
+            else
+                std::fprintf(stderr,
+                    "audiocore_server: registered '%s' (%s) [load on demand]\n",
+                    m.id.c_str(), m.family.c_str());
         } else {
             std::fprintf(stderr,
                 "audiocore_server: registered '%s' (%s) [load on demand]\n",

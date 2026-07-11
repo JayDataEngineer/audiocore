@@ -323,6 +323,24 @@ json clip_info(const fs::directory_entry& entry) {
     c["mtime"] = mtime_s;
     float dur = wav_duration_seconds(entry.path());
     if (dur > 0) c["duration"] = dur;
+    // Rating / VLM-score sidecar: <clipname>.json (written by the webapp's
+    // star-rating and "Score" features). Surface the fields the UI shows.
+    try {
+        fs::path sidecar = entry.path();
+        sidecar += ".json";
+        if (fs::is_regular_file(sidecar)) {
+            std::ifstream sf(sidecar);
+            if (sf) {
+                std::string mt((std::istreambuf_iterator<char>(sf)),
+                               std::istreambuf_iterator<char>());
+                auto m = json::parse(mt, nullptr, false);
+                if (m.contains("rating"))          c["rating"]          = m["rating"];
+                if (m.contains("naturalness"))     c["naturalness"]     = m["naturalness"];
+                if (m.contains("intelligibility")) c["intelligibility"] = m["intelligibility"];
+                if (m.contains("transcript"))      c["transcript"]      = m["transcript"];
+            }
+        }
+    } catch (...) {}
     return c;
 }
 
@@ -657,6 +675,49 @@ std::shared_ptr<httplib::Server> build_server(
                     static_cast<double>(speed_mult),
                     tresp.sampling_rate);
                 tresp.pcm_mono = std::move(sped);
+            }
+        }
+
+        // ── Voice-enhance + prosody DSP chain ───────────────────────────
+        // Optional, all default-off. Each axis is independent; the chain runs
+        // voice_enhance (biquad EQ + breathiness) → pitch_contour → breath
+        // insertion. All are pure signal processing on the final PCM.
+        if (!tresp.pcm_mono.empty()) {
+            audiocore::VoiceEnhanceParams ve;
+            if (body.contains("dsp_warmth"))      ve.warmth      = body["dsp_warmth"].get<float>();
+            if (body.contains("dsp_formant"))     ve.formant     = body["dsp_formant"].get<float>();
+            if (body.contains("dsp_brightness"))  ve.brightness  = body["dsp_brightness"].get<float>();
+            if (body.contains("dsp_airiness"))    ve.airiness    = body["dsp_airiness"].get<float>();
+            if (body.contains("dsp_breathiness")) ve.breathiness = body["dsp_breathiness"].get<float>();
+            const bool any_enh = std::fabs(ve.warmth) > 0.001f ||
+                                 std::fabs(ve.formant) > 0.001f ||
+                                 std::fabs(ve.brightness) > 0.001f ||
+                                 std::fabs(ve.airiness) > 0.001f ||
+                                 ve.breathiness > 0.001f;
+            if (any_enh) {
+                auto e = audiocore::voice_enhance(
+                    tresp.pcm_mono.data(), tresp.pcm_mono.size(),
+                    tresp.sampling_rate, ve);
+                tresp.pcm_mono = std::move(e);
+            }
+
+            // Pitch contour (prosody): shape + depth in semitones.
+            std::string contour_shape = body.value("prosody_contour", "flat");
+            float contour_depth = body.value("prosody_contour_depth", 0.0f);
+            if (contour_shape != "flat" && contour_depth > 0.05f) {
+                auto c = audiocore::pitch_contour(
+                    tresp.pcm_mono.data(), tresp.pcm_mono.size(),
+                    tresp.sampling_rate, contour_shape, contour_depth);
+                tresp.pcm_mono = std::move(c);
+            }
+
+            // Breath insertion (prosody): intensity 0..1.
+            float breath = body.value("prosody_breath", 0.0f);
+            if (breath > 0.01f) {
+                auto b = audiocore::insert_breaths(
+                    tresp.pcm_mono.data(), tresp.pcm_mono.size(),
+                    tresp.sampling_rate, breath);
+                tresp.pcm_mono = std::move(b);
             }
         }
 
@@ -1220,6 +1281,174 @@ std::shared_ptr<httplib::Server> build_server(
                 resp["ok"] = false;
                 resp["error"] = "not found";
             }
+            res.set_content(resp.dump(), "application/json");
+        });
+
+        // POST /v1/clips/rate — set a 0..5 star rating on a clip. The rating
+        // is persisted to a `<clipname>.json` sidecar (merged with any VLM
+        // score fields) and surfaced by clip_info() on subsequent listings.
+        svr->Post("/v1/clips/rate",
+                  [clips_dir](const httplib::Request& req, httplib::Response& res) {
+            json resp;
+            json body;
+            try { body = json::parse(req.body); }
+            catch (...) {
+                res.status = 400;
+                resp["error"] = "invalid json";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            std::string name = body.value("name", "");
+            int rating = body.value("rating", -1);
+            if (name.empty() || name.find("..") != std::string::npos ||
+                name.find('/') != std::string::npos ||
+                rating < 0 || rating > 5) {
+                res.status = 400;
+                resp["error"] = "requires name + rating (0..5)";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            fs::path target = fs::path(clips_dir) / name;
+            if (!fs::is_regular_file(target)) {
+                res.status = 404;
+                resp["error"] = "clip not found";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            // Merge into the existing sidecar (preserve score fields).
+            fs::path sidecar = target; sidecar += ".json";
+            json meta = json::object();
+            {
+                std::ifstream sf(sidecar);
+                if (sf) {
+                    std::string mt((std::istreambuf_iterator<char>(sf)),
+                                   std::istreambuf_iterator<char>());
+                    try { meta = json::parse(mt, nullptr, false); } catch (...) {}
+                }
+            }
+            meta["rating"] = rating;
+            std::ofstream of(sidecar);
+            of << meta.dump(2);
+            resp["ok"] = true;
+            resp["rating"] = rating;
+            res.set_content(resp.dump(), "application/json");
+        });
+
+        // POST /v1/clips/score — run the cloud VLM (tools/audio_vlm.py) to
+        // transcribe the clip and rate NATURALNESS + INTELLIGIBILITY 1..10.
+        // Results are cached into the `<clipname>.json` sidecar so the Clips
+        // tab can rank by quality without re-running the (paid) model.
+        svr->Post("/v1/clips/score",
+                  [clips_dir](const httplib::Request& req, httplib::Response& res) {
+            json resp;
+            json body;
+            try { body = json::parse(req.body); }
+            catch (...) {
+                res.status = 400;
+                resp["error"] = "invalid json";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            std::string name = body.value("name", "");
+            if (name.empty() || name.find("..") != std::string::npos ||
+                name.find('/') != std::string::npos) {
+                res.status = 400;
+                resp["error"] = "invalid name";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            fs::path target = fs::path(clips_dir) / name;
+            if (!fs::is_regular_file(target)) {
+                res.status = 404;
+                resp["error"] = "clip not found";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            // Locate tools/audio_vlm.py by walking up from clips_dir.
+            std::string script_path;
+            for (fs::path p = fs::path(clips_dir); !p.empty(); p = p.parent_path()) {
+                auto cand = p / "tools" / "audio_vlm.py";
+                if (fs::exists(cand)) { script_path = cand.string(); break; }
+            }
+            if (script_path.empty()) {
+                res.status = 500;
+                resp["error"] = "tools/audio_vlm.py not found in project tree";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            // Fixed scoring prompt (no user interpolation → no shell-injection
+            // surface). Deliberately free of apostrophes so single-quoting is
+            // safe across shells.
+            const std::string prompt =
+                "Transcribe the spoken text exactly. Then rate NATURALNESS and "
+                "INTELLIGIBILITY each on a 1 to 10 scale. End with two lines "
+                "exactly: NATURALNESS: N/10 and INTELLIGIBILITY: N/10";
+            std::ostringstream cmd;
+            cmd << "python3 '" << script_path << "' '" << target.string() << "'"
+                << " --describe --json --max-tokens 512"
+                << " -p '" << prompt << "'";
+            FILE* pipe = popen(cmd.str().c_str(), "r");
+            if (!pipe) {
+                res.status = 500;
+                resp["error"] = "failed to start python3";
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            std::string output;
+            { char buf[4096];
+              while (fgets(buf, sizeof(buf), pipe)) output += buf; }
+            int rc = pclose(pipe);
+
+            // audio_vlm.py --json exits 0 on success and prints a JSON dict.
+            json vlm;
+            try { vlm = json::parse(output, nullptr, false); }
+            catch (...) { vlm = json::object(); }
+            if (rc != 0 || !vlm.value("success", false)) {
+                res.status = 502;
+                resp["error"] = "VLM scoring failed";
+                resp["detail"] = vlm.value("error", output);
+                res.set_content(resp.dump(), "application/json");
+                return;
+            }
+            const std::string& response = vlm.value("response", "");
+            // Parse the two numeric ratings out of the prose.
+            int naturalness = -1, intelligibility = -1;
+            std::smatch m;
+            std::regex re_nat("naturalness[^0-9]*([0-9]+)", std::regex::icase);
+            std::regex re_int("intelligibility[^0-9]*([0-9]+)", std::regex::icase);
+            if (std::regex_search(response, m, re_nat)) naturalness = std::stoi(m[1]);
+            if (std::regex_search(response, m, re_int)) intelligibility = std::stoi(m[1]);
+            // Transcript ≈ the prose before the first rating keyword.
+            std::string transcript = response;
+            {
+                auto pos = transcript.find("naturalness");
+                if (pos == std::string::npos)
+                    pos = transcript.find("Naturalness");
+                if (pos != std::string::npos) transcript = transcript.substr(0, pos);
+            }
+
+            // Cache into the sidecar (merge with any existing rating).
+            fs::path sidecar = target; sidecar += ".json";
+            json meta = json::object();
+            {
+                std::ifstream sf(sidecar);
+                if (sf) {
+                    std::string mt((std::istreambuf_iterator<char>(sf)),
+                                   std::istreambuf_iterator<char>());
+                    try { meta = json::parse(mt, nullptr, false); } catch (...) {}
+                }
+            }
+            meta["naturalness"]     = naturalness;
+            meta["intelligibility"] = intelligibility;
+            meta["transcript"]      = transcript;
+            std::ofstream of(sidecar);
+            of << meta.dump(2);
+
+            resp["ok"]            = true;
+            resp["naturalness"]   = naturalness;
+            resp["intelligibility"] = intelligibility;
+            resp["transcript"]    = transcript;
+            resp["raw"]           = response;
             res.set_content(resp.dump(), "application/json");
         });
     }

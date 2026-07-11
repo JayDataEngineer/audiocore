@@ -104,6 +104,12 @@ struct Qwen3TtsConfig {
     int  n_ctx_predictor    = 4096;
     int  n_gpu_layers       = -1;
     bool flash_attn         = true;
+    // Force the audio codec onto the CPU backend even when the talker runs on
+    // CUDA. The codec is only 8 small layers; running it on CPU avoids VRAM
+    // contention with co-tenant GPU processes (e.g. a shared ComfyUI) that can
+    // leave too little free VRAM for the codec's ~4 GB decode graph. Off by
+    // default; enable via extras["codec_on_cpu"] = "1".
+    bool codec_on_cpu       = false;
     float temperature       = 0.7f;
     float top_p             = 0.9f;
     int   max_new_tokens    = 4096;

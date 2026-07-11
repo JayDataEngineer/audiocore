@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 
 #include "audiocore/framework/core/backend.h"
 #include "audiocore/framework/io/gguf_reader.h"
@@ -151,6 +152,11 @@ bool Qwen3TtsSession::load(const std::string& model_path,
         auto it = opts.extras.find("flash_attn");
         if (it != opts.extras.end())
             config_.flash_attn = it->second == "1" || it->second == "true";
+    }
+    {
+        auto it = opts.extras.find("codec_on_cpu");
+        if (it != opts.extras.end())
+            config_.codec_on_cpu = it->second == "1" || it->second == "true";
     }
     {
         auto it = opts.extras.find("model_size_b");
@@ -531,9 +537,17 @@ bool Qwen3TtsSession::load(const std::string& model_path,
             if (codec_reader_->get_kv_f32("qwen3tts_codec.dec.rope_theta",   &f32)) hp.rope_theta    = f32;
             if (codec_reader_->get_kv_f32("qwen3tts_codec.dec.rms_norm_eps", &f32)) hp.rms_norm_eps  = f32;
 
-            // Build the same ggml Backend the talker uses so codec + talker
-            // share VRAM rather than round-tripping through host RAM.
-            codec_backend_ = make_backend(backend_cfg, nullptr);
+            // Build the codec backend. Normally the codec shares the talker's
+            // backend (CUDA) so weights live in VRAM; but when VRAM is
+            // contested by co-tenant GPU processes the codec's ~4 GB decode
+            // graph can OOM. extras["codec_on_cpu"]="1" forces a CPU backend
+            // for the codec — cheap (8 layers) and sidesteps the contention.
+            BackendConfig codec_cfg = backend_cfg;
+            if (config_.codec_on_cpu) {
+                codec_cfg.kind = BackendKind::ggml_cpu;
+                codec_cfg.n_threads = std::max(1, (int) std::thread::hardware_concurrency());
+            }
+            codec_backend_ = make_backend(codec_cfg, nullptr);
             ggml_backend_t be = codec_backend_ ? codec_backend_->raw_ggml_backend() : nullptr;
             if (!be) {
                 std::fprintf(stderr, "qwen3_tts: codec backend unavailable; "
