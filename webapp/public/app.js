@@ -1269,7 +1269,7 @@
       }
     } else if (src === "identity_style") {
       // Cross-speaker style transfer: identity comes from a saved .voice
-      // (your tts_remote), acting/prosody is copied from a separate expressive
+      // (your character), acting/prosody is copied from a separate expressive
       // reference WAV. The backend keeps the .voice embedding and ALSO
       // encodes the style WAV into codec ref-codes — so you hear your
       // character performing the other clip's delivery.
@@ -2372,7 +2372,7 @@
 
   function pca_profile_export() {
     const st = pca_profile_state();
-    const name = (prompt("Profile name:", "my_tts_remote") || "voice").trim().replace(/[^a-z0-9_-]/gi, "_");
+    const name = (prompt("Profile name:", "my_voice") || "voice").trim().replace(/[^a-z0-9_-]/gi, "_");
     const blob = new Blob([JSON.stringify(st, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);

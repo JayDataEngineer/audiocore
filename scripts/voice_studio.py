@@ -18,12 +18,12 @@ COMMANDS
 
 EXAMPLES
   # Generate with every knob
-  voice-studio generate --voice tts_remote \\
+  voice-studio generate --voice default \\
     --text "Welcome home." --instruct "warm, gentle" \\
     --icl-frames 10 --temperature 0.8 --seed 42 --rate 0.95
 
   # Audition 10 takes
-  voice-studio audition --voice tts_remote \\
+  voice-studio audition --voice default \\
     --text "I missed you." --instruct "sad, longing" \\
     --seeds 42-51 -o audition/
 
@@ -31,7 +31,7 @@ EXAMPLES
   voice-studio compose --script scene.json -o scene.wav
 
   # Bake a joyful voice
-  voice-studio bake --source tts_remote_wdelta --save-as tts_remote_joy \\
+  voice-studio bake --source default_wdelta --save-as narrator_joy \\
     --text "I'm so happy!" --instruct "warm joy" --seed 42
 ══════════════════════════════════════════════════════════════════════════════"""
 from __future__ import annotations
@@ -78,7 +78,7 @@ class Param:
 
 PARAMS: list[Param] = [
     # ── VOICE IDENTITY NODE ──────────────────────────────────────────────
-    Param(["--voice", "-v"], "voice", str, "tts_remote",
+    Param(["--voice", "-v"], "voice", str, "default",
           help="Voice name (.qvoice filename without extension)", node="VOICE IDENTITY"),
     Param(["--voice-strength", "--vs"], "voice_strength", float, 1.0,
           min_val=0.0, max_val=3.0,
@@ -165,7 +165,7 @@ for p in PARAMS:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class VoiceEngine:
-    """HTTP client for the tts_remote TTS server."""
+    """HTTP client for the audiocore TTS server."""
 
     def __init__(self, endpoint: str = DEFAULT_ENDPOINT):
         self.endpoint = endpoint.rstrip("/")
@@ -221,7 +221,7 @@ class VoiceEngine:
     def exprs(self) -> dict:
         return self._get("/v1/exprs")
 
-    def generate(self, text: str, voice: str = "tts_remote", **params) -> tuple[bytes, dict]:
+    def generate(self, text: str, voice: str = "default", **params) -> tuple[bytes, dict]:
         body = {"input": text, "voice": voice}
         body.update(params)
         return self._post("/v1/audio/speech", body)
@@ -389,7 +389,7 @@ def fmt_duration(s: float) -> str:
 def cmd_generate(args):
     engine = VoiceEngine(args.endpoint)
     params = collect_params(args, exclude={"voice"})
-    voice = args.voice or "tts_remote"
+    voice = args.voice or "default"
     text = args.text
 
     # Profile merge
@@ -444,7 +444,7 @@ def cmd_generate(args):
 def cmd_audition(args):
     engine = VoiceEngine(args.endpoint)
     params = collect_params(args, exclude={"voice", "seed"})
-    voice = args.voice or "tts_remote"
+    voice = args.voice or "default"
     text = args.text
 
     # Parse seed range
@@ -557,7 +557,7 @@ def cmd_compose(args):
             continue
 
         text = line["input"] or line.get("text", "")
-        voice = line.get("voice", script.get("default_voice", "tts_remote"))
+        voice = line.get("voice", script.get("default_voice", "default"))
         params = {k: v for k, v in line.items()
                   if k not in ("input", "text", "voice", "pause") and v is not None}
 
