@@ -174,7 +174,19 @@ public:
         return {std::move(resp.pcm_stereo), resp.sampling_rate, resp.channels};
     }
 
-    bool loaded() const { return session_->loaded(); }
+    bool loaded() const { return session_ && session_->loaded(); }
+
+    /// Explicitly destroy the session and free all VRAM.
+    ///
+    /// The GGML CUDA backend allocates model weights via cudaMalloc, which
+    /// is NOT tracked by PyTorch's caching allocator.  Python's GC may not
+    /// collect the pybind11 wrapper immediately after the last reference is
+    /// dropped, leaving VRAM occupied.  This method forces immediate
+    /// destruction of the C++ Session (which destroys the Backend, which
+    /// calls ggml_backend_free → cudaFree).
+    void close() {
+        session_.reset();  // destroys Session → destroys Backend → frees VRAM
+    }
 
 private:
     std::unique_ptr<Session> session_;
@@ -264,5 +276,9 @@ PYBIND11_MODULE(audiocore, m) {
              "n_diffusion_steps=0 uses variant default (turbo=8, sft=50).")
 
         .def("loaded", &PythonSession::loaded,
-             "Check if model weights are loaded.");
+             "Check if model weights are loaded.")
+
+        .def("close", &PythonSession::close,
+             "Destroy the session and free all VRAM. "
+             "The session cannot be used after calling this.");
 }
