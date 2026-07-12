@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 import numpy as np
 import torch
 
-from .core import ManagedModel, init
+from .core import ManagedModel, _AUDIOCORE_MODELS_DIR, init
 
 logger = logging.getLogger("audiocore-nodes")
 
@@ -33,13 +34,63 @@ FAMILY_NAMES = {
     "moss_sfx_v2": "MOSS-SFX v2 (sound effects)",
 }
 
-# Conventional model directories.
-_DEFAULT_MODEL_PATH = {
-    "moss_tts": "/models/moss-tts",
-    "qwen3_tts": "/models/qwen3-tts",
-    "ace_step": "/models/acestep",
-    "moss_sfx_v2": "/models/moss-sfx-v2",
+# Conventional model directory NAMES (relative to AUDIOCORE_MODELS_DIR).
+# These are the subdirectory names that contain the .gguf weights.
+_DEFAULT_MODEL_DIR = {
+    "moss_tts": "moss-tts",
+    "qwen3_tts": "qwen3-tts",
+    "ace_step": "acestep-cpp-converted",
+    "moss_sfx_v2": "moss-sfx-v2",
 }
+
+
+def _list_audiocore_models() -> list[str]:
+    """List available audiocore model subdirectories for the combo dropdown.
+
+    Scans AUDIOCORE_MODELS_DIR for immediate subdirectories. Each one is a
+    model family directory containing .gguf weight files. This populates
+    the LoadAudiocoreModel dropdown so users can pick models by name
+    instead of typing absolute paths.
+
+    Called by INPUT_TYPES (refreshed each time ComfyUI rebuilds the node
+    menu), so newly downloaded models appear without a restart.
+    """
+    try:
+        entries = sorted(os.listdir(_AUDIOCORE_MODELS_DIR))
+        return [
+            e for e in entries
+            if os.path.isdir(os.path.join(_AUDIOCORE_MODELS_DIR, e))
+        ]
+    except OSError:
+        return []
+
+
+def _resolve_model_path(model_path: str) -> str:
+    """Resolve a model_path to an absolute filesystem path.
+
+    Accepts both:
+      - Absolute paths (e.g. /mnt/data/models/audio/moss-tts) — used by
+        the ray server's catalog and programmatic callers.
+      - Relative names (e.g. "moss-tts") — used by the ComfyUI UI dropdown.
+        Resolved via folder_paths.get_full_path("audiocore", name) with a
+        fallback to AUDIOCORE_MODELS_DIR/name.
+
+    This dual-mode keeps backwards compatibility (absolute paths from the
+    builder) while making the UI dropdown work (relative names from the
+    combo widget).
+    """
+    if os.path.isabs(model_path):
+        return model_path
+    # Relative — try folder_paths first (registered in __init__.py)
+    try:
+        import folder_paths
+        resolved = folder_paths.get_full_path("audiocore", model_path)
+        if resolved and os.path.exists(resolved):
+            return resolved
+    except ImportError:
+        pass
+    # Fallback: prepend AUDIOCORE_MODELS_DIR
+    return os.path.join(_AUDIOCORE_MODELS_DIR, model_path)
 
 
 # ── Node: Load Audiocore Model ───────────────────────────────────────────────
@@ -63,12 +114,21 @@ class LoadAudiocoreModel:
 
     @classmethod
     def INPUT_TYPES(cls):
+        # Layer 3: model_path is a combo dropdown populated by scanning
+        # AUDIOCORE_MODELS_DIR for subdirectories. Each subdirectory is a
+        # model family (moss-tts/, moss-sfx-v2/, ...). The user picks one;
+        # load() resolves the relative name to an absolute path.
+        models = _list_audiocore_models()
+        default_family = "moss_tts"
+        default_model = _DEFAULT_MODEL_DIR.get(default_family, "")
+        if default_model not in models and models:
+            default_model = models[0]
         return {
             "required": {
                 "family": (list(FAMILY_NAMES.keys()),
-                           {"default": "moss_tts"}),
-                "model_path": ("STRING",
-                               {"default": "/models/moss-tts"}),
+                           {"default": default_family}),
+                "model_path": (models,
+                               {"default": default_model}),
                 "backend": (["ggml_cuda", "ggml_cpu"],
                             {"default": "ggml_cuda"}),
             },
@@ -90,10 +150,14 @@ class LoadAudiocoreModel:
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"extras must be valid JSON: {e}") from e
 
-        m = ManagedModel(family, model_path, backend)
+        # Layer 3: resolve relative names (from the dropdown) to absolute
+        # paths. Absolute paths (from the ray builder) pass through.
+        resolved_path = _resolve_model_path(model_path)
+
+        m = ManagedModel(family, resolved_path, backend)
         if not m.load(**extras_dict):
             raise RuntimeError(
-                f"Failed to load {family} from {model_path}"
+                f"Failed to load {family} from {resolved_path}"
             )
         return (m,)
 
