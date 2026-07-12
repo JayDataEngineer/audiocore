@@ -246,7 +246,7 @@ bool SfxSession::load(const std::string& model_path,
         te_cfg.n_ctx        = 2048;
         te_cfg.n_batch      = 512;
         te_cfg.n_threads    = 0;
-        te_cfg.n_gpu_layers = -1;
+        te_cfg.n_gpu_layers = (backend_cfg.kind == BackendKind::ggml_cuda) ? -1 : 0;
         te_cfg.flash_attn   = true;
         auto te = qwen3::Runner::load(te_path, te_cfg, &load_err);
         if (!te) {
