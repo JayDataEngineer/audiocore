@@ -1912,33 +1912,31 @@ bool AceStepSession::run_dit_and_vae(const MusicRequest& req,
             fprintf(stderr, "[ace_step] WARNING: %d/%zu NaN in final latent\n",
                     nan_l, xt_current.size());
         }
-        // TEMP DEBUG: dump final xt_current stats + first frame values.
-        // Compare against silence_latent (the "no music" reference) to see
-        // whether the DiT produced something silence-like or actually
-        // musical. The VAE expects ~[-3, 3] range latents.
-        double mn = 1e30, mx = -1e30, sum = 0, abs_sum = 0;
-        for (size_t i = 0; i < xt_current.size(); i++) {
-            float v = xt_current[i];
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-            sum += v; abs_sum += std::fabs(v);
-        }
-        fprintf(stderr,
-                "[ace_step] final xt_current: N=%zu range=[%.4f,%.4f] "
-                "mean=%.4f mean_abs=%.4f\n",
-                xt_current.size(), mn, mx, sum / xt_current.size(),
-                abs_sum / xt_current.size());
-        // First 8 values of channel 0
-        fprintf(stderr, "[ace_step] xt_current[0..7]: ");
-        for (int i = 0; i < 8 && i < (int)xt_current.size(); i++)
-            fprintf(stderr, "%.4f ", xt_current[i]);
-        fprintf(stderr, "\n");
-        // Compare with silence_latent first 8 values
-        if (silence_ptr) {
-            fprintf(stderr, "[ace_step] silence_latent[0..7]: ");
-            for (int i = 0; i < 8 && i < silence_T * out_ch; i++)
-                fprintf(stderr, "%.4f ", silence_ptr[i]);
+        // Latent stats — gated behind ACE_STEP_DEBUG_LATENT env var.
+        // Useful for diagnosing silence/corruption issues during development.
+        if (std::getenv("ACE_STEP_DEBUG_LATENT")) {
+            double mn = 1e30, mx = -1e30, sum = 0, abs_sum = 0;
+            for (size_t i = 0; i < xt_current.size(); i++) {
+                float v = xt_current[i];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += v; abs_sum += std::fabs(v);
+            }
+            fprintf(stderr,
+                    "[ace_step] final xt_current: N=%zu range=[%.4f,%.4f] "
+                    "mean=%.4f mean_abs=%.4f\n",
+                    xt_current.size(), mn, mx, sum / xt_current.size(),
+                    abs_sum / xt_current.size());
+            fprintf(stderr, "[ace_step] xt_current[0..7]: ");
+            for (int i = 0; i < 8 && i < (int)xt_current.size(); i++)
+                fprintf(stderr, "%.4f ", xt_current[i]);
             fprintf(stderr, "\n");
+            if (silence_ptr) {
+                fprintf(stderr, "[ace_step] silence_latent[0..7]: ");
+                for (int i = 0; i < 8 && i < silence_T * out_ch; i++)
+                    fprintf(stderr, "%.4f ", silence_ptr[i]);
+                fprintf(stderr, "\n");
+            }
         }
         // Dump xt_current to /tmp for offline diffusers comparison
         if (const char* p = std::getenv("ACE_STEP_DUMP_XT")) {

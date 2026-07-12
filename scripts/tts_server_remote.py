@@ -200,6 +200,7 @@ class Handler(BaseHTTPRequestHandler):
         source = body.get("source_voice") or body.get("source", "default")
         save_as = body.get("save_as", "")
         text = body.get("text") or body.get("input", "")
+        wdelta = body.get("wdelta", False)  # Heavy WDELTA voice (~3.6GB)
 
         if not save_as or not text:
             self._json(400, {"error": "missing 'save_as' or 'text'"})
@@ -249,17 +250,17 @@ class Handler(BaseHTTPRequestHandler):
         self.log_message("BAKE step 1 done: %s", bake_wav)
 
         # ── Step 2: Clone with Base model ──────────────────────────────
-        # NOTE: --target-cv is documented in the help text but NOT a recognized
-        # CLI flag in the compiled binary. The clone produces a ~24MB graft
-        # voice (x-vector + metadata + saved source weights) from the ref audio.
-        # The emotional characteristics of the Step 1 audio ARE captured in the
-        # embedding, giving the baked-voice its emotional quality.
-        self.log_message("BAKE step 2: cloning with Base model → %s.qvoice", save_as)
+        # Default: ~24MB graft voice (x-vector + metadata + saved source weights).
+        # With wdelta=True: ~3.6GB WDELTA voice (full weight delta, exact identity).
+        self.log_message("BAKE step 2: cloning with Base model → %s.qvoice%s",
+                         save_as, " (WDELTA)" if wdelta else "")
         clone_argv = [
             QWEN_TTS, "-d", MODEL_DIRS["base"],
             "--ref-audio", bake_wav,
             "--save-voice", out_qvoice,
         ]
+        if wdelta:
+            clone_argv.append("--target-cv")
 
         proc = subprocess.run(clone_argv, capture_output=True, text=True, timeout=TIMEOUT)
         if proc.returncode != 0 or not os.path.exists(out_qvoice):
@@ -309,9 +310,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         out_qvoice = os.path.join(VOICES_DIR, f"{save_as}.qvoice")
-        # NOTE: --target-cv not supported by compiled binary (see bake handler)
         argv = [QWEN_TTS, "-d", MODEL_DIRS["base"],
                 "--ref-audio", ref_audio, "--save-voice", out_qvoice]
+        if target_cv:
+            argv.append("--target-cv")
 
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT)
         if proc.returncode != 0 or not os.path.exists(out_qvoice):

@@ -32,9 +32,9 @@
 //   null_condition_emb
 //
 // CFG runs two separate graphs (cond / uncond) and blends outputs.
-// NOTE: vanilla CFG formula = u + g*(c-u). Upstream uses normalized_guidance
-// with pred_cond base + orthogonal update + norm_threshold=2.5. The vanilla
-// formula over-amplifies when diff is large (FIXME: upgrade to match upstream).
+// Uses Adaptive Projected Guidance (APG) — matches diffusers
+// normalized_guidance with pred_cond base + orthogonal update +
+// norm_threshold=2.5. See apply_apg_blend() below for the implementation.
 
 #include "audiocore/models/ace_step/dit_runner.h"
 #include "audiocore/framework/ggml/backend_helper.h"
