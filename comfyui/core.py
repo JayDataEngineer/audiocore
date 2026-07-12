@@ -11,9 +11,12 @@ Env vars:
 from __future__ import annotations
 
 import ctypes
+import importlib
+import importlib.util
 import logging
 import os
 import sys
+import sysconfig
 
 logger = logging.getLogger("audiocore-nodes")
 
@@ -29,20 +32,19 @@ _AUDIOCORE_LIB_DIR = os.environ.get(
 )
 
 _initialized = False
+_ext = None  # type: ignore[assignment]  # The C++ pybind11 module, cached after init().
 
 
-def init():
-    """Initialise audiocore (idempotent). Loads the .so + GGML shared libs."""
-    global _initialized
-    if _initialized:
-        return
+def _load_ext():
+    """Load the audiocore C++ pybind11 .so and return the module.
 
-    # Find the pybind11 module for the running Python version.
-    import sysconfig
+    The custom_nodes/audiocore/ Python package shadows the .so of the same
+    name in sys.modules.  We evict the cached package, load the .so directly
+    via importlib, then restore the package so ComfyUI node imports survive.
+    """
     ext = sysconfig.get_config_var("EXT_SUFFIX")
     so_path = os.path.join(_AUDIOCORE_SO_DIR, f"audiocore{ext}")
     if not os.path.exists(so_path):
-        # Fall back to scanning for any audiocore.cpython-*.so
         import glob
         candidates = sorted(
             glob.glob(os.path.join(_AUDIOCORE_SO_DIR, "audiocore.cpython-*.so")),
@@ -63,11 +65,38 @@ def init():
         if os.path.exists(lib_path):
             ctypes.CDLL(lib_path, ctypes.RTLD_GLOBAL)
 
-    if _AUDIOCORE_SO_DIR not in sys.path:
-        sys.path.insert(0, _AUDIOCORE_SO_DIR)
-    import audiocore
-    audiocore.init()
-    logger.info("audiocore initialized: families=%s", audiocore.list_families())
+    # ── Evict the Python package from sys.modules so the .so loads ──
+    saved_pkg = sys.modules.pop("audiocore", None)
+    saved_sub = {}
+    for key in list(sys.modules):
+        if key.startswith("audiocore."):
+            saved_sub[key] = sys.modules.pop(key)
+
+    try:
+        # importlib.util.spec_from_file_location with the name "audiocore"
+        # is the only way to load a pybind11 .so whose PyInit is PyInit_audiocore.
+        spec = importlib.util.spec_from_file_location("audiocore", so_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["audiocore"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        # Restore the Python package so ComfyUI node imports still resolve.
+        if saved_pkg is not None:
+            sys.modules["audiocore"] = saved_pkg
+        for k, v in saved_sub.items():
+            sys.modules[k] = v
+
+
+def init():
+    """Initialise audiocore (idempotent). Loads the .so + GGML shared libs."""
+    global _initialized, _ext
+    if _initialized:
+        return
+
+    _ext = _load_ext()
+    _ext.init()
+    logger.info("audiocore initialized: families=%s", _ext.list_families())
     _initialized = True
 
 
@@ -108,12 +137,13 @@ class ManagedModel:
             prev._cleanup()
 
         init()
-        import audiocore
         try:
-            s = audiocore.Session.create(self.family)
-            kwargs: dict = {"backend": self.backend}
-            load_kwargs = {k: v for k, v in extras.items() if v}
-            s.load(self.path, **kwargs, **load_kwargs)
+            s = _ext.Session.create(self.family)
+            # The C++ Session.load() accepts: (model_path, backend, device,
+            # threads, extras: dict[str,str]).  Family-specific keys like
+            # te_path, talker_path, etc. must be wrapped inside `extras`.
+            load_extras = {k: str(v) for k, v in extras.items() if v}
+            s.load(self.path, backend=self.backend, extras=load_extras)
             self._session = s
             ManagedModel._active_model = self
             logger.info("loaded %s from %s", self.family, self.path)
@@ -125,7 +155,8 @@ class ManagedModel:
     def _cleanup(self):
         """Actually free the C++ session and its VRAM."""
         if self._session is not None:
-            # Call the C++ destructor explicitly if available.
+            # Call the C++ close() — destroys the Session, which destroys
+            # the Backend, which calls ggml_backend_free → cudaFree.
             close_fn = getattr(self._session, "close", None)
             if close_fn:
                 try:
@@ -137,10 +168,14 @@ class ManagedModel:
             ManagedModel._active_model = None
         import gc
         gc.collect()
-        # Force CUDA cache clear so GGML can reallocate.
+        # Force CUDA synchronisation + cache clear so GGML's cudaFree
+        # allocations are visible to the next model load.
         try:
             import torch
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
         except Exception:
             pass
 
