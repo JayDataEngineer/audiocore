@@ -554,7 +554,7 @@ def cmd_compose(args):
 
 def cmd_bake(args):
     engine = VoiceEngine(args.endpoint)
-    params = collect_params(args, exclude={"voice", "seed"})
+    params = collect_params(args, exclude={"voice"})
 
     print(f"▶ BAKE: source={args.source} → save_as={args.save_as}")
     print(f"  text: \"{args.text[:80]}\"")
