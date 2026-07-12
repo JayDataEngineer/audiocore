@@ -171,8 +171,14 @@ class VoiceEngine:
         self.endpoint = endpoint.rstrip("/")
 
     def _get(self, path: str) -> dict:
-        with urllib.request.urlopen(f"{self.endpoint}{path}", timeout=15) as r:
-            return json.loads(r.read())
+        try:
+            with urllib.request.urlopen(f"{self.endpoint}{path}", timeout=15) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode()[:300]
+            raise RuntimeError(f"HTTP {e.code}: {detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Cannot reach server at {self.endpoint}: {e.reason}") from e
 
     def _post(self, path: str, body: dict, timeout: float = 600) -> tuple[bytes, dict]:
         data = json.dumps(body).encode()
@@ -181,12 +187,30 @@ class VoiceEngine:
             headers={"Content-Type": "application/json"}, method="POST",
         )
         t0 = time.time()
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            wav = r.read()
-            elapsed = time.time() - t0
-            headers = dict(r.headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                wav = r.read()
+                elapsed = time.time() - t0
+                headers = dict(r.headers)
+                status = r.status
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode()[:500]
+            raise RuntimeError(f"HTTP {e.code}: {detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Cannot reach server at {self.endpoint}: {e.reason}") from e
         return wav, {"elapsed_s": round(elapsed, 1), "headers": headers,
-                     "status": r.status if hasattr(r, 'status') else 200}
+                     "status": status}
+
+    def _delete(self, path: str) -> dict:
+        req = urllib.request.Request(f"{self.endpoint}{path}", method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode()[:300]
+            raise RuntimeError(f"HTTP {e.code}: {detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Cannot reach server at {self.endpoint}: {e.reason}") from e
 
     def health(self) -> dict:
         return self._get("/health")
@@ -217,6 +241,11 @@ class VoiceEngine:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             return {"error": f"HTTP {e.code}", "detail": e.read().decode()[:500]}
+
+    def delete_voice(self, name: str):
+        """Delete a voice via the server DELETE endpoint."""
+        self._delete(f"/v1/voices/{name}")
+        print(f"✓ Deleted voice: {name}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -268,8 +297,8 @@ def concatenate_wavs(wav_chunks: list[bytes], gaps_s: list[float] | None = None)
 # CACHE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def cache_key(text: str, voice: str, params: dict) -> str:
-    blob = json.dumps({"t": text, "v": voice, "p": params}, sort_keys=True)
+def cache_key(text: str, voice: str, params: dict, endpoint: str = "") -> str:
+    blob = json.dumps({"t": text, "v": voice, "p": params, "e": endpoint}, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -318,7 +347,7 @@ def add_param_args(parser: argparse.ArgumentParser):
         kwargs: dict[str, Any] = {"help": p.help, "default": None, "dest": p.json_name}
         if p.ptype is float:
             kwargs["type"] = float
-        elif p.ptype is int and p.json_name != "seed":
+        elif p.ptype is int:
             kwargs["type"] = int
         elif p.ptype is bool:
             kwargs["action"] = "store_true"
@@ -370,7 +399,7 @@ def cmd_generate(args):
         params = prof
 
     # Cache
-    key = cache_key(text, voice, params)
+    key = cache_key(text, voice, params, args.endpoint)
     if not args.no_cache:
         cached = cache_get(key)
         if cached:
@@ -439,6 +468,24 @@ def cmd_audition(args):
         seed_params = dict(params)
         seed_params["seed"] = seed
 
+        wav_path = outdir / f"seed_{seed:04d}.wav"
+        key = cache_key(text, voice, seed_params, args.endpoint)
+
+        # Cache check
+        if not args.no_cache:
+            cached = cache_get(key)
+            if cached:
+                info = wav_info(cached)
+                wav_path.write_bytes(cached)
+                take = {"seed": seed, "path": str(wav_path),
+                        "duration_s": info["duration_s"],
+                        "generation_time_s": 0.0, "size_bytes": len(cached),
+                        "cached": True}
+                manifest["takes"].append(take)
+                print(f"  [{i+1}/{len(seeds)}] seed={seed} CACHE HIT "
+                      f"{info['duration_s']}s → {wav_path.name}")
+                continue
+
         print(f"  [{i+1}/{len(seeds)}] seed={seed}...", end=" ", flush=True)
         t0 = time.time()
 
@@ -446,8 +493,8 @@ def cmd_audition(args):
             wav, meta = engine.generate(text, voice, **seed_params)
             elapsed = time.time() - t0
             info = wav_info(wav)
-            wav_path = outdir / f"seed_{seed:04d}.wav"
             wav_path.write_bytes(wav)
+            cache_put(key, wav)
 
             take = {"seed": seed, "path": str(wav_path), "duration_s": info["duration_s"],
                     "generation_time_s": round(elapsed, 1), "size_bytes": len(wav)}
@@ -463,8 +510,11 @@ def cmd_audition(args):
 
     # Summary
     succeeded = [t for t in manifest["takes"] if "error" not in t]
+    cached_n = sum(1 for t in succeeded if t.get("cached"))
     total_time = sum(t.get("generation_time_s", 0) for t in succeeded)
-    print(f"\n✓ {len(succeeded)}/{len(seeds)} takes generated in {fmt_duration(total_time)}")
+    gen_n = len(succeeded) - cached_n
+    print(f"\n✓ {len(succeeded)}/{len(seeds)} takes "
+          f"({gen_n} generated, {cached_n} cached) in {fmt_duration(total_time)}")
     print(f"  manifest: {manifest_path}")
     print(f"\n  Listen and pick the best:")
     print(f"  for f in {outdir}/seed_*.wav; do ffplay \"$f\"; done")
@@ -496,12 +546,13 @@ def cmd_compose(args):
 
     print(f"▶ COMPOSE: {len(lines)} lines")
     chunks = []
-    gaps = []
+    gaps = []          # gaps[i] = silence between chunks[i] and chunks[i+1]
     line_metas = []
+    pending_pause = None
 
     for i, line in enumerate(lines):
         if "pause" in line:
-            gaps.append(float(line["pause"]))
+            pending_pause = float(line["pause"])
             print(f"  [{i+1}] pause {line['pause']}s")
             continue
 
@@ -510,31 +561,31 @@ def cmd_compose(args):
         params = {k: v for k, v in line.items()
                   if k not in ("input", "text", "voice", "pause") and v is not None}
 
-        if not chunks:  # First line has no preceding gap
-            pass
-        elif not gaps or len(gaps) < len(chunks):
-            gaps.append(script.get("default_pause", 0.3))
-
         print(f"  [{i+1}] voice={voice} \"{text[:60]}{'...' if len(text)>60 else ''}\"")
 
         try:
             wav, meta = engine.generate(text, voice, **params)
             info = wav_info(wav)
+            # Gap before this chunk (not for the first)
+            if chunks:
+                gap = pending_pause if pending_pause is not None else script.get("default_pause", 0.3)
+                gaps.append(gap)
             chunks.append(wav)
             line_metas.append({"text": text, "voice": voice, "params": params,
                                "duration_s": info["duration_s"],
                                "gen_time_s": meta["elapsed_s"]})
+            pending_pause = None
             print(f"       → {info['duration_s']}s in {fmt_duration(meta['elapsed_s'])}")
         except Exception as e:
             print(f"       ✗ FAILED: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # Concatenate
-    output = concatenate_wavs(chunks, gaps[:len(chunks)-1] if len(gaps) >= len(chunks) - 1 else None)
+    # Concatenate — gaps has exactly len(chunks)-1 entries
+    output = concatenate_wavs(chunks, gaps)
     Path(args.output).write_bytes(output)
 
     total_dur = sum(m["duration_s"] for m in line_metas)
-    total_gap = sum(g for g in gaps if g is not None)
+    total_gap = sum(gaps)
     total_gen = sum(m["gen_time_s"] for m in line_metas)
 
     print(f"\n✓ Composed: {len(chunks)} clips, {total_dur:.1f}s audio "
@@ -544,7 +595,7 @@ def cmd_compose(args):
     # Sidecar
     meta_path = Path(args.output).with_suffix(".meta.json")
     meta_path.write_text(json.dumps({
-        "lines": line_metas, "gaps": gaps[:len(chunks)-1],
+        "lines": line_metas, "gaps": gaps,
         "total_duration_s": total_dur + total_gap,
         "total_generation_s": round(total_gen, 1),
     }, indent=2))
@@ -609,16 +660,14 @@ def cmd_voices(args):
         print(json.dumps(v, indent=2))
 
     elif args.subcmd == "delete":
-        # TODO: server v3 DELETE endpoint
-        print(f"(delete not yet implemented in server — use ssh to remove manually)")
-        print(f"  ssh ubuntu@TAILSCALE_HOST 'rm /opt/audiocore/voices/{args.name}.qvoice'")
+        engine.delete_voice(args.name)
 
 
 # ── PROFILE ─────────────────────────────────────────────────────────────────
 
 def cmd_profile(args):
     if args.subcmd == "save":
-        params = collect_params(args, exclude={"voice", "seed"})
+        params = collect_params(args, exclude={"voice"})
         if args.voice:
             params["voice"] = args.voice
         profile_save(args.name, params)
@@ -727,6 +776,7 @@ def main():
     aud.add_argument("--text", "-t", required=True)
     aud.add_argument("--seeds", default="42-51", help="Seed range: '42-51' or '42,43,45'")
     aud.add_argument("--output", "-o", default="audition")
+    aud.add_argument("--no-cache", action="store_true", help="Bypass local cache")
     add_param_args(aud)
 
     # ── compose ────────────────────────────────────────────────────────
@@ -765,16 +815,20 @@ def main():
         ap.print_help()
         sys.exit(0)
 
-    {
-        "generate": cmd_generate,
-        "audition": cmd_audition,
-        "compose": cmd_compose,
-        "bake": cmd_bake,
-        "voices": cmd_voices,
-        "profile": cmd_profile,
-        "describe": cmd_describe,
-        "status": cmd_status,
-    }[args.command](args)
+    try:
+        {
+            "generate": cmd_generate,
+            "audition": cmd_audition,
+            "compose": cmd_compose,
+            "bake": cmd_bake,
+            "voices": cmd_voices,
+            "profile": cmd_profile,
+            "describe": cmd_describe,
+            "status": cmd_status,
+        }[args.command](args)
+    except RuntimeError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
