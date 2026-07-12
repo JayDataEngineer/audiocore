@@ -125,11 +125,32 @@ class ManagedModel:
         self._session = None
 
     def load(self, **extras) -> bool:
-        """Load model weights. Returns True on success."""
+        """Load model weights. Returns True on success.
+
+        Caching: if the previously-loaded model (tracked by the
+        ``_active_model`` class variable) matches this model's family +
+        path, REUSE its session instead of re-loading from disk. This is
+        the hot path that drops back-to-back TTS from ~20s (cold GGUF
+        load) to ~2s (cached). Each ComfyUI graph creates a fresh
+        ``ManagedModel`` instance, so without this reuse check the cache
+        would never hit.
+        """
         if self._session is not None:
+            return True  # this instance already loaded
+
+        # ── Hot path: reuse the active session if compatible ──
+        active = ManagedModel._active_model
+        if (active is not None
+                and active is not self
+                and active.family == self.family
+                and active.path == self.path
+                and active._session is not None):
+            self._session = active._session
+            logger.info("reusing cached %s session (path=%s)",
+                        self.family, self.path)
             return True
 
-        # ── Free VRAM from any previously loaded model ──
+        # ── Cold path: free any incompatible active model, then load ──
         prev = ManagedModel._active_model
         if prev is not None and prev is not self:
             logger.info("unloading %s from VRAM before loading %s",
