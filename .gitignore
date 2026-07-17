@@ -76,8 +76,6 @@ tools/compare/
 *~
 ref-qwen3tts/
 
-# ComfyUI custom nodes integration (WIP — incomplete, not yet functional)
-comfyui/
 
 # Saved Qwen3-TTS voice files (generated, up to 3.6GB each)
 *.qvoice
