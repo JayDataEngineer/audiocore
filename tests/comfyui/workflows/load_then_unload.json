@@ -1,0 +1,20 @@
+{
+  "1": {
+    "class_type": "LoadAudiocoreModel",
+    "inputs": {
+      "family": "moss_tts",
+      "model_path": "moss-tts",
+      "backend": "ggml_cuda"
+    }
+  },
+  "2": {
+    "class_type": "UnloadAudiocoreModel",
+    "inputs": {
+      "model": ["1", 0]
+    }
+  },
+  "3": {
+    "class_type": "AudiocoreFamilyInfo",
+    "inputs": {}
+  }
+}

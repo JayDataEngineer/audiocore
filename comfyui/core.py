@@ -395,6 +395,8 @@ class _AudiocorePatcherStub:
         .model_size()               → int   (total weight bytes)
         .loaded_size()              → int   (currently-resident bytes)
         .model.__class__.__name__   → str   (for the "Unloading X" log line)
+        .partially_unload_ram(n)    → int   (RAM-pin eviction; no-op for GGML)
+        .model_mmap_residency(free) → (resident_bytes, total_bytes) tuple
 
     ``sys.getrefcount()`` is also called on ``.model`` — so the property must
     return a STABLE object (self), not a fresh wrapper on each access.
@@ -428,6 +430,34 @@ class _AudiocorePatcherStub:
         if self._managed._session is not None and torch.cuda.is_available():
             return torch.device("cuda", 0)
         return None
+
+    def partially_unload_ram(self, ram_to_unload):
+        """RAM-pin eviction hook (free_memory'spins_to_free' path).
+
+        GGML sessions don't expose per-tensor offload, so we can't partially
+        free pinned RAM. Return 0 (nothing freed) — ComfyUI's free_memory
+        doesn't check the return value here, so this is a safe no-op.
+        """
+        return 0
+
+    def model_mmap_residency(self, free=False):
+        """Return (resident_bytes, total_bytes) for free_memory's accounting.
+
+        GGML weight buffers aren't torch mmap-pools — once a Session is
+        loaded, ALL weights are resident in VRAM. So resident equals total
+        when alive, 0 when evicted. ``free=True`` is a no-op (we don't
+        pool mmap'd pages that can be selectively dropped).
+        """
+        total = self._managed._estimated_vram
+        if self._managed._session is not None:
+            return (total, total)
+        return (0, total)
+
+    def pinned_memory_size(self) -> int:
+        """Pinned-host-memory used by this model. GGML allocates CUDA-host
+        buffers for some weights; we don't track that separately. Report 0
+        so load_models_gpu budgets nothing for pins."""
+        return 0
 
 
 class AudiocoreLoadedModel:
@@ -473,6 +503,12 @@ class AudiocoreLoadedModel:
 
     def model_memory_required(self, device) -> int:
         return self.model_memory()
+
+    def model_mmap_residency(self, free=False):
+        """Delegate to the patcher stub — required by free_memory /
+        unload_all_models since ComfyUI v0.3.x. See
+        ``_AudiocorePatcherStub.model_mmap_residency`` for semantics."""
+        return self._patcher.model_mmap_residency(free=free)
 
     def model_load(self, lowvram_model_memory=0, force_patch_weights=False):
         return self  # already loaded — nothing to do

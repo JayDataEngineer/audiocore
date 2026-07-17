@@ -1,0 +1,16 @@
+{
+  "1": {
+    "class_type": "LoadAudiocoreModel",
+    "inputs": {
+      "family": "moss_sfx_v2",
+      "model_path": "moss-sfx-v2",
+      "backend": "ggml_cuda"
+    }
+  },
+  "2": {
+    "class_type": "AudiocoreFamilyInfo",
+    "inputs": {
+      "model": ["1", 0]
+    }
+  }
+}

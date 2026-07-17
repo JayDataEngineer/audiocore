@@ -1,0 +1,25 @@
+{
+  "1": {
+    "class_type": "LoadAudiocoreModel",
+    "inputs": {
+      "family": "ace_step",
+      "model_path": "acestep-cpp-converted",
+      "backend": "ggml_cuda"
+    }
+  },
+  "2": {
+    "class_type": "AudiocoreMusic",
+    "inputs": {
+      "model": ["1", 0],
+      "caption": "calm lo-fi piano with soft vinyl crackle",
+      "duration": 10.0
+    }
+  },
+  "3": {
+    "class_type": "SaveAudio",
+    "inputs": {
+      "audio": ["2", 0],
+      "filename_prefix": "audiocore_test_ace_step"
+    }
+  }
+}

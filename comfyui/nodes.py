@@ -471,30 +471,55 @@ class UnloadAudiocoreModel:
 # ── Node: Audiocore Family Info ──────────────────────────────────────────────
 
 class AudiocoreFamilyInfo:
-    """List registered audiocore families (for debugging / discovery)."""
+    """List registered audiocore families (for debugging / discovery).
+
+    When wired downstream of LoadAudiocoreModel (via the optional ``model``
+    input), the report also includes the currently-active session's family,
+    path, and backend — useful as a load verification sink in workflows
+    that don't otherwise produce an output artifact.
+    """
 
     TITLE = "Audiocore Family Info"
     CATEGORY = "audio/audiocore"
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("info",)
     FUNCTION = "info"
+    OUTPUT_NODE = True
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {
+            "required": {},
+            "optional": {
+                # Accepting the model handle makes this node a valid sink for
+                # load-only graphs (ComfyUI requires an OUTPUT_NODE terminator).
+                "model": ("AUDIOCORE_MODEL",),
+            },
+        }
 
-    def info(self):
+    def info(self, model=None):
         try:
             init()
         except Exception as e:
-            return (f"audiocore not available: {e}",)
+            text = f"audiocore not available: {e}"
+            return {"ui": {"text": [text]}, "result": (text,)}
         import audiocore
         families = audiocore.list_families()
         lines = [f"Registered families: {', '.join(families) or '(none)'}"]
         for f in families:
             display = FAMILY_NAMES.get(f, f)
             lines.append(f"  {f} -> {display}")
-        return ("\n".join(lines),)
+        # When chained after LoadAudiocoreModel, surface what's actually live.
+        if model is not None and getattr(model, "loaded", False):
+            lines.append("")
+            lines.append(
+                f"Active session: family={model.family} "
+                f"path={model.path} backend={model.backend}"
+            )
+        text = "\n".join(lines)
+        # OUTPUT_NODE convention: {"ui": {...}, "result": (...)} so the text
+        # appears in /history outputs as node_output["text"].
+        return {"ui": {"text": [text]}, "result": (text,)}
 
 
 # ── Mappings ─────────────────────────────────────────────────────────────────

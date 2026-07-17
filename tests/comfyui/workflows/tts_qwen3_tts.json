@@ -1,0 +1,25 @@
+{
+  "1": {
+    "class_type": "LoadAudiocoreModel",
+    "inputs": {
+      "family": "qwen3_tts",
+      "model_path": "qwen3-tts",
+      "backend": "ggml_cuda"
+    }
+  },
+  "2": {
+    "class_type": "AudiocoreTTS",
+    "inputs": {
+      "model": ["1", 0],
+      "text": "Hello from qwen3_tts.",
+      "mode": "tts"
+    }
+  },
+  "3": {
+    "class_type": "SaveAudio",
+    "inputs": {
+      "audio": ["2", 0],
+      "filename_prefix": "audiocore_test_qwen3_tts"
+    }
+  }
+}

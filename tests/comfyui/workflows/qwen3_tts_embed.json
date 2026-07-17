@@ -1,0 +1,34 @@
+{
+  "1": {
+    "class_type": "LoadAudiocoreModel",
+    "inputs": {
+      "family": "qwen3_tts",
+      "model_path": "qwen3-tts",
+      "backend": "ggml_cuda",
+      "extras": "{\"speaker_encoder_path\": \"/mnt/data/models/audio/qwen3_tts/qwen3tts-speaker-encoder.gguf\"}"
+    }
+  },
+  "2": {
+    "class_type": "AudiocoreVoiceEmbedding",
+    "inputs": {
+      "model": ["1", 0],
+      "wav_path": "/mnt/data/models/test_moss_output.wav"
+    }
+  },
+  "3": {
+    "class_type": "AudiocoreTTS",
+    "inputs": {
+      "model": ["1", 0],
+      "text": "Voice cloning test with a computed speaker embedding.",
+      "mode": "clone",
+      "speaker_embedding": ["2", 0]
+    }
+  },
+  "4": {
+    "class_type": "SaveAudio",
+    "inputs": {
+      "audio": ["3", 0],
+      "filename_prefix": "audiocore_test_qwen3_embed"
+    }
+  }
+}
