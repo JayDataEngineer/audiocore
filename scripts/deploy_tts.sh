@@ -16,7 +16,8 @@
 # =============================================================================
 set -euo pipefail
 
-AUDIOCORE="<AUDIOCORE_ROOT>"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AUDIOCORE="$(dirname "$SCRIPT_DIR")"
 REMOTE="ubuntu@TAILSCALE_HOST"
 RDIR="/opt/audiocore"
 PORT=39517

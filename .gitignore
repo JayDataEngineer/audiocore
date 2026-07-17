@@ -81,3 +81,21 @@ comfyui/
 
 # Saved Qwen3-TTS voice files (generated, up to 3.6GB each)
 *.qvoice
+
+# ─── Hardening (post-cleanup 2026-07-17) ────────────────────────────────────
+# Prevent dev session logs / stale runtime artifacts from sneaking into build/
+build/*.log
+build/*.log.*
+build/*.pid
+build/*.bak
+build/server.json*
+build/clips/
+
+# Prevent dev test-output accumulation
+Testing/
+
+# Voice fixture policy: only tests/fixtures/*.voice is tracked (intentional).
+# Root-level *.voice and webapp/clips/voices/*.voice are personal/experimental.
+/*.voice
+/webapp/clips/voices/
+/webapp/clips/archive_*/
