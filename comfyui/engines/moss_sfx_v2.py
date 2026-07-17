@@ -35,6 +35,38 @@ def _ensure_upstream_on_path() -> None:
     _UPSTREAM_LOADED = True
 
 
+def _disable_torch_compile() -> None:
+    """Make torch.compile a no-op BEFORE the upstream pipeline imports.
+
+    The upstream `model_fn_wan_video` is decorated with
+    `@torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)`.
+    On torch 2.11 + CUDA 12.8 the cudagraphs path calls
+    `torch._C._cuda_checkPoolLiveAllocations`, which is incompatible with
+    `cudaMallocAsync` (the default CUDA allocator backend) and crashes with:
+
+        RuntimeError: cudaMallocAsync does not yet support
+        checkPoolLiveAllocations.
+
+    Setting `torch._dynamo.config.disable = True` BEFORE the upstream
+    module is imported turns the `@torch.compile(...)` decorator into a
+    no-op, so `model_fn_wan_video` runs eagerly. Inference is still fast
+    (~10 it/s on a 4090) and numerically identical to the compiled path.
+
+    Must run before `from moss_soundeffect_v2 import MossSoundEffectPipeline`
+    so the decorator is a no-op at function-definition time.
+    """
+    try:
+        import torch._dynamo
+        if not torch._dynamo.config.disable:
+            torch._dynamo.config.disable = True
+            logger.info(
+                "moss_sfx_v2: disabled torch.compile globally "
+                "(cudaMallocAsync + cudagraphs checkPoolLiveAllocations "
+                "incompatibility in this container); running eagerly")
+    except Exception:
+        logger.debug("moss_sfx_v2: could not set torch._dynamo.config.disable")
+
+
 def _patch_sage_attention_off() -> None:
     """Disable SageAttention in the upstream DiT module.
 
@@ -96,6 +128,11 @@ class MossSfxV2Engine:
             )
 
         _ensure_upstream_on_path()
+        # Disable torch.compile BEFORE importing the upstream pipeline so
+        # its @torch.compile decorator becomes a no-op. See
+        # _disable_torch_compile for the cudaMallocAsync rationale.
+        _disable_torch_compile()
+
         try:
             from moss_soundeffect_v2 import MossSoundEffectPipeline
         except ImportError as e:
