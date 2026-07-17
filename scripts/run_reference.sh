@@ -13,17 +13,17 @@ if [ -f "$PROJECT_DIR/config/secrets.env" ]; then
 fi
 
 # Point PYTHONPATH to the vendor (upstream code) + our shim
-VENDOR_DIR="<RAY_ROOT>/vendor/moss-tts-v2"
+VENDOR_DIR="<MOSS_TTS_VENDOR>"
 export PYTHONPATH="$PROJECT_DIR:$VENDOR_DIR:$PYTHONPATH"
 
 # Download the audio tokenizer ONNX if not already cached locally
-HF_CACHE_ONNX="<HF_ONNX_CACHE>"
+HF_CACHE_ONNX="<HF_CACHE_ONNX>"
 if [ ! -d "$WEIGHTS/MOSS-Audio-Tokenizer-ONNX" ]; then
     ln -sfn "$HF_CACHE_ONNX" "$WEIGHTS/MOSS-Audio-Tokenizer-ONNX"
 fi
 
 # Also ensure GGUF symlink
-HF_CACHE_GGUF="<HF_GGUF_CACHE>"
+HF_CACHE_GGUF="<HOME>25f5ba2ad752292821ad51c4ee590f21373ff"
 if [ ! -d "$WEIGHTS/MOSS-TTS-GGUF" ]; then
     ln -sfn "$HF_CACHE_GGUF" "$WEIGHTS/MOSS-TTS-GGUF"
 fi

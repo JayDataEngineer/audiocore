@@ -38,7 +38,7 @@ int main() {
 
     const char* env_dir = std::getenv("ACESTEP_DIR");
     std::string model_dir = env_dir ? env_dir
-        : "<AUDIOCORE_ROOT>/weights/ace_step/ace-step-1.5-turbo/";
+        : "./weights/ace_step/ace-step-1.5-turbo/";
 
     const char* env_ngpu = std::getenv("ACESTEP_NGPU");
     std::string ngpu_str = env_ngpu ? env_ngpu : "-1";
