@@ -93,6 +93,5 @@ target_link_libraries(test_full_dit PRIVATE audiocore_framework)
 add_executable(test_mse2_e2e test_mse2_e2e.cpp)
 target_link_libraries(test_mse2_e2e PRIVATE audiocore_framework)
 
-# End-to-end Silero VAD test — loads silero_vad.gguf (~1.8MB), runs VAD on
 # a 16 kHz WAV. Soft-skips (return 77) if model/audio missing or if the
 # graph port hasn't landed yet (load returns "not implemented").
