@@ -48,8 +48,8 @@
           "min_vram_gb": 18,
           "files": [
             {
-              "name": "codec_shard_1",
-              "filename": "model-00001-of-00002.safetensors",
+              "name": "codec_model",
+              "filename": "codec.safetensors",
               "source": {
                 "provider": "huggingface",
                 "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -58,38 +58,8 @@
               }
             },
             {
-              "name": "codec_shard_2",
-              "filename": "model-00002-of-00002.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "codec_index",
-              "filename": "model.safetensors.index.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "codec_config",
-              "filename": "config.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "upstream_shard_1",
-              "filename": "model-00001-of-00004.safetensors",
+              "name": "upstream_model",
+              "filename": "model.safetensors",
               "source": {
                 "provider": "huggingface",
                 "repo": "OpenMOSS-Team/MOSS-TTS",
@@ -97,59 +67,6 @@
                 "subpath": ""
               },
               "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_shard_2",
-              "filename": "model-00002-of-00004.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_shard_3",
-              "filename": "model-00003-of-00004.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_shard_4",
-              "filename": "model-00004-of-00004.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_index",
-              "filename": "model.safetensors.index.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "upstream_config",
-              "filename": "config.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              }
             }
           ],
           "status_note": "Downloads original upstream safetensors from OpenMOSS-Team/MOSS-TTS + codec from OpenMOSS-Team/MOSS-Audio-Tokenizer. convert_moss_tts.py extracts the Qwen3 backbone, runs llama.cpp's convert_hf_to_gguf.py, then writes a sidecar .extras.gguf with audio embeddings + LM heads + codec tensors. Quantize the backbone afterward with llama-quantize.",
@@ -164,8 +81,8 @@
           "min_vram_gb": 10,
           "files": [
             {
-              "name": "codec_shard_1",
-              "filename": "model-00001-of-00002.safetensors",
+              "name": "codec_model",
+              "filename": "codec.safetensors",
               "source": {
                 "provider": "huggingface",
                 "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -174,98 +91,16 @@
               }
             },
             {
-              "name": "codec_shard_2",
-              "filename": "model-00002-of-00002.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "codec_index",
-              "filename": "model.safetensors.index.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "codec_config",
-              "filename": "config.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "upstream_shard_1",
-              "filename": "model-00001-of-00004.safetensors",
+              "name": "upstream_model",
+              "filename": "model.safetensors",
               "source": {
                 "provider": "huggingface",
                 "repo": "OpenMOSS-Team/MOSS-TTS",
                 "revision": "main",
                 "subpath": ""
               },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_shard_2",
-              "filename": "model-00002-of-00004.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_shard_3",
-              "filename": "model-00003-of-00004.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_shard_4",
-              "filename": "model-00004-of-00004.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_index",
-              "filename": "model.safetensors.index.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "upstream_config",
-              "filename": "config.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-TTS",
-                "revision": "main",
-                "subpath": ""
-              }
+              "post_process": "convert_moss_tts",
+              "post_quantize": "Q4_K_M"
             }
           ],
           "server_config": {
@@ -310,28 +145,8 @@
           ],
           "files": [
             {
-              "name": "codec_shard_1",
-              "filename": "model-00001-of-00002.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "codec_shard_2",
-              "filename": "model-00002-of-00002.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "codec_index",
-              "filename": "model.safetensors.index.json",
+              "name": "codec_model",
+              "filename": "codec.safetensors",
               "source": {
                 "provider": "huggingface",
                 "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -348,17 +163,8 @@
                 "revision": "main",
                 "subpath": ""
               },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_config",
-              "filename": "config.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-VoiceGenerator",
-                "revision": "main",
-                "subpath": ""
-              }
+              "post_process": "convert_moss_tts",
+              "post_quantize": "Q8_0"
             }
           ],
           "server_config": {
@@ -375,8 +181,8 @@
           ],
           "files": [
             {
-              "name": "codec_shard_1",
-              "filename": "model-00001-of-00002.safetensors",
+              "name": "codec_model",
+              "filename": "codec.safetensors",
               "source": {
                 "provider": "huggingface",
                 "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
@@ -385,38 +191,8 @@
               }
             },
             {
-              "name": "codec_shard_2",
-              "filename": "model-00002-of-00002.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "codec_index",
-              "filename": "model.safetensors.index.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "codec_config",
-              "filename": "config.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "upstream_shard_1",
-              "filename": "model-00001-of-00004.safetensors",
+              "name": "upstream_model",
+              "filename": "model.safetensors",
               "source": {
                 "provider": "huggingface",
                 "repo": "OpenMOSS-Team/MOSS-SoundEffect",
@@ -424,59 +200,6 @@
                 "subpath": ""
               },
               "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_shard_2",
-              "filename": "model-00002-of-00004.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
-                "revision": "main",
-                "subpath": ""
-              },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_shard_3",
-              "filename": "model-00003-of-00004.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
-                "revision": "main",
-                "subpath": ""
-              },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_shard_4",
-              "filename": "model-00004-of-00004.safetensors",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
-                "revision": "main",
-                "subpath": ""
-              },
-              "post_process": "convert_moss_tts"
-            },
-            {
-              "name": "upstream_index",
-              "filename": "model.safetensors.index.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
-                "revision": "main",
-                "subpath": ""
-              }
-            },
-            {
-              "name": "upstream_config",
-              "filename": "config.json",
-              "source": {
-                "provider": "huggingface",
-                "repo": "OpenMOSS-Team/MOSS-SoundEffect",
-                "revision": "main",
-                "subpath": ""
-              }
             }
           ],
           "server_config": {
