@@ -25,8 +25,6 @@
 #include "audiocore/framework/runtime/tasks.h"
 #include "audiocore/framework/audio/dsp.h"   // pitch_shift, change_speed
 #include "audiocore/models/ace_step/family.h"    // MusicRequest / MusicResponse
-#include "audiocore/server/acestep_proxy.h"     // reference ace-server proxy
-#include "audiocore/server/qwen3tts_proxy.h"    // reference qwen_tts-server proxy
 #ifdef AUDIOCORE_ENABLE_MP3
 #include "audiocore/framework/io/mp3_encoder.h"
 #endif
@@ -490,18 +488,10 @@ std::shared_ptr<httplib::Server> build_server(
         std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots,
         const std::string& clips_dir,
         std::shared_ptr<ModelRegistry> registry,
-        const std::string& weights_dir,
-        std::shared_ptr<std::unordered_map<std::string, AceStepProxyConfig>> acestep_proxies,
-        std::shared_ptr<std::unordered_map<std::string, Qwen3TtsProxyConfig>> qwen3tts_proxies) {
+        const std::string& weights_dir) {
     auto svr = std::make_shared<httplib::Server>();
     auto slots_ref = slots;
     auto registry_raw = registry.get();
-    auto proxies_ref = acestep_proxies ?
-        acestep_proxies :
-        std::make_shared<std::unordered_map<std::string, AceStepProxyConfig>>();
-    auto q3_proxies_ref = qwen3tts_proxies ?
-        qwen3tts_proxies :
-        std::make_shared<std::unordered_map<std::string, Qwen3TtsProxyConfig>>();
 
     // Auto-download state. Captured by the /v1/models/fetch* handlers.
     // repo_root is empty when scripts/fetch_models.sh can't be located — the
@@ -528,7 +518,7 @@ std::shared_ptr<httplib::Server> build_server(
             repo_root.c_str());
     }
 
-    svr->Get("/health", [slots_ref, proxies_ref, q3_proxies_ref](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/health", [slots_ref](const httplib::Request&, httplib::Response& res) {
         // Lightweight liveness + readiness probe. Counts are O(n_slots)
         // and lock-free (we only read booleans, no session deref), so this
         // is cheap enough for a k8s-style probe hitting it every few seconds.
@@ -537,11 +527,6 @@ std::shared_ptr<httplib::Server> build_server(
             ++total;
             if (slot->loaded) ++loaded;
         }
-        // Proxy models are always "loaded" (served by the external servers).
-        int proxy_count = static_cast<int>(proxies_ref->size());
-        int q3_proxy_count = static_cast<int>(q3_proxies_ref->size());
-        total  += proxy_count + q3_proxy_count;
-        loaded += proxy_count + q3_proxy_count;
         auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::steady_clock::now() - kServerStart)
                             .count();
@@ -556,13 +541,12 @@ std::shared_ptr<httplib::Server> build_server(
             {"uptime_s", static_cast<int64_t>(uptime_s)},
             {"models_total", total},
             {"models_loaded", loaded},
-            {"proxy_models", proxy_count + q3_proxy_count},
             {"webapp", kHasWebapp},
         };
         res.set_content(j.dump(), "application/json");
     });
 
-    svr->Get("/v1/models", [slots_ref, proxies_ref, q3_proxies_ref](const httplib::Request&, httplib::Response& res) {
+    svr->Get("/v1/models", [slots_ref](const httplib::Request&, httplib::Response& res) {
         json arr = json::array();
         for (const auto& [id, slot] : *slots_ref) {
             std::lock_guard<std::mutex> g(slot->mtx);
@@ -575,22 +559,6 @@ std::shared_ptr<httplib::Server> build_server(
         }
         // Proxy models are served by the reference servers, not loaded
         // locally. Surface them so the webapp can select them for generation.
-        for (const auto& [id, cfg] : *proxies_ref) {
-            arr.push_back({
-                {"id", id},
-                {"family", "ace_step"},
-                {"loaded", true},
-                {"backend", "acestep_proxy"},
-            });
-        }
-        for (const auto& [id, cfg] : *q3_proxies_ref) {
-            arr.push_back({
-                {"id", id},
-                {"family", "qwen3_tts"},
-                {"loaded", true},
-                {"backend", "qwen3tts_proxy"},
-            });
-        }
         res.set_content(json{{"object", "list"}, {"data", arr}}.dump(),
                         "application/json");
     });
@@ -906,116 +874,7 @@ std::shared_ptr<httplib::Server> build_server(
     });
 
     svr->Post("/v1/audio/speech",
-              [slots_ref, clips_dir, q3_proxies_ref](const httplib::Request& req, httplib::Response& res) {
-        // ── Qwen3-TTS proxy short-circuit ───────────────────────────────
-        // Models with backend="qwen3tts_proxy" are served by the external
-        // reference qwen_tts-server (VLM-verified clean audio). Parse the
-        // body early and forward the request instead of resolving a local
-        // slot — the proxy server does all the heavy lifting.
-        {
-            json body_peek;
-            bool body_ok = true;
-            try { body_peek = json::parse(req.body); }
-            catch (...) { body_ok = false; }
-            if (body_ok) {
-                const std::string model_id = body_peek.value("model", "");
-                auto qit = q3_proxies_ref->find(model_id);
-                if (qit != q3_proxies_ref->end()) {
-                    fprintf(stderr, "[speech] proxying '%s' → qwen_tts-server (%s)\n",
-                            model_id.c_str(), qit->second.server_url.c_str());
-
-                    TtsRequest tr;
-                    tr.text         = body_peek.value("input", "");
-                    tr.language     = body_peek.value("language", "");
-                    tr.voice_path   = body_peek.value("voice", "");
-                    tr.instruct     = body_peek.value("instruct", "");
-                    tr.speaker_name = body_peek.value("speaker", "");
-                    tr.speed        = body_peek.value("speed", 1.0f);
-                    tr.emotion      = body_peek.value("emotion", "");
-                    tr.voice_strength = body_peek.value("voice_strength", 1.0f);
-                    tr.expr_file      = body_peek.value("expr_file", "");
-                    tr.expr_weight    = body_peek.value("expr_weight", 1.0f);
-                    if (body_peek.contains("seed"))
-                        tr.seed = body_peek["seed"].get<int32_t>();
-                    if (body_peek.contains("temperature"))
-                        tr.temperature = body_peek["temperature"].get<float>();
-                    if (body_peek.contains("top_p"))
-                        tr.top_p = body_peek["top_p"].get<float>();
-                    if (body_peek.contains("top_k"))
-                        tr.text_top_k = body_peek["top_k"].get<int32_t>();
-                    if (body_peek.contains("repetition_penalty"))
-                        tr.repetition_penalty = body_peek["repetition_penalty"].get<float>();
-                    if (body_peek.contains("max_new_tokens"))
-                        tr.max_new_tokens = body_peek["max_new_tokens"].get<int32_t>();
-                    if (body_peek.contains("max_tokens"))
-                        tr.max_new_tokens = body_peek["max_tokens"].get<int32_t>();
-                    if (body_peek.contains("messages") && body_peek["messages"].is_array()) {
-                        for (const auto& m : body_peek["messages"]) {
-                            ChatMessage cm;
-                            cm.role    = m.value("role", "");
-                            cm.content = m.value("content", "");
-                            if (!cm.role.empty() && !cm.content.empty())
-                                tr.messages.push_back(std::move(cm));
-                        }
-                    }
-
-                    // ── Voice-bearing CLI path ─────────────────────────
-                    // If `voice` resolves to a saved .qvoice file in
-                    // voices_dir, shell out to the CLI binary with
-                    // --load-voice --icl-only --voice-strength --emotion.
-                    // This avoids per-request weight mutation in the
-                    // persistent reference server.
-                    std::vector<uint8_t> wav;
-                    std::string error;
-                    bool used_cli = false;
-
-                    if (!qit->second.voices_dir.empty() && !tr.voice_path.empty()) {
-                        // Check if voice matches a saved .qvoice.
-                        std::string qvpath = qit->second.voices_dir + "/" +
-                                             tr.voice_path + ".qvoice";
-                        struct stat st;
-                        if (stat(qvpath.c_str(), &st) == 0 && st.st_size > 0) {
-                            fprintf(stderr, "[speech] CLI path: voice=%s emotion=%s strength=%.2f\n",
-                                    tr.voice_path.c_str(), tr.emotion.c_str(), tr.voice_strength);
-                            wav = audiocore::qwen3tts_cli_generate(qit->second, tr, qvpath, &error);
-                            used_cli = true;
-                        }
-                    }
-
-                    if (!used_cli) {
-                        // Fallback: proxy to reference server.
-                        wav = audiocore::qwen3tts_proxy_generate(qit->second, tr, &error);
-                    }
-
-                    if (wav.empty()) {
-                        res.status = 502;
-                        json e = {{"error", "qwen_tts-server proxy failed"}, {"detail", error}};
-                        res.set_content(e.dump(), "application/json");
-                        return;
-                    }
-
-                    // Optional: save the clip to the library when the
-                    // caller asks (mirrors the local-slot path).
-                    bool save = body_peek.value("save", false);
-                    if (save && !clips_dir.empty()) {
-                        std::string fname = iso_timestamp_for_filename() + "_" +
-                                            model_id + ".wav";
-                        std::string fpath = clips_dir + "/" + fname;
-                        std::ofstream f(fpath, std::ios::binary);
-                        if (f.is_open()) {
-                            f.write(reinterpret_cast<const char*>(wav.data()), wav.size());
-                            res.set_header("X-Audiocore-Clip", fname);
-                            fprintf(stderr, "[speech] saved clip: %s\n", fpath.c_str());
-                        }
-                    }
-
-                    res.set_content(reinterpret_cast<const char*>(wav.data()),
-                                    wav.size(), "audio/wav");
-                    return;
-                }
-            }
-        }
-
+              [slots_ref, clips_dir](const httplib::Request& req, httplib::Response& res) {
         auto sg = resolve_slot(req, *slots_ref, res);
         if (!sg) return;
         const auto& body = sg->body;
@@ -1208,7 +1067,7 @@ std::shared_ptr<httplib::Server> build_server(
     });
 
     svr->Post("/v1/audio/music",
-              [slots_ref, clips_dir, proxies_ref](const httplib::Request& req, httplib::Response& res) {
+              [slots_ref, clips_dir](const httplib::Request& req, httplib::Response& res) {
         // Parse body early — proxy models don't need a loaded slot.
         json body;
         try { body = json::parse(req.body); }
@@ -1218,65 +1077,6 @@ std::shared_ptr<httplib::Server> build_server(
             return;
         }
         const std::string model_id = body.value("model", "");
-
-        // ── Check if this model is proxied to the reference ace-server ──
-        auto pit = proxies_ref->find(model_id);
-        if (pit != proxies_ref->end()) {
-            fprintf(stderr, "[music] proxying '%s' → ace-server (%s)\n",
-                    model_id.c_str(), pit->second.ace_server_url.c_str());
-
-            acestep::MusicRequest mr;
-            mr.caption  = body.value("caption", body.value("prompt", ""));
-            mr.lyrics   = body.value("lyrics", body.value("prompt_lyrics", ""));
-            mr.duration = body.value("duration", 30.0f);
-            if (body.contains("seed"))           mr.seed              = body["seed"].get<int32_t>();
-            if (body.contains("guidance_scale")) mr.guidance_scale    = body["guidance_scale"].get<float>();
-            if (body.contains("steps"))          mr.n_diffusion_steps = body["steps"].get<int32_t>();
-            if (body.contains("temperature"))    mr.temperature       = body["temperature"].get<float>();
-            if (body.contains("top_p"))          mr.top_p             = body["top_p"].get<float>();
-            if (body.contains("bpm"))            mr.bpm               = body["bpm"].get<int32_t>();
-            if (body.contains("keyscale"))       mr.keyscale          = body["keyscale"].get<std::string>();
-            if (body.contains("timesignature"))  mr.timesignature     = body["timesignature"].get<std::string>();
-            if (body.contains("vocal_language")) mr.vocal_language    = body["vocal_language"].get<std::string>();
-            if (body.contains("language"))       mr.vocal_language    = body["language"].get<std::string>();
-            if (body.contains("lm_cfg_scale"))   mr.lm_cfg_scale      = body["lm_cfg_scale"].get<float>();
-
-            auto proxy_cfg = pit->second;
-            // Allow per-request dit_variant override.
-            if (body.contains("dit_variant"))
-                proxy_cfg.dit_variant = body["dit_variant"].get<std::string>();
-            // Allow per-request VAE swap (e.g. "vae-scrag-BF16.gguf" or "vae-BF16.gguf").
-            if (body.contains("vae") && body["vae"].is_string())
-                proxy_cfg.vae_override = body["vae"].get<std::string>();
-            // Allow clearing the VAE override by sending null.
-            if (body.contains("vae") && body["vae"].is_null())
-                proxy_cfg.vae_override.clear();
-
-            std::string error;
-            auto wav = acestep_proxy_generate(proxy_cfg, mr, &error);
-            if (wav.empty()) {
-                res.status = 502;
-                json e = {{"error", "ace-server proxy failed"}, {"detail", error}};
-                res.set_content(e.dump(), "application/json");
-                return;
-            }
-
-            // Save clip to clips_dir.
-            if (!clips_dir.empty()) {
-                std::string fname = iso_timestamp_for_filename() + "_" +
-                                    model_id + ".wav";
-                std::string fpath = clips_dir + "/" + fname;
-                std::ofstream f(fpath, std::ios::binary);
-                if (f.is_open()) {
-                    f.write(reinterpret_cast<const char*>(wav.data()), wav.size());
-                    fprintf(stderr, "[music] saved clip: %s\n", fpath.c_str());
-                }
-            }
-
-            res.set_content(reinterpret_cast<const char*>(wav.data()),
-                            wav.size(), "audio/wav");
-            return;
-        }
 
         // ── Normal path: our own ACE-Step or other music model ──
         auto sg = resolve_slot(req, *slots_ref, res);
@@ -2660,257 +2460,6 @@ std::shared_ptr<httplib::Server> build_server(
                     return;
                 }
                 res.set_content(output, "application/json");
-            });
-
-            // ── Qwen3-TTS .qvoice routes ─────────────────────────────────
-            // GET /v1/qvoices — list saved .qvoice files from the qwen3tts
-            // proxy's voices_dir. Returns name, path, size for each.
-            svr->Get("/v1/qvoices", [q3_proxies_ref](const httplib::Request&, httplib::Response& res) {
-                json arr = json::array();
-                for (const auto& [id, cfg] : *q3_proxies_ref) {
-                    auto voices = audiocore::qwen3tts_list_voices(cfg);
-                    for (const auto& v : voices) {
-                        arr.push_back({
-                            {"name", v.name},
-                            {"path", v.path},
-                            {"size", v.size_bytes},
-                            {"model_id", id},
-                        });
-                    }
-                }
-                res.set_content(json{{"voices", arr}}.dump(), "application/json");
-            });
-
-            // POST /v1/voice/export — generate a voice via VoiceDesign and
-            // bake it into a .qvoice file with the Base model.
-            // Body: {name, instruct, text?, wdelta?}
-            // If wdelta=true, creates a heavy WDELTA voice (~0.8-3GB)
-            // that supports voice_strength. Default: lite graft (~25MB).
-            svr->Post("/v1/voice/export", [q3_proxies_ref](const httplib::Request& req, httplib::Response& res) {
-                json body;
-                try { body = json::parse(req.body); } catch (...) {
-                    res.status = 400;
-                    res.set_content(R"({"error":"invalid json"})", "application/json");
-                    return;
-                }
-                std::string name     = body.value("name", "");
-                std::string instruct = body.value("instruct", "");
-                std::string text     = body.value("text", "");
-                bool        wdelta   = body.value("wdelta", false);
-                if (name.empty() || instruct.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":"name and instruct required"})", "application/json");
-                    return;
-                }
-                // Use the first qwen3tts proxy config (there's typically one).
-                if (q3_proxies_ref->empty()) {
-                    res.status = 503;
-                    res.set_content(R"({"error":"no qwen3tts proxy configured"})", "application/json");
-                    return;
-                }
-                auto& cfg = q3_proxies_ref->begin()->second;
-                std::string error;
-                bool ok = audiocore::qwen3tts_cli_export_voice(cfg, name, instruct, text, &error, wdelta);
-                if (!ok) {
-                    res.status = 500;
-                    json e = {{"error", "voice export failed"}, {"detail", error}};
-                    res.set_content(e.dump(), "application/json");
-                    return;
-                }
-                std::string qvpath = cfg.voices_dir + "/" + name + ".qvoice";
-                struct stat st;
-                stat(qvpath.c_str(), &st);
-                json r = {{"ok", true}, {"name", name}, {"path", qvpath},
-                          {"size", static_cast<int64_t>(st.st_size)},
-                          {"wdelta", wdelta}};
-                res.set_content(r.dump(), "application/json");
-            });
-
-            // POST /v1/voice/rebake — Take existing voice, generate audio
-            // with emotion/instruct, re-bake as NEW voice with emotion baked in.
-            // Body: {source_voice, name, emotion?, instruct?, wdelta?}
-            svr->Post("/v1/voice/rebake", [q3_proxies_ref](const httplib::Request& req, httplib::Response& res) {
-                json body;
-                try { body = json::parse(req.body); } catch (...) {
-                    res.status = 400;
-                    res.set_content(R"({"error":"invalid json"})", "application/json");
-                    return;
-                }
-                std::string source = body.value("source_voice", "");
-                std::string name   = body.value("name", "");
-                std::string emotion  = body.value("emotion", "");
-                std::string instruct = body.value("instruct", "");
-                bool wdelta = body.value("wdelta", false);
-                if (source.empty() || name.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":"source_voice and name required"})", "application/json");
-                    return;
-                }
-                if (q3_proxies_ref->empty()) {
-                    res.status = 503;
-                    res.set_content(R"({"error":"no qwen3tts proxy configured"})", "application/json");
-                    return;
-                }
-                auto& cfg = q3_proxies_ref->begin()->second;
-
-                // Step 1: Generate emotional audio from source voice.
-                std::string tmp_wav = "/tmp/audiocore_rebake_" + std::to_string(getpid()) + ".wav";
-                std::string sample_text = "Hello, I am speaking with emotion. This is my voice.";
-                {
-                    std::string src_path = cfg.voices_dir + "/" + source + ".qvoice";
-                    struct stat st;
-                    if (stat(src_path.c_str(), &st) != 0) {
-                        res.status = 404;
-                        res.set_content(R"({"error":"source voice not found"})", "application/json");
-                        return;
-                    }
-                    bool is_heavy = (st.st_size > 100 * 1024 * 1024);
-                    std::vector<std::string> argv = {
-                        cfg.binary_path, "-d", cfg.customvoice_dir,
-                        "--load-voice", src_path,
-                    };
-                    if (!is_heavy) argv.push_back("--icl-only");
-                    argv.push_back("--text");
-                    argv.push_back(sample_text);
-                    argv.push_back("-o");
-                    argv.push_back(tmp_wav);
-                    argv.push_back("-T");
-                    argv.push_back("0.9");
-                    argv.push_back("-p");
-                    argv.push_back("1.0");
-                    argv.push_back("-k");
-                    argv.push_back("50");
-                    argv.push_back("--rep-penalty");
-                    argv.push_back("1.05");
-                    if (cfg.use_gpu) { argv.push_back("--backend"); argv.push_back("cuda"); }
-                    if (!emotion.empty()) { argv.push_back("--emotion"); argv.push_back(emotion); }
-                    if (!instruct.empty()) { argv.push_back("--instruct"); argv.push_back(instruct); }
-
-                    fprintf(stderr, "[voice/rebake] step1: generate from %s with emotion=%s\n",
-                            source.c_str(), emotion.c_str());
-                    auto env = audiocore::qwen3tts_build_cli_env(cfg);
-                    int rc = audiocore::qwen3tts_run_cli(cfg.binary_path, argv, env);
-                    if (rc != 0) { unlink(tmp_wav.c_str()); res.status = 500;
-                        json e = {{"error", "generate failed"}, {"detail", "exit " + std::to_string(rc)}};
-                        res.set_content(e.dump(), "application/json"); return; }
-                }
-
-                // Step 2: Re-bake emotional audio as new voice.
-                mkdir(cfg.voices_dir.c_str(), 0755);
-                // Auto-number on collision: foo → foo_2 → foo_3 → ...
-                std::string base_name = name;
-                std::string out_qvoice = cfg.voices_dir + "/" + name + ".qvoice";
-                {
-                    struct stat st;
-                    int seq = 2;
-                    while (stat(out_qvoice.c_str(), &st) == 0) {
-                        name = base_name + "_" + std::to_string(seq++);
-                        out_qvoice = cfg.voices_dir + "/" + name + ".qvoice";
-                    }
-                }
-                {
-                    std::vector<std::string> argv = {
-                        cfg.binary_path, "-d", cfg.base_dir,
-                        "--ref-audio", tmp_wav,
-                        "--voice-name", name,
-                        "--save-voice", out_qvoice,
-                    };
-                    if (wdelta) argv.push_back("--target-cv");
-                    if (cfg.use_gpu) { argv.push_back("--backend"); argv.push_back("cuda"); }
-
-                    fprintf(stderr, "[voice/rebake] step2: bake %s%s\n",
-                            name.c_str(), wdelta ? " (WDELTA)" : "");
-                    auto env = audiocore::qwen3tts_build_cli_env(cfg);
-                    int rc = audiocore::qwen3tts_run_cli(cfg.binary_path, argv, env);
-                    unlink(tmp_wav.c_str());
-                    if (rc != 0) { res.status = 500;
-                        json e = {{"error", "bake failed"}, {"detail", "exit " + std::to_string(rc)}};
-                        res.set_content(e.dump(), "application/json"); return; }
-                }
-
-                struct stat st;
-                stat(out_qvoice.c_str(), &st);
-                json r = {{"ok", true}, {"name", name}, {"path", out_qvoice},
-                          {"size", static_cast<int64_t>(st.st_size)}, {"wdelta", wdelta},
-                          {"emotion_baked", emotion}};
-                res.set_content(r.dump(), "application/json");
-            });
-
-            // POST /v1/voice/preview — VoiceDesign preview only (no bake).
-            // Body: {instruct, text?}. Returns WAV audio.
-            svr->Post("/v1/voice/preview", [q3_proxies_ref](const httplib::Request& req, httplib::Response& res) {
-                json body;
-                try { body = json::parse(req.body); } catch (...) {
-                    res.status = 400;
-                    res.set_content(R"({"error":"invalid json"})", "application/json");
-                    return;
-                }
-                std::string instruct = body.value("instruct", "");
-                std::string text     = body.value("text", "");
-                if (instruct.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":"instruct required"})", "application/json");
-                    return;
-                }
-                if (q3_proxies_ref->empty()) {
-                    res.status = 503;
-                    res.set_content(R"({"error":"no qwen3tts proxy configured"})", "application/json");
-                    return;
-                }
-                auto& cfg = q3_proxies_ref->begin()->second;
-                if (cfg.binary_path.empty() || cfg.voicedesign_dir.empty()) {
-                    res.status = 503;
-                    res.set_content(R"({"error":"VoiceDesign CLI not configured"})", "application/json");
-                    return;
-                }
-
-                std::string synth_text = text.empty()
-                    ? "Hello, I am a friendly voice assistant. How can I help you today?"
-                    : text;
-                std::string tmp_out = "/tmp/audiocore_preview_" + std::to_string(getpid()) + ".wav";
-
-                std::vector<std::string> argv = {
-                    cfg.binary_path,
-                    "-d", cfg.voicedesign_dir,
-                    "--voice-design",
-                    "--instruct", instruct,
-                    "--text", synth_text,
-                    "-o", tmp_out,
-                    "-T", "0.9",
-                    "-p", "1.0",
-                    "-k", "50",
-                    "--rep-penalty", "1.05",
-                };
-                if (cfg.use_gpu) {
-                    argv.push_back("--backend");
-                    argv.push_back("cuda");
-                }
-
-                fprintf(stderr, "[voice/preview] VoiceDesign gen instruct='%s...'\n",
-                        instruct.substr(0, 40).c_str());
-
-                auto env = audiocore::qwen3tts_build_cli_env(cfg);
-                int rc = audiocore::qwen3tts_run_cli(cfg.binary_path, argv, env);
-
-                if (rc != 0) {
-                    unlink(tmp_out.c_str());
-                    res.status = 500;
-                    json e = {{"error", "VoiceDesign CLI exited with code " + std::to_string(rc)}};
-                    res.set_content(e.dump(), "application/json");
-                    return;
-                }
-
-                auto wav = audiocore::qwen3tts_read_file(tmp_out);
-                unlink(tmp_out.c_str());
-                if (wav.empty()) {
-                    res.status = 500;
-                    res.set_content(R"({"error":"CLI produced no output"})", "application/json");
-                    return;
-                }
-
-                fprintf(stderr, "[voice/preview] ← %zu bytes WAV\n", wav.size());
-                res.set_content(reinterpret_cast<const char*>(wav.data()),
-                                wav.size(), "audio/wav");
             });
         }
     }

@@ -154,8 +154,6 @@ add_library(audiocore_framework STATIC
     # audiocore_server binary AND into the e2e HTTP test, so both share the
     # same routing code path.
     src/server/server.cpp
-    src/server/acestep_proxy.cpp
-    src/server/qwen3tts_proxy.cpp
 )
 if(ENGINE_ENABLE_MP3)
     target_sources(audiocore_framework PRIVATE src/framework/io/mp3_encoder.cpp)

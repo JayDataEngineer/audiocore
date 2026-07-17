@@ -24,8 +24,6 @@
 #include "audiocore/models/moss_tts/family.h"
 #include "audiocore/models/qwen3_tts/family.h"
 #include "audiocore/server/server.h"
-#include "audiocore/server/acestep_proxy.h"
-#include "audiocore/server/qwen3tts_proxy.h"
 
 namespace {
 
@@ -64,33 +62,6 @@ struct ServerConfig {
     std::string model_dir;
     std::string clips_dir;
     std::vector<ConfigModel> models;
-    // Reference ace-server proxy configuration.
-    struct AceProxyCfg {
-        std::string server_url = "http://localhost:8085";
-        std::string binary;      // path to ace-server executable
-        std::string models_dir;  // directory of GGUF files for ace-server
-        std::string library_dir; // LD_LIBRARY_PATH for ace-server
-        std::vector<std::string> extra_args;
-    };
-    bool has_proxy = false;
-    AceProxyCfg proxy;
-    // Reference qwen_tts server subprocess configuration.
-    struct Qwen3TtsProxyCfg {
-        std::string server_url = "http://localhost:8086";
-        std::string binary;      // path to qwen_tts executable
-        std::string model_dir;   // model directory for qwen_tts (-d)
-        std::string library_dir; // LD_LIBRARY_PATH for qwen_tts
-        std::vector<std::string> extra_args;
-        // CLI runner paths (for voice-bearing requests via shell-out).
-        std::string customvoice_dir;  // 1.7B-CustomVoice model dir
-        std::string voicedesign_dir;  // VoiceDesign model dir
-        std::string base_dir;         // 1.7B-Base model dir
-        std::string voices_dir;       // saved .qvoice files directory
-        bool        use_gpu = false;  // --backend cuda for CLI calls
-        int         gpu_device = 0;   // CUDA_VISIBLE_DEVICES
-    };
-    bool has_qwen3tts_proxy = false;
-    Qwen3TtsProxyCfg qwen3tts_proxy;
     // Lazy mode: register every model but load NONE at startup. Models are
     // materialised on first /v1/models/load request from the webapp. Keeps
     // VRAM free on small boxes and lets the server boot past a broken file.
@@ -141,39 +112,6 @@ bool load_config(const std::string& path, ServerConfig& out) {
             }
             out.models.push_back(std::move(cm));
         }
-    }
-    // Parse acestep_proxy config (reference ace-server subprocess).
-    if (j.contains("acestep_proxy") && j["acestep_proxy"].is_object()) {
-        const auto& p = j["acestep_proxy"];
-        out.has_proxy = true;
-        out.proxy.server_url  = p.value("server_url", out.proxy.server_url);
-        out.proxy.binary      = p.value("binary", "");
-        out.proxy.models_dir  = p.value("models_dir", "");
-        out.proxy.library_dir = p.value("library_dir", "");
-        if (p.contains("extra_args") && p["extra_args"].is_array()) {
-            for (const auto& a : p["extra_args"])
-                out.proxy.extra_args.push_back(a.get<std::string>());
-        }
-    }
-    // Parse qwen3tts_proxy config (reference qwen_tts subprocess).
-    if (j.contains("qwen3tts_proxy") && j["qwen3tts_proxy"].is_object()) {
-        const auto& p = j["qwen3tts_proxy"];
-        out.has_qwen3tts_proxy = true;
-        out.qwen3tts_proxy.server_url  = p.value("server_url", out.qwen3tts_proxy.server_url);
-        out.qwen3tts_proxy.binary      = p.value("binary", "");
-        out.qwen3tts_proxy.model_dir   = p.value("model_dir", "");
-        out.qwen3tts_proxy.library_dir = p.value("library_dir", "");
-        if (p.contains("extra_args") && p["extra_args"].is_array()) {
-            for (const auto& a : p["extra_args"])
-                out.qwen3tts_proxy.extra_args.push_back(a.get<std::string>());
-        }
-        // CLI runner paths (voice-bearing requests).
-        out.qwen3tts_proxy.customvoice_dir = p.value("customvoice_dir", "");
-        out.qwen3tts_proxy.voicedesign_dir = p.value("voicedesign_dir", "");
-        out.qwen3tts_proxy.base_dir        = p.value("base_dir", "");
-        out.qwen3tts_proxy.voices_dir      = p.value("voices_dir", "");
-        out.qwen3tts_proxy.use_gpu         = p.value("use_gpu", false);
-        out.qwen3tts_proxy.gpu_device      = p.value("gpu_device", 0);
     }
     return true;
 }
@@ -297,15 +235,8 @@ int main(int argc, char** argv) {
     // (CustomVoice/VoiceDesign), and any other multi-variant family.
     // Single-model families (e.g. moss_sfx) are always eager.
     //
-    // Models with backend="acestep_proxy" are NOT loaded locally — they are
-    // proxied to the reference ace-server. They are registered in the proxy
-    // map instead of the slots map.
     auto slots = std::make_shared<
         std::unordered_map<std::string, std::shared_ptr<ModelSlot>>>();
-    auto proxies = std::make_shared<
-        std::unordered_map<std::string, audiocore::AceStepProxyConfig>>();
-    auto qwen3_proxies = std::make_shared<
-        std::unordered_map<std::string, audiocore::Qwen3TtsProxyConfig>>();
     // --lazy / "lazy_models": defer ALL models (load on demand from webapp).
     const bool lazy_mode = cfg.lazy_models || lazy_flag;
 
@@ -313,50 +244,6 @@ int main(int argc, char** argv) {
     std::set<std::string> eager_families;
 
     for (const ConfigModel& m : cfg.models) {
-        // Proxy models skip local loading entirely.
-        if (m.backend == "acestep_proxy") {
-            audiocore::AceStepProxyConfig pc;
-            pc.ace_server_url = cfg.has_proxy ? cfg.proxy.server_url : "http://localhost:8085";
-            // Extract dit_variant from extras if present.
-            auto it = m.load_options.extras.find("dit_variant");
-            if (it != m.load_options.extras.end())
-                pc.dit_variant = it->second;
-            // Extract vae_override from extras if present (ScragVAE swap-in).
-            auto vit = m.load_options.extras.find("vae_override");
-            if (vit != m.load_options.extras.end())
-                pc.vae_override = vit->second;
-            (*proxies)[m.id] = pc;
-            std::fprintf(stderr,
-                "audiocore_server: proxy '%s' → ace-server (%s, dit=%s, vae=%s)\n",
-                m.id.c_str(), pc.ace_server_url.c_str(),
-                pc.dit_variant.empty() ? "auto" : pc.dit_variant.c_str(),
-                pc.vae_override.empty() ? "default" : pc.vae_override.c_str());
-            continue;
-        }
-        if (m.backend == "qwen3tts_proxy") {
-            audiocore::Qwen3TtsProxyConfig pc;
-            pc.server_url = cfg.has_qwen3tts_proxy
-                ? cfg.qwen3tts_proxy.server_url
-                : "http://localhost:8086";
-            pc.model_dir  = cfg.has_qwen3tts_proxy
-                ? cfg.qwen3tts_proxy.model_dir
-                : m.path;
-            // CLI runner paths (voice-bearing requests).
-            if (cfg.has_qwen3tts_proxy) {
-                pc.binary_path     = cfg.qwen3tts_proxy.binary;
-                pc.customvoice_dir = cfg.qwen3tts_proxy.customvoice_dir;
-                pc.voicedesign_dir = cfg.qwen3tts_proxy.voicedesign_dir;
-                pc.base_dir        = cfg.qwen3tts_proxy.base_dir;
-                pc.voices_dir      = cfg.qwen3tts_proxy.voices_dir;
-                pc.use_gpu         = cfg.qwen3tts_proxy.use_gpu;
-                pc.gpu_device      = cfg.qwen3tts_proxy.gpu_device;
-            }
-            (*qwen3_proxies)[m.id] = pc;
-            std::fprintf(stderr,
-                "audiocore_server: proxy '%s' → qwen_tts-server (%s)\n",
-                m.id.c_str(), pc.server_url.c_str());
-            continue;
-        }
         audiocore::ModelLoadRequest req;
         req.model_path = m.path;
         req.family_hint = m.family;
@@ -415,235 +302,10 @@ int main(int argc, char** argv) {
             "Booting anyway; /v1/audio/* will return 404 until a model is loaded.\n");
     }
 
-    // ── Start the reference ace-server subprocess (if configured) ──────────
-    // The proxy routes /v1/audio/music for backend="acestep_proxy" models to
-    // this external process. We fork/exec it with the configured GGUF
-    // directory + LD_LIBRARY_PATH, then block until /health responds.
-    pid_t ace_server_pid = -1;
-    if (cfg.has_proxy && !cfg.proxy.binary.empty()) {
-        std::fprintf(stderr,
-            "audiocore_server: starting ace-server subprocess\n"
-            "  binary     : %s\n"
-            "  models_dir : %s\n"
-            "  server_url : %s\n",
-            cfg.proxy.binary.c_str(),
-            cfg.proxy.models_dir.c_str(),
-            cfg.proxy.server_url.c_str());
-
-        ace_server_pid = fork();
-        if (ace_server_pid < 0) {
-            std::perror("fork");
-            return 1;
-        }
-        if (ace_server_pid == 0) {
-            // ── Child process ──
-            // Set LD_LIBRARY_PATH so ace-server finds its bundled ggml backend.
-            if (!cfg.proxy.library_dir.empty()) {
-                const char* old = std::getenv("LD_LIBRARY_PATH");
-                std::string lp = cfg.proxy.library_dir;
-                if (old && *old) lp += std::string(":") + old;
-                setenv("LD_LIBRARY_PATH", lp.c_str(), 1);
-            }
-            // Parse the port out of server_url to pass via --port.
-            // ace-server listens on 8085 by default; honor the configured URL.
-            std::string port_str;
-            {
-                auto colon = cfg.proxy.server_url.rfind(':');
-                if (colon != std::string::npos) {
-                    // Strip any trailing slash from the port portion.
-                    std::string tail = cfg.proxy.server_url.substr(colon + 1);
-                    auto slash = tail.find('/');
-                    port_str = slash == std::string::npos ? tail : tail.substr(0, slash);
-                }
-            }
-
-            std::vector<std::string> argv_str;
-            argv_str.push_back(cfg.proxy.binary);
-            if (!cfg.proxy.models_dir.empty()) {
-                argv_str.push_back("--models");
-                argv_str.push_back(cfg.proxy.models_dir);
-            }
-            if (!port_str.empty()) {
-                argv_str.push_back("--port");
-                argv_str.push_back(port_str);
-            }
-            for (const auto& a : cfg.proxy.extra_args)
-                argv_str.push_back(a);
-
-            std::vector<char*> argv_c;
-            argv_c.reserve(argv_str.size() + 1);
-            for (auto& s : argv_str) argv_c.push_back(&s[0]);
-            argv_c.push_back(nullptr);
-
-            // Redirect child stdout/stderr to the parent's so ace-server logs
-            // surface in our terminal alongside our own.
-            execv(cfg.proxy.binary.c_str(), argv_c.data());
-            // execv only returns on failure.
-            std::perror("execv(ace-server)");
-            std::_Exit(127);
-        }
-
-        // ── Parent: wait for ace-server /health ──
-        audiocore::AceStepProxyConfig hc;
-        hc.ace_server_url = cfg.proxy.server_url;
-        hc.timeout_seconds = 60;
-        bool healthy = false;
-        for (int attempt = 0; attempt < 120; ++attempt) {
-            // Bail early if the child died.
-            int status = 0;
-            pid_t w = waitpid(ace_server_pid, &status, WNOHANG);
-            if (w == ace_server_pid || (w == -1 && errno != EINTR)) {
-                std::fprintf(stderr,
-                    "audiocore_server: ace-server process exited (status=%d) — "
-                    "check model paths and library_dir\n", status);
-                ace_server_pid = -1;
-                break;
-            }
-            if (audiocore::acestep_proxy_health(hc)) {
-                healthy = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        if (healthy) {
-            std::fprintf(stderr,
-                "audiocore_server: ace-server healthy (pid=%d)\n", ace_server_pid);
-        } else if (ace_server_pid > 0) {
-            std::fprintf(stderr,
-                "audiocore_server: WARNING — ace-server did not become healthy "
-                "within 60s; proxy requests will fail until it starts.\n");
-        }
-    } else if (!proxies->empty()) {
-        // Proxies are configured but no binary — assume ace-server runs
-        // out-of-band (managed by a supervisor / separate terminal).
-        audiocore::AceStepProxyConfig hc;
-        hc.ace_server_url = cfg.has_proxy ? cfg.proxy.server_url : "http://localhost:8085";
-        if (audiocore::acestep_proxy_health(hc)) {
-            std::fprintf(stderr,
-                "audiocore_server: ace-server already running at %s\n",
-                hc.ace_server_url.c_str());
-        } else {
-            std::fprintf(stderr,
-                "audiocore_server: WARNING — %zu proxy model(s) configured but "
-                "ace-server is not reachable at %s. Start it manually or add an "
-                "\"acestep_proxy.binary\" to the config.\n",
-                proxies->size(), hc.ace_server_url.c_str());
-        }
-    }
-
-    // ── Start the reference qwen_tts subprocess (if configured) ──────────
-    // The proxy routes /v1/audio/speech for backend="qwen3tts_proxy" models to
-    // this external process. We fork/exec it with the model dir, then block
-    // until /v1/health responds.
-    pid_t qwen3tts_server_pid = -1;
-    if (cfg.has_qwen3tts_proxy && !cfg.qwen3tts_proxy.binary.empty()) {
-        std::fprintf(stderr,
-            "audiocore_server: starting qwen_tts-server subprocess\n"
-            "  binary     : %s\n"
-            "  model_dir  : %s\n"
-            "  server_url : %s\n",
-            cfg.qwen3tts_proxy.binary.c_str(),
-            cfg.qwen3tts_proxy.model_dir.c_str(),
-            cfg.qwen3tts_proxy.server_url.c_str());
-
-        qwen3tts_server_pid = fork();
-        if (qwen3tts_server_pid < 0) {
-            std::perror("fork");
-            return 1;
-        }
-        if (qwen3tts_server_pid == 0) {
-            // ── Child process ──
-            if (!cfg.qwen3tts_proxy.library_dir.empty()) {
-                const char* old = std::getenv("LD_LIBRARY_PATH");
-                std::string lp = cfg.qwen3tts_proxy.library_dir;
-                if (old && *old) lp += std::string(":") + old;
-                setenv("LD_LIBRARY_PATH", lp.c_str(), 1);
-            }
-            // Parse the port out of server_url to pass via --serve.
-            std::string port_str;
-            {
-                std::string u = cfg.qwen3tts_proxy.server_url;
-                auto colon = u.rfind(':');
-                if (colon != std::string::npos) {
-                    std::string tail = u.substr(colon + 1);
-                    auto slash = tail.find('/');
-                    port_str = slash == std::string::npos ? tail : tail.substr(0, slash);
-                }
-            }
-
-            std::vector<std::string> argv_str;
-            argv_str.push_back(cfg.qwen3tts_proxy.binary);
-            if (!cfg.qwen3tts_proxy.model_dir.empty()) {
-                argv_str.push_back("-d");
-                argv_str.push_back(cfg.qwen3tts_proxy.model_dir);
-            }
-            if (!port_str.empty()) {
-                argv_str.push_back("--serve");
-                argv_str.push_back(port_str);
-            }
-            for (const auto& a : cfg.qwen3tts_proxy.extra_args)
-                argv_str.push_back(a);
-
-            std::vector<char*> argv_c;
-            argv_c.reserve(argv_str.size() + 1);
-            for (auto& s : argv_str) argv_c.push_back(&s[0]);
-            argv_c.push_back(nullptr);
-
-            execv(cfg.qwen3tts_proxy.binary.c_str(), argv_c.data());
-            std::perror("execv(qwen_tts)");
-            std::_Exit(127);
-        }
-
-        // ── Parent: wait for qwen_tts /v1/health ──
-        audiocore::Qwen3TtsProxyConfig hc;
-        hc.server_url = cfg.qwen3tts_proxy.server_url;
-        hc.timeout_seconds = 120;
-        bool healthy = false;
-        for (int attempt = 0; attempt < 240; ++attempt) {
-            int status = 0;
-            pid_t w = waitpid(qwen3tts_server_pid, &status, WNOHANG);
-            if (w == qwen3tts_server_pid || (w == -1 && errno != EINTR)) {
-                std::fprintf(stderr,
-                    "audiocore_server: qwen_tts-server process exited (status=%d) — "
-                    "check model paths\n", status);
-                qwen3tts_server_pid = -1;
-                break;
-            }
-            if (audiocore::qwen3tts_proxy_health(hc)) {
-                healthy = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        if (healthy) {
-            std::fprintf(stderr,
-                "audiocore_server: qwen_tts-server healthy (pid=%d)\n",
-                qwen3tts_server_pid);
-        } else if (qwen3tts_server_pid > 0) {
-            std::fprintf(stderr,
-                "audiocore_server: WARNING — qwen_tts-server did not become healthy "
-                "within 120s; proxy requests will fail until it starts.\n");
-        }
-    } else if (!qwen3_proxies->empty()) {
-        audiocore::Qwen3TtsProxyConfig hc;
-        hc.server_url = cfg.has_qwen3tts_proxy ? cfg.qwen3tts_proxy.server_url : "http://localhost:8086";
-        if (audiocore::qwen3tts_proxy_health(hc)) {
-            std::fprintf(stderr,
-                "audiocore_server: qwen_tts-server already running at %s\n",
-                hc.server_url.c_str());
-        } else {
-            std::fprintf(stderr,
-                "audiocore_server: WARNING — %zu qwen3tts proxy model(s) configured "
-                "but qwen_tts-server is not reachable at %s. Start it manually or "
-                "add a \"qwen3tts_proxy.binary\" to the config.\n",
-                qwen3_proxies->size(), hc.server_url.c_str());
-        }
-    }
 
     // Pass registry + model dir so the webapp can load/unload models at runtime.
     // cfg.model_dir is the discovery scan root (may be empty in single-model mode).
-    auto svr = audiocore::build_server(slots, cfg.clips_dir, registry, cfg.model_dir,
-                                       proxies, qwen3_proxies);
+    auto svr = audiocore::build_server(slots, cfg.clips_dir, registry, cfg.model_dir);
 
     // Logger: skip per-byte noise from static-asset GETs (the browser fetches
     // /, /style.css, /app.js on every page load) and from /health probes

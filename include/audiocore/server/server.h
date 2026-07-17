@@ -9,8 +9,6 @@
 #include <unordered_map>
 
 #include "audiocore/framework/runtime/registry.h"
-#include "audiocore/server/acestep_proxy.h"
-#include "audiocore/server/qwen3tts_proxy.h"
 
 namespace audiocore {
 
@@ -33,9 +31,7 @@ std::shared_ptr<httplib::Server> build_server(
         std::shared_ptr<std::unordered_map<std::string, std::shared_ptr<ModelSlot>>> slots,
         const std::string& clips_dir = {},
         std::shared_ptr<ModelRegistry> registry = {},
-        const std::string& weights_dir = {},
-        std::shared_ptr<std::unordered_map<std::string, AceStepProxyConfig>> acestep_proxies = {},
-        std::shared_ptr<std::unordered_map<std::string, Qwen3TtsProxyConfig>> qwen3tts_proxies = {});
+        const std::string& weights_dir = {});
 
 // WAV encoders (exposed for unit testing).
 std::string pcm_mono_to_wav(const std::vector<float>& pcm, int32_t sr);
