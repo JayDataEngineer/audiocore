@@ -1,0 +1,27 @@
+{
+  "1": {
+    "class_type": "LoadAudiocoreModel",
+    "inputs": {
+      "family": "moss_sfx_v2",
+      "model_path": "moss-sfx-v2",
+      "backend": "ggml_cuda",
+      "extras": "{\"te_path\": \"/opt/audiocore/models/qwen3-te.gguf\"}"
+    }
+  },
+  "2": {
+    "class_type": "AudiocoreTTS",
+    "inputs": {
+      "model": ["1", 0],
+      "text": "heavy wooden door slamming shut with a deep thud",
+      "mode": "tts",
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "SaveAudio",
+    "inputs": {
+      "audio": ["2", 0],
+      "filename_prefix": "audiocore_test_moss_sfx_v2"
+    }
+  }
+}

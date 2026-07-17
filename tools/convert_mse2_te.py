@@ -52,6 +52,24 @@ HF_PER_LAYER = {
 }
 
 
+def _is_norm_tensor(gguf_name: str) -> bool:
+    """Norm weights must be F32 (llama.cpp convention; matches moss_tts).
+
+    The ggml CUDA binbcast dispatcher for `ggml_mul` (used by build_norm to
+    apply the per-channel scale after ggml_rms_norm) has an implicit
+    assumption that when src0 and dst are both F32, src1 is also F32. If src1
+    is F16 the kernel asserts with `nb10 % sizeof(src1_t) == 0` because the
+    F16 stride (2 bytes) is not a multiple of sizeof(float) (4 bytes). The
+    TE forward hits this on every layer's `attn_norm` mul.
+
+    Norm weights are small (hidden_size or head_dim floats per layer, ~1 MB
+    total for a 28-layer Qwen3-TE) so storing them as F32 has no meaningful
+    size cost and matches what llama.cpp's own convert scripts emit.
+    """
+    # Match all RMS/LayerNorm weights, including the q/k per-head norms.
+    return gguf_name.endswith("_norm.weight") or "_norm." in gguf_name
+
+
 def convert(args):
     model_dir = args.model_dir
     out_path = args.output
@@ -151,13 +169,29 @@ def convert(args):
     def to_f16(arr: np.ndarray) -> np.ndarray:
         return arr.astype(np.float16) if arr.dtype != np.float16 else arr
 
+    def to_f32(arr: np.ndarray) -> np.ndarray:
+        return arr.astype(np.float32) if arr.dtype != np.float32 else arr
+
+    def add_weight(writer, gguf_name, arr):
+        """Write a model weight with the llama.cpp-convention dtype.
+
+        Norm weights → F32 (see _is_norm_tensor for rationale).
+        Everything else → F16 (matches existing F16 layout).
+        """
+        if _is_norm_tensor(gguf_name):
+            t = to_f32(arr)
+            writer.add_tensor(gguf_name, t, raw_dtype=GGMLQuantizationType.F32)
+        else:
+            t = to_f16(arr)
+            writer.add_tensor(gguf_name, t, raw_dtype=GGMLQuantizationType.F16)
+        return t
+
     # Global tensors
     for hf_name, gguf_name in HF_TO_GGUF.items():
         if hf_name in state:
-            t = to_f16(state[hf_name])
-            writer.add_tensor(gguf_name, t, raw_dtype=GGMLQuantizationType.F16)
+            t = add_weight(writer, gguf_name, state[hf_name])
             written += 1
-            print(f"  [{written}] {gguf_name} ({t.shape})")
+            print(f"  [{written}] {gguf_name} ({t.shape}, {t.dtype})")
         else:
             print(f"  SKIP (not found): {hf_name}")
 
@@ -168,11 +202,10 @@ def convert(args):
             if hf_name not in state:
                 continue
             gguf_name = f"blk.{layer_idx}.{gguf_base}.{gguf_suffix}"
-            t = to_f16(state[hf_name])
-            writer.add_tensor(gguf_name, t, raw_dtype=GGMLQuantizationType.F16)
+            t = add_weight(writer, gguf_name, state[hf_name])
             written += 1
             if written <= 20 or written % 50 == 0:
-                print(f"  [{written}] {gguf_name} ({t.shape})")
+                print(f"  [{written}] {gguf_name} ({t.shape}, {t.dtype})")
 
     print(f"\n  Total tensors written: {written}")
     writer.write_header_to_file()

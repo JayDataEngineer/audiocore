@@ -310,6 +310,46 @@ def test_qwen3_tts_voice_embedding_roundtrip(
     )
 
 
+def test_moss_sfx_v2_inference_produces_valid_audio(
+    session, comfyui, submit, empty_queue, available_families
+):
+    """End-to-end sound-effect generation with moss_sfx_v2.
+
+    Real text prompt → real flow-matching DiT → real DAC VAE decode →
+    real PCM mono bytes on disk. The pipeline is:
+        text → Qwen3-TE → 512-dim context embeddings
+             → 50-step Euler flow-matching on a 1.3B DiT
+             → DAC VAE decoder (upsample factor 960)
+             → mono PCM at the VAE sample rate.
+
+    Requires the te_path sidecar (qwen3-te.gguf); without it the DiT
+    has no text conditioning and emits degenerate output. The workflow
+    file supplies te_path via LoadAudiocoreModel's extras field.
+    """
+    if "moss_sfx_v2" not in available_families:
+        pytest.skip("moss_sfx_v2 not registered in this build")
+    p = submit.queue(session, comfyui, "sfx_moss_sfx_v2.json")
+    history = submit.wait(session, comfyui, p, timeout=900)
+
+    assert history["status"].get("completed") is True, (
+        f"moss_sfx_v2 workflow failed: "
+        f"{history['status'].get('messages', [])[:3]}"
+    )
+    blob = _fetch_audio(session, comfyui, history, output_key="3")
+    fmt = _assert_valid_audio(blob, min_bytes=40_000)
+    duration = _audio_duration_seconds(blob, fmt) or 0.0
+    # moss_sfx_v2 emits ~10s clips per the manifest (duration_tokens=125 →
+    # 125 * 0.08s = 10s). Allow 5–25s tolerance for VAE rounding + encoder
+    # padding variation.
+    assert duration >= 5.0, (
+        f"moss_sfx_v2 audio too short: {duration:.2f}s "
+        f"({len(blob)} bytes {fmt}) — expected ~10s"
+    )
+    assert duration <= 25.0, (
+        f"moss_sfx_v2 audio too long: {duration:.2f}s — expected ~10s"
+    )
+
+
 @pytest.mark.xfail(
     reason=(
         "Inherits from test_moss_tts_inference_produces_valid_audio's known "

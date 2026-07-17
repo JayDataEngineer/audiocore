@@ -4,7 +4,8 @@
     "inputs": {
       "family": "moss_sfx_v2",
       "model_path": "moss-sfx-v2",
-      "backend": "ggml_cuda"
+      "backend": "ggml_cuda",
+      "extras": "{\"te_path\": \"/opt/audiocore/models/qwen3-te.gguf\"}"
     }
   },
   "2": {

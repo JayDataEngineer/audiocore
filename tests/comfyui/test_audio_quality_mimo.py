@@ -140,6 +140,74 @@ def test_ace_step_audio_passes_mimo_music_check(
     )
 
 
+def test_moss_sfx_v2_audio_passes_mimo_sfx_check(
+    session, comfyui, submit, empty_queue, available_families, mimo
+):
+    """Mimo must recognize the moss_sfx_v2 output as the prompted sound effect.
+
+    The workflow generates "heavy wooden door slamming shut with a deep thud".
+    Mimo is asked whether the clip contains a recognizable sound effect (not
+    silence, not music, not random noise) and to score fidelity 1–10.
+
+    This is the highest-level proof that moss_sfx_v2 "works" — not just that
+    it produces a valid FLAC of the right duration, but that the audio is
+    semantically on-prompt. Catches both the failure mode in test_inference
+    (wrong duration / corrupt file) AND semantic regressions (model emits
+    music or noise instead of the requested SFX).
+    """
+    _require_mimo(mimo)
+    if "moss_sfx_v2" not in available_families:
+        pytest.skip("moss_sfx_v2 not registered")
+
+    p = submit.queue(session, comfyui, "sfx_moss_sfx_v2.json")
+    history = submit.wait(session, comfyui, p, timeout=900)
+    assert history["status"].get("completed") is True, (
+        f"moss_sfx_v2 workflow failed: "
+        f"{history['status'].get('messages', [])[:3]}"
+    )
+
+    blob = _fetch_audio(session, comfyui, history, output_key="3")
+    _assert_valid_audio(blob, min_bytes=40_000)
+
+    sfx_question = (
+        "You are an audio quality expert. This clip should be a SOUND EFFECT "
+        "matching the prompt: 'heavy wooden door slamming shut with a deep "
+        "thud'. Listen carefully and judge whether the clip contains a "
+        "recognizable door-slam / thud sound effect (not silence, not music, "
+        "not random static). Respond with ONLY a JSON object — no prose, no "
+        "markdown fences — with this exact shape: "
+        "{\"sfx_present\": true|false, "
+        "\"matches_prompt\": true|false, "
+        "\"noise_level\": \"clean\"|\"moderate\"|\"noisy\", "
+        "\"clipping\": true|false, "
+        "\"quality_score\": <int 1-10>, "
+        "\"description\": \"<one sentence>\"}."
+    )
+    verdict = mimo.judge_audio_bytes(
+        blob, filename="moss_sfx_v2.flac", question=sfx_question
+    )
+    print(f"\nMimo verdict for moss_sfx_v2: {verdict}")
+    # Predicate: a recognizable sound effect is present, on-prompt, with
+    # acceptable noise/fidelity. Threshold 4 — moss_sfx_v2 is a 1.3B model
+    # and SFX fidelity at this scale is good-but-not-Hollywood-grade.
+    assert verdict.get("sfx_present") is True, (
+        f"moss_sfx_v2 audio: Mimo did not hear a sound effect: {verdict}"
+    )
+    assert verdict.get("matches_prompt") is True, (
+        f"moss_sfx_v2 audio: Mimo heard SFX but it didn't match the prompt: "
+        f"{verdict}"
+    )
+    assert verdict.get("noise_level") in ("clean", "moderate"), (
+        f"moss_sfx_v2 audio too noisy: {verdict}"
+    )
+    assert verdict.get("clipping") is not True, (
+        f"moss_sfx_v2 audio clipping: {verdict}"
+    )
+    assert int(verdict.get("quality_score", 0)) >= 4, (
+        f"moss_sfx_v2 audio quality too low: {verdict}"
+    )
+
+
 @pytest.mark.xfail(reason=("Inherits qwen3_tts cold-load crash from test_inference.test_qwen3_tts_voice_embedding_roundtrip. Remove xfail when the .so is rebuilt."), strict=False)
 def test_voice_clone_output_matches_reference_voice_gender(
     session, comfyui, submit, empty_queue, available_families, mimo
