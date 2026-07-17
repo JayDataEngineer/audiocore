@@ -147,7 +147,6 @@ int main() {
     // (loader.cpp probes <dir>/qwen3tts-speaker-encoder.gguf). Override with
     // QWEN3TTS_ENCODER to point at an arbitrary path. MUST be the 1024-dim
     // variant for Qwen3-TTS — the 2048-dim standalone ECAPA GGUF is wrong
-    // (see MODEL-GAPS.md Gap J / TO-DO SPK-1024).
     std::string enc_fn   = get_env("QWEN3TTS_ENCODER",   "qwen3tts-speaker-encoder.gguf");
     int    ngpu  = std::atoi(get_env("QWEN3TTS_NGPU",   "99").c_str());
     std::string backend  = get_env("QWEN3TTS_DEVICE",  "ggml_cuda");

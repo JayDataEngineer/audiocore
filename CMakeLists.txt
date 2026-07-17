@@ -261,7 +261,7 @@ target_link_libraries(convert_qwen3tts PRIVATE audiocore_framework)
 # Source: marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B (or any equivalent
 # EcapaTdnnSpeakerEncoder checkpoint). Produces ~23 MB GGUF with `speaker.*`
 # namespaced tensors that audiocore's Qwen3TtsSpeakerEncoder::bind() resolves
-# unchanged. See docs/MODEL-GAPS.md Gap J.
+# unchanged.
 add_executable(convert_ecapa tools/convert_ecapa.cpp)
 target_link_libraries(convert_ecapa PRIVATE audiocore_framework)
 

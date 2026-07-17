@@ -99,3 +99,7 @@ Testing/
 /*.voice
 /webapp/clips/voices/
 /webapp/clips/archive_*/
+
+# Local .git backup dirs (created before history rewrites). Never commit.
+/.git.backup-*
+/.git.modules.backup-*

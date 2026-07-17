@@ -170,7 +170,7 @@ std::unique_ptr<Runner> Runner::load(const std::string& gguf_path,
     // pairs (i, i+n/2)) after a cos/sin reorder. In TTS-only mode where all 3
     // multimodal axes share the same position id, IMROPE and NEOX produce
     // identical results. We force rope_type=NEOX in llama-model.cpp and use
-    // standard 1D positions here. See MODEL-GAPS.md Gap Q.
+    // standard 1D positions here.
     {
         const auto rt = llama_model_rope_type(self->model_);
         self->n_pos_per_embd_ = (rt == LLAMA_ROPE_TYPE_MROPE ||

@@ -162,8 +162,7 @@ public:
     //   (a) speaker embedding  +  (b) instruct emotion
     //   (c) text prompt        +  (d) high quality
     // — the gap that the Mastrapasqua `qwen3-tts` engine closes via its
-    // `.qvoice WOVR` section, ported here for our GGUF stack. See
-    // docs/QWEN3-TTS-GAPS.md §A4 and blog/cross-model-voice-analysis.md.
+    // `.qvoice WOVR` section, ported here for our GGUF stack.
     //
     // Returns true on success. *error receives a message on failure. Safe
     // to call multiple times — later calls re-overwrite with whatever the
