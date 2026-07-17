@@ -5,7 +5,7 @@
 **Engine:** audiocore (ggml/CUDA backend) for GGUF models; standalone PyTorch for MOSS-SoundEffect v2
 
 **See also:** [MODELS-SUPPORTED.md](MODELS-SUPPORTED.md) for which models run in
-C++ vs Python, and [MODEL-GAPS.md](MODEL-GAPS.md) for what's missing.
+C++ vs Python
 
 ---
 
@@ -330,7 +330,7 @@ by the TTS/SFX models above.
 |-----------|---------|-----|----------|---------|-------|
 | MOSS-Audio-Tokenizer | v1 | 24 kHz | mono | ✅ `moss-audio-tokenizer/` | Used by MOSS-TTS-Delay. Codec encoder/decoder. |
 | MOSS-Audio-Tokenizer Nano | v1 | 24 kHz | mono | ✅ `moss-audio-tokenizer-nano/` | Smaller variant. |
-| MOSS-Audio-Tokenizer | **v2** | **48 kHz** | **stereo** | ✅ downloaded | Used internally by MOSS-SFX v2 Python project (48 kHz stereo output). Not ported to GGML — see MODEL-GAPS.md Gap B for why a port would be needed (MOSS-TTS-Local-Transformer-v1.5). |
+| MOSS-Audio-Tokenizer | **v2** | **48 kHz** | **stereo** | ✅ downloaded | Used internally by MOSS-SFX v2 Python project (48 kHz stereo output). Not ported to GGML. |
 | Qwen3-TTS-Tokenizer-12Hz | — | 24 kHz | mono | ✅ `qwen3_tts/0.6b-base/tokenizer-f16.gguf` | Used by all Qwen3-TTS variants. GGUF port (codec decode fix above). |
 
 ### Release Notes
@@ -348,7 +348,7 @@ input and output (v1 was 24 kHz mono). Not yet integrated into audiocore.
 
 | Model | Status | Blocker |
 |-------|--------|---------|
-| MOSS-TTSD (dialogue) | Not downloaded | Same Delay architecture — needs HF download + GGUF conversion. See MODEL-GAPS.md Gap A |
-| MOSS-TTS-Local-Transformer-v1.5 | Not downloaded | New MossTTSLocal architecture (4B backbone, 48 kHz stereo). See MODEL-GAPS.md Gap B |
-| MOSS-TTS-Realtime | Not downloaded | MossTTSRealtime architecture — needs new code path. See MODEL-GAPS.md Gap C |
-| MOSS-TTS-Nano | Not downloaded | MossTTSNano architecture (~100M, CPU-first). See MODEL-GAPS.md Gap D |
+| MOSS-TTSD (dialogue) | Not downloaded | Same Delay architecture — needs HF download + GGUF conversion |
+| MOSS-TTS-Local-Transformer-v1.5 | Not downloaded | New MossTTSLocal architecture (4B backbone, 48 kHz stereo) |
+| MOSS-TTS-Realtime | Not downloaded | MossTTSRealtime architecture — needs new code path |
+| MOSS-TTS-Nano | Not downloaded | MossTTSNano architecture (~100M, CPU-first) |

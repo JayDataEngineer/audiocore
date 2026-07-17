@@ -225,7 +225,7 @@
         },
         "voice_clone": {
           "status": "wired",
-          "notes": "Stage 17b CLOSED (2026-07-03): ECAPA-TDNN speaker encoder loaded from standalone qwen3tts-speaker-encoder.gguf (~23 MB, converted from marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B via tools/convert_ecapa.cpp). Two paths: (a) reference_audio \u2192 compute_embedding \u2192 2048-dim vector cached for reuse; (b) speaker_embedding passed directly (voice-caching pattern). Vector flows through the talker's [spk_emb] prompt slot. End-to-end RTF 0.128 (matches Base \u2014 embedding injection is free). Note: the parallel ICL codec-encoder path (reference_audio \u2192 codec tokens) has a separate pre-existing bug \u2014 see MODEL-GAPS.md Gap K."
+          "notes": "Stage 17b CLOSED (2026-07-03): ECAPA-TDNN speaker encoder loaded from standalone qwen3tts-speaker-encoder.gguf (~23 MB, converted from marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B via tools/convert_ecapa.cpp). Two paths: (a) reference_audio \u2192 compute_embedding \u2192 2048-dim vector cached for reuse; (b) speaker_embedding passed directly (voice-caching pattern). Vector flows through the talker's [spk_emb] prompt slot. End-to-end RTF 0.128 (matches Base \u2014 embedding injection is free)."
         },
         "voice_design": {
           "status": "partial",

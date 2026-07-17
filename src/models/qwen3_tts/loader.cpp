@@ -240,7 +240,7 @@ bool Qwen3TtsSession::load(const std::string& model_path,
     // text_proj biases + codec_embedding in the loaded CV talker with Base's
     // versions. After the patch, CV accepts a continuous ECAPA embedding at
     // the speaker slot AND retains its instruct-tuned transformer norms.
-    // See Runner::apply_wdelta_patch docstring + QWEN3-TTS-GAPS.md §A4.
+    // See Runner::apply_wdelta_patch docstring.
     //
     // Enabled by default when CV + sibling Base is detected; opt out via
     // extras["wdelta_disable"]="1" (e.g. for A/B comparison).

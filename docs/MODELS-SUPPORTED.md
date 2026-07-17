@@ -44,11 +44,11 @@ Last updated: 2026-07-02
 | | **Qwen3-TTS-Tokenizer-25Hz** | ❌ Gap F³ | — | ❌ | — | — | — |
 | | XY_Tokenizer (TTSD codec) | ❌ | — | ✅ | HF safetensors | — | — |
 
-¹ **Gap G closed (2026-07-02):** ACE-Step 1.5 Base GGUF downloaded (`acestep-v15-base-Q8_0.gguf`, 2.4 GB) and added to manifest. Code patched in `loader.cpp` (`-base` substring detection, excluding `xl-base`) and `session.cpp` (50-step linear schedule for `"base"` variant). Benchmarked: RTF 10.49. See MODEL-GAPS.md Gap G.
+¹ **Gap G closed (2026-07-02):** ACE-Step 1.5 Base GGUF downloaded (`acestep-v15-base-Q8_0.gguf`, 2.4 GB) and added to manifest. Code patched in `loader.cpp` (`-base` substring detection, excluding `xl-base`) and `session.cpp` (50-step linear schedule for `"base"` variant). Benchmarked: RTF 10.49
 
-² **Gap H closed (2026-07-02):** ScragVAE GGUF downloaded (`scragvae-BF16.gguf`, 322 MB). Verified pure drop-in (365 tensors, identical names/shapes/architecture tag to stock `vae-BF16.gguf`). Added as `alternate_components.scragvae` in manifest. End-to-end run: RTF 3.70 with turbo DiT (same as stock — same architecture, only weights differ). To use: symlink `scragvae-BF16.gguf` → `vae-BF16.gguf` in the variant dir. See MODEL-GAPS.md Gap H.
+² **Gap H closed (2026-07-02):** ScragVAE GGUF downloaded (`scragvae-BF16.gguf`, 322 MB). Verified pure drop-in (365 tensors, identical names/shapes/architecture tag to stock `vae-BF16.gguf`). Added as `alternate_components.scragvae` in manifest. End-to-end run: RTF 3.70 with turbo DiT (same as stock — same architecture, only weights differ). To use: symlink `scragvae-BF16.gguf` → `vae-BF16.gguf` in the variant dir
 
-³ **Gap F (still open):** Qwen3-TTS-Tokenizer-25Hz is described in the Qwen3 technical report but **no public weights exist** on HuggingFace (only 12 Hz variants published). Paper-only release. See MODEL-GAPS.md Gap F.
+³ **Gap F (still open):** Qwen3-TTS-Tokenizer-25Hz is described in the Qwen3 technical report but **no public weights exist** on HuggingFace (only 12 Hz variants published). Paper-only release
 
 **Format cheat-sheet:**
 

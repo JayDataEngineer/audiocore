@@ -1,4 +1,4 @@
-# AGENTS.md
+# CLAUDE.md
 
 > **CRITICAL, you MUST verify ALL AUDIO OUTPUT with the VLM functions BEFORE YOU COMPLETE.**
 >
