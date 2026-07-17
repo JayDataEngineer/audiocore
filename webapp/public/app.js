@@ -3366,6 +3366,18 @@
         if (r.ok) {
           toast("Loaded " + id, "ok");
           await load_models();
+        } else if (j.fetchable) {
+          // Server says files are missing + auto-download is available.
+          // Offer the fetch UI instead of dumping a stack trace.
+          const fam = (j.fetch_payload && j.fetch_payload.family) || "?";
+          b.textContent = "Fetch & Load";
+          b.disabled = false;
+          b.classList.add("btn-warn");
+          b.dataset.fetchFamily = fam;
+          b.dataset.fetchModelId = id;
+          b.removeEventListener("click", arguments.callee, false);
+          b.addEventListener("click", () => open_fetch_dialog(id, fam), { once: true });
+          toast("Files missing for " + id + " (family: " + fam + "). Click Fetch & Load to download.", "warn", 8000);
         } else {
           toast("Load failed: " + (j.error || r.status), "err");
           b.disabled = false;
@@ -3378,6 +3390,141 @@
       }
     }));
   }
+
+  // ── Auto-download UI ──────────────────────────────────────────────
+  // Triggered when /v1/models/load returns fetchable:true. Prompts the
+  // user to pick a manifest variant, kicks off POST /v1/models/fetch, and
+  // polls GET /v1/models/fetch/status until the job finishes, then retries
+  // the load. The status widget at the top of the Models tab renders
+  // active downloads for all in-flight jobs (see render_fetch_status).
+  async function open_fetch_dialog(modelId, family) {
+    // Resolve a sensible default variant from the model id. The model id
+    // (from server.json) often matches a manifest variant key, but not
+    // always — when it doesn't, we leave the field blank for the user.
+    const guessVariant = (() => {
+      const id = (modelId || "").toLowerCase();
+      // ace-step-turbo → ace-step-1.5-turbo is the common default
+      if (id === "ace-step-turbo") return "ace-step-1.5-turbo";
+      if (id === "ace-step-base")  return "ace-step-1.5-base";
+      if (id === "moss-tts")       return "moss-tts-q4-k-m";
+      if (id === "moss-sfx")       return "moss-sfx-f16";
+      if (id === "moss-sfx-v2")    return "default";
+      if (id === "moss-voicegen")  return "moss-voicegen-q8_0";
+      // Qwen3-TTS proxy models have variants in HF format; leave blank.
+      if (id.indexOf("qwen3") >= 0) return "";
+      return modelId;
+    })();
+    const variant = prompt(
+      "Download model files for: " + modelId + "\n" +
+      "Family: " + family + "\n\n" +
+      "Enter the manifest variant name (see models/manifest.json):",
+      guessVariant
+    );
+    if (!variant) return;
+    try {
+      const r = await fetch("/v1/models/fetch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ family, variant }),
+      });
+      const j = await r.json();
+      if (r.status === 409) {
+        toast("Already downloading: " + j.id, "warn");
+      } else if (!r.ok) {
+        toast("Fetch failed: " + (j.error || r.status), "err");
+        return;
+      } else {
+        toast("Download started: " + j.id + " — poll status below.", "ok", 6000);
+      }
+      // Start polling status until the job finishes, then retry the load.
+      await poll_fetch_then_load(j.id || (family + "/" + variant), modelId);
+    } catch (e) {
+      toast("Fetch error: " + e.message, "err");
+    }
+  }
+
+  // Poll /v1/models/fetch/status every 2s until `jobId` leaves `active`.
+  // On success, retries /v1/models/load for `modelId`. On failure, surfaces
+  // the log tail so the user can see why it broke.
+  async function poll_fetch_then_load(jobId, modelId) {
+    const deadline = Date.now() + 30 * 60 * 1000;  // 30 min cap
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 2000));
+      let st;
+      try {
+        st = await (await fetch("/v1/models/fetch/status")).json();
+      } catch (e) { continue; }
+      render_fetch_status(st);
+      const done = (st.recent || []).find(j => j.id === jobId && j.finished);
+      if (done) {
+        if (done.exit_code === 0) {
+          toast("Download complete — loading " + modelId, "ok");
+          // Re-hit /v1/models/load — should succeed now.
+          const lr = await fetch("/v1/models/load", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id: modelId }),
+          });
+          if (lr.ok) {
+            toast("Loaded " + modelId, "ok");
+            await load_models();
+          } else {
+            const lj = await lr.json().catch(() => ({}));
+            toast("Load after fetch failed: " + (lj.error || lr.status), "err");
+          }
+        } else {
+          toast("Download failed (exit " + done.exit_code + ") — see server log.", "err", 10000);
+          console.error("Fetch log tail:", done.log_tail);
+        }
+        return;
+      }
+    }
+    toast("Download timed out after 30 min", "err");
+  }
+
+  // Render the active/recent downloads widget at the top of the Models tab.
+  // No-op if the widget element isn't present. Called on a 2s interval while
+  // the Models tab is visible so progress updates without user interaction.
+  function render_fetch_status(st) {
+    const box = $("#model-fetch-status");
+    if (!box) return;
+    const active = st.active || [];
+    const recent = st.recent || [];
+    if (!active.length && !recent.length) { box.style.display = "none"; return; }
+    box.style.display = "";
+    let html = "";
+    for (const j of active) {
+      const secs = Math.round((Date.now() / 1000) - j.started);
+      html += '<div class="fetch-row fetch-active">' +
+        '<span class="fetch-spinner"></span>' +
+        '<strong>' + esc(j.id) + '</strong> · downloading… (' + secs + 's)' +
+        '</div>';
+    }
+    for (const j of recent.slice(-5)) {
+      const ok = j.exit_code === 0;
+      html += '<div class="fetch-row ' + (ok ? "fetch-ok" : "fetch-fail") + '">' +
+        '<code>' + (ok ? "✓" : "✗") + '</code> ' +
+        '<strong>' + esc(j.id) + '</strong> · ' +
+        (ok ? "finished" : ("failed (exit " + j.exit_code + ")")) +
+        '</div>';
+    }
+    box.innerHTML = html;
+  }
+
+  // Periodic refresh of the downloads widget while the Models tab is open.
+  let _fetch_poll_handle = null;
+  function start_fetch_polling() {
+    if (_fetch_poll_handle) return;
+    _fetch_poll_handle = setInterval(async () => {
+      const modelsTab = $("#tab-models");
+      if (!modelsTab || !modelsTab.classList.contains("active")) return;
+      try {
+        const st = await (await fetch("/v1/models/fetch/status")).json();
+        render_fetch_status(st);
+      } catch (e) { /* server down — silent */ }
+    }, 3000);
+  }
+  start_fetch_polling();
 
   const _model_refresh = $("#model-refresh");
   if (_model_refresh) _model_refresh.addEventListener("click", load_models);
