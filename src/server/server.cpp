@@ -13,10 +13,15 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
+#include <fcntl.h>      // O_WRONLY — fetch log redirection
 #include <unistd.h>
+#include <sys/wait.h>   // waitpid — fetch subprocess reaping
 
 #include <nlohmann/json.hpp>
 
+#include "audiocore/framework/runtime/manifest.h"   // load_manifest — auto-download
 #include "audiocore/framework/runtime/tasks.h"
 #include "audiocore/framework/audio/dsp.h"   // pitch_shift, change_speed
 #include "audiocore/models/ace_step/family.h"    // MusicRequest / MusicResponse
@@ -357,6 +362,128 @@ std::string_view asset_data(const std::string& name) {
 }
 #endif
 
+// ── Auto-download support ───────────────────────────────────────────────
+// Tracks fetch_models.sh subprocesses spawned by POST /v1/models/fetch so
+// the webapp can show "downloading…" UI and poll GET /v1/models/fetch/status
+// until the job finishes, then call /v1/models/load.
+
+struct FetchJob {
+    std::string id;          // "family/variant"
+    std::string family;
+    std::string variant;
+    pid_t pid = -1;
+    std::chrono::system_clock::time_point started;
+    std::string log_path;
+    bool finished = false;
+    int exit_code = -1;
+    std::chrono::system_clock::time_point ended;
+};
+
+struct FetchState {
+    std::mutex mtx;
+    std::unordered_map<std::string, FetchJob> active;  // keyed by "family/variant"
+    std::vector<FetchJob> recent;                       // finished jobs (capped at 20)
+};
+
+// Walk up from the executable's directory looking for scripts/fetch_models.sh
+// + models/manifest.json. Falls back to CWD. Returns empty if not found
+// (auto-download disabled in that case).
+std::string find_repo_root_for_fetch() {
+    char exe_buf[4096];
+    ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    fs::path p;
+    if (len > 0) {
+        exe_buf[len] = '\0';
+        p = fs::path(exe_buf).parent_path();
+        for (int i = 0; i < 8 && p.has_parent_path(); ++i) {
+            if (fs::exists(p / "scripts" / "fetch_models.sh") &&
+                fs::exists(p / "models" / "manifest.json")) {
+                return p.string();
+            }
+            p = p.parent_path();
+        }
+    }
+    // Last-ditch: CWD.
+    if (fs::exists("scripts/fetch_models.sh") && fs::exists("models/manifest.json")) {
+        std::error_code ec;
+        auto cwd = fs::current_path(ec);
+        if (!ec) return cwd.string();
+    }
+    return {};
+}
+
+// Heuristic: does this loader error look like a missing-file error?
+// Used by /v1/models/load to decide whether to surface the fetch hint.
+bool looks_like_missing_file(const std::string& msg) {
+    auto has = [&](const char* needle) {
+        return msg.find(needle) != std::string::npos;
+    };
+    return has("No such file") || has("not found") || has("cannot open") ||
+           has("No entity") || has("Does not exist") ||
+           has("missing") || has("Failed to open") || has("unable to open");
+}
+
+// Read the last N bytes of a log file for the status endpoint.
+std::string tail_log(const std::string& path, size_t max_bytes = 4096) {
+    if (path.empty()) return {};
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    auto sz = f.tellg();
+    if (sz <= 0) return {};
+    if (sz > static_cast<std::streamoff>(max_bytes)) f.seekg(-max_bytes, std::ios::end);
+    else f.seekg(0);
+    std::string out;
+    out.resize(max_bytes);
+    f.read(&out[0], max_bytes);
+    out.resize(f.gcount());
+    return out;
+}
+
+// Non-blocking reaper. For each active job, check if the subprocess exited
+// and move it to `recent` if so. Called from the status endpoint and the
+// fetch launcher so we never leak zombies.
+void reap_jobs(FetchState& state) {
+    std::lock_guard<std::mutex> g(state.mtx);
+    for (auto it = state.active.begin(); it != state.active.end();) {
+        auto& job = it->second;
+        int status = 0;
+        pid_t r = waitpid(job.pid, &status, WNOHANG);
+        if (r == job.pid) {
+            job.finished = true;
+            job.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            job.ended = std::chrono::system_clock::now();
+            state.recent.push_back(job);
+            if (state.recent.size() > 20) state.recent.erase(state.recent.begin());
+            it = state.active.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Render a FetchJob as JSON for the status endpoint.
+json job_to_json(const FetchJob& j) {
+    auto secs = [](std::chrono::system_clock::time_point t) {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   t.time_since_epoch()).count();
+    };
+    json out = {
+        {"id", j.id},
+        {"family", j.family},
+        {"variant", j.variant},
+        {"pid", j.pid},
+        {"started", secs(j.started)},
+        {"log_path", j.log_path},
+        {"finished", j.finished},
+    };
+    if (j.finished) {
+        out["exit_code"] = j.exit_code;
+        out["ended"] = secs(j.ended);
+        out["log_tail"] = tail_log(j.log_path);
+    }
+    return out;
+}
+
 }  // namespace
 
 std::shared_ptr<httplib::Server> build_server(
@@ -375,6 +502,31 @@ std::shared_ptr<httplib::Server> build_server(
     auto q3_proxies_ref = qwen3tts_proxies ?
         qwen3tts_proxies :
         std::make_shared<std::unordered_map<std::string, Qwen3TtsProxyConfig>>();
+
+    // Auto-download state. Captured by the /v1/models/fetch* handlers.
+    // repo_root is empty when scripts/fetch_models.sh can't be located — the
+    // fetch endpoint returns 503 in that case rather than refusing to boot.
+    auto fetch_state = std::make_shared<FetchState>();
+    auto manifest_ref = std::make_shared<Manifest>();
+    const std::string repo_root = find_repo_root_for_fetch();
+    {
+        std::string manifest_err;
+        *manifest_ref = load_manifest(&manifest_err);
+        if (!manifest_err.empty()) {
+            std::fprintf(stderr,
+                "[server] manifest load failed: %s (auto-download degraded)\n",
+                manifest_err.c_str());
+        }
+    }
+    if (repo_root.empty()) {
+        std::fprintf(stderr,
+            "[server] scripts/fetch_models.sh not found relative to executable "
+            "or CWD — /v1/models/fetch will return 503\n");
+    } else {
+        std::fprintf(stderr,
+            "[server] auto-download enabled (repo_root=%s)\n",
+            repo_root.c_str());
+    }
 
     svr->Get("/health", [slots_ref, proxies_ref, q3_proxies_ref](const httplib::Request&, httplib::Response& res) {
         // Lightweight liveness + readiness probe. Counts are O(n_slots)
@@ -475,8 +627,12 @@ std::shared_ptr<httplib::Server> build_server(
 
     // Load a model by id (consumes VRAM). Uses the cached ModelLoadRequest
     // from startup config. Allows the webapp to hot-swap models.
+    //
+    // If the load fails with a missing-file error, the response carries a
+    // `fetchable: true` hint pointing the client at POST /v1/models/fetch so
+    // the webapp can offer a "Download & Load" button instead of a stack trace.
     svr->Post("/v1/models/load",
-              [slots_ref, registry_raw](const httplib::Request& req, httplib::Response& res) {
+              [slots_ref, registry_raw, manifest_ref, repo_root](const httplib::Request& req, httplib::Response& res) {
         json body;
         try { body = json::parse(req.body); } catch (...) {
             res.status = 400;
@@ -510,12 +666,185 @@ std::shared_ptr<httplib::Server> build_server(
             std::fprintf(stderr, "[server] model '%s' loaded\n", id.c_str());
             res.set_content(R"({"ok":true})", "application/json");
         } catch (const std::exception& e) {
+            const std::string msg = e.what();
             std::fprintf(stderr, "[server] load FAILED for '%s': %s\n",
-                         id.c_str(), e.what());
+                         id.c_str(), msg.c_str());
             res.status = 500;
-            json err = {{"error", e.what()}};
+            json err = {{"error", msg}};
+            // Missing-file errors get a fetch hint so the webapp can offer
+            // to download the model. We surface the family we know about from
+            // the load request and let the client figure out the variant from
+            // GET /v1/models/available.
+            if (looks_like_missing_file(msg) && !repo_root.empty()) {
+                err["fetchable"] = true;
+                err["fetch_endpoint"] = "POST /v1/models/fetch";
+                err["fetch_payload"] = {
+                    {"family", slot->load_req.family_hint},
+                };
+                err["status_endpoint"] = "GET /v1/models/fetch/status";
+            }
             res.set_content(err.dump(), "application/json");
         }
+    });
+
+    // ── Auto-download ─────────────────────────────────────────────────────
+    // POST /v1/models/fetch — launch scripts/fetch_models.sh as a tracked
+    // subprocess. Returns immediately with a job id; the client polls
+    // GET /v1/models/fetch/status until `finished: true`.
+    //
+    // Body: {"family": "moss_tts", "variant": "moss-tts-q4-k-m"}
+    //   family + variant must exist in models/manifest.json — we validate
+    //   before forking so typos fail fast instead of downloading junk.
+    //
+    // Responses:
+    //   200 {"ok":true, "id":"moss_tts/moss-tts-q4-k-m", "log_path":"..."}
+    //   404 {"error":"unknown family"} / {"error":"unknown variant"}
+    //   409 {"error":"already running", "id":"...", "job": {...}}
+    //   503 {"error":"auto-download disabled", "reason":"..."}
+    svr->Post("/v1/models/fetch",
+              [fetch_state, manifest_ref, repo_root, weights_dir](const httplib::Request& req, httplib::Response& res) {
+        if (repo_root.empty()) {
+            res.status = 503;
+            res.set_content(R"({"error":"auto-download disabled","reason":"scripts/fetch_models.sh not located"})", "application/json");
+            return;
+        }
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid json"})", "application/json");
+            return;
+        }
+        const std::string family  = body.value("family", "");
+        const std::string variant = body.value("variant", "");
+        if (family.empty() || variant.empty()) {
+            res.status = 400;
+            res.set_content(R"({"error":"missing 'family' or 'variant'"})", "application/json");
+            return;
+        }
+        // Validate against the manifest so a typo doesn't fork a download
+        // that will quietly fail far away.
+        if (manifest_ref->empty() ||
+            !manifest_ref->find_family(family) ||
+            ![&]() {
+                const auto* f = manifest_ref->find_family(family);
+                for (const auto& v : f->variants) if (v.key == variant) return true;
+                return false;
+            }()) {
+            res.status = 404;
+            json err = {{"error", "unknown family/variant"},
+                        {"hint", "GET /v1/models/available lists known variants"}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        const std::string job_id = family + "/" + variant;
+
+        // Reject if this exact job is already running.
+        {
+            std::lock_guard<std::mutex> g(fetch_state->mtx);
+            auto it = fetch_state->active.find(job_id);
+            if (it != fetch_state->active.end()) {
+                res.status = 409;
+                json err = {{"error", "already running"}, {"id", job_id}, {"job", job_to_json(it->second)}};
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+        }
+
+        // Prepare a log file under <weights>/.fetch_logs/ (or /tmp).
+        fs::path log_dir;
+        if (!weights_dir.empty() && fs::exists(weights_dir)) {
+            log_dir = fs::path(weights_dir) / ".fetch_logs";
+        } else {
+            log_dir = "/tmp/audiocore-fetch-logs";
+        }
+        std::error_code ec;
+        fs::create_directories(log_dir, ec);
+        auto now = std::chrono::system_clock::now();
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+        fs::path log_path = log_dir / (family + "_" + variant + "_" + std::to_string(secs) + ".log");
+
+        // fork + execv scripts/fetch_models.sh. Redirect stdout/stderr to the
+        // log file. Set AUDIOCORE_MODELS_DIR so the script downloads into the
+        // configured weights dir (it defaults to ./weights otherwise).
+        const fs::path script = fs::path(repo_root) / "scripts" / "fetch_models.sh";
+        const std::string weights_target = (!weights_dir.empty() && fs::exists(weights_dir))
+            ? weights_dir : (fs::path(repo_root) / "weights").string();
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            std::perror("fork");
+            res.status = 500;
+            res.set_content(R"({"error":"fork failed"})", "application/json");
+            return;
+        }
+        if (pid == 0) {
+            // ── Child ──
+            // Redirect stdout+stderr to the log file.
+            int fd = ::open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                dup2(fd, STDOUT_FILENO);
+                dup2(fd, STDERR_FILENO);
+                close(fd);
+            }
+            // Tell fetch_models.sh where to put files.
+            setenv("AUDIOCORE_MODELS_DIR", weights_target.c_str(), 1);
+            // build/bin is where the convert_* binaries live.
+            std::string build_bin = (fs::path(repo_root) / "build" / "bin").string();
+            setenv("AUDIOCORE_BUILD_DIR", build_bin.c_str(), 1);
+
+            // Build argv: bash fetch_models.sh <family> <variant>
+            // Use execvp so a non-executable script (no +x bit on some checkouts)
+            // still works through the shell.
+            std::vector<std::string> argv_str = {
+                "bash", script.string(), family, variant
+            };
+            std::vector<char*> argv_c;
+            argv_c.reserve(argv_str.size() + 1);
+            for (auto& s : argv_str) argv_c.push_back(&s[0]);
+            argv_c.push_back(nullptr);
+            execvp("bash", argv_c.data());
+            // Only returns on failure.
+            std::perror("execvp(bash fetch_models.sh)");
+            _exit(127);
+        }
+
+        // ── Parent ──
+        FetchJob job;
+        job.id = job_id;
+        job.family = family;
+        job.variant = variant;
+        job.pid = pid;
+        job.started = std::chrono::system_clock::now();
+        job.log_path = log_path.string();
+        {
+            std::lock_guard<std::mutex> g(fetch_state->mtx);
+            fetch_state->active[job_id] = job;
+        }
+        std::fprintf(stderr, "[server] fetch started: %s (pid=%d, log=%s)\n",
+                     job_id.c_str(), pid, job.log_path.c_str());
+        json out = {
+            {"ok", true},
+            {"id", job_id},
+            {"log_path", job.log_path},
+            {"status_endpoint", "GET /v1/models/fetch/status"},
+        };
+        res.set_content(out.dump(), "application/json");
+    });
+
+    // GET /v1/models/fetch/status — poll active + recently-finished fetches.
+    // Reaps zombies on every call so the client doesn't have to wait.
+    svr->Get("/v1/models/fetch/status",
+             [fetch_state](const httplib::Request&, httplib::Response& res) {
+        reap_jobs(*fetch_state);
+        json active = json::array();
+        json recent = json::array();
+        {
+            std::lock_guard<std::mutex> g(fetch_state->mtx);
+            for (const auto& [_, j] : fetch_state->active) active.push_back(job_to_json(j));
+            for (const auto& j : fetch_state->recent)         recent.push_back(job_to_json(j));
+        }
+        res.set_content(json{{"active", active}, {"recent", recent}}.dump(),
+                        "application/json");
     });
 
     // List available models on disk (scan weights directory).
