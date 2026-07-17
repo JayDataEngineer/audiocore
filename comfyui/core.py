@@ -1,7 +1,20 @@
-"""audiocore Python bindings loader for ComfyUI.
+"""audiocore loader for ComfyUI — Python engines first, C++ fallback.
 
-Loads the audiocore pybind11 module (audiocore.cpython-*.so) and provides
-a ManagedModel wrapper that passes through the ComfyUI graph.
+Each family has ONE of two backends:
+  1. A Python engine (engines/<family>.py) that loads upstream HF /
+     diffusers pipelines directly. No GGUF, no conversion.
+  2. The legacy audiocore C++ pybind11 .so (GGML/GGUF). Used for families
+     that haven't been ported to Python yet.
+
+The dispatch decision is made at load() time based on whether a Python
+engine is registered for the family in engines/__init__.py.
+
+Both kinds of backend expose the same session contract:
+    load(path, **extras) -> bool
+    run_tts(text, **kwargs) -> (list[float], int)
+    run_music(caption, **kwargs) -> (list[float], int, int)
+    compute_embedding(wav_path) -> list[float]
+    close() / unload()
 
 Env vars:
     AUDIOCORE_BUILD_DIR   — build output root (default /opt/audiocore/build-py)
@@ -122,6 +135,32 @@ def _estimate_vram(model_path: str) -> int:
     return total
 
 
+# Rough VRAM estimates for Python-engine families (no .gguf files to sum).
+# Values are upper bounds for bf16 weights + KV + activation working set.
+_PYTHON_ENGINE_VRAM = {
+    "moss_sfx_v2":   4 * 1024 * 1024 * 1024,   # 1.3B DiT + DAC VAE + Qwen3-TE bf16
+}
+
+
+def _get_python_engine(family: str):
+    """Return the Python engine class for `family`, or None.
+
+    Imports the engines registry lazily so ComfyUI startup doesn't pay the
+    torch/diffusers import cost just for enumerating families.
+    """
+    try:
+        from .engines import get_engine_class, python_families
+    except ImportError:
+        return None
+    if family not in python_families():
+        return None
+    try:
+        return get_engine_class(family)
+    except Exception:
+        logger.exception("failed to load Python engine for %s", family)
+        return None
+
+
 class ManagedModel:
     """A loaded audiocore model session, passed through the ComfyUI graph.
 
@@ -190,6 +229,32 @@ class ManagedModel:
                         prev.family, self.family)
             prev._cleanup()
 
+        # ── Python engine path (preferred for ported families) ──
+        EngineCls = _get_python_engine(self.family)
+        if EngineCls is not None:
+            try:
+                engine = EngineCls()
+                ok = engine.load(self.path, **extras)
+                if not ok:
+                    raise RuntimeError(
+                        f"Python engine {EngineCls.__name__}.load() "
+                        f"returned False for {self.family}")
+                self._session = engine
+                self._estimated_vram = _PYTHON_ENGINE_VRAM.get(
+                    self.family, _estimate_vram(self.path))
+                ManagedModel._active_model = self
+                self._register_in_model_management()
+                logger.info("loaded %s via Python engine %s (%d MB est VRAM)",
+                            self.family, EngineCls.__name__,
+                            self._estimated_vram // (1024 * 1024))
+                return True
+            except Exception as e:
+                logger.error("Python engine load failed for %s: %s",
+                             self.family, e)
+                self._session = None
+                # Fall through to C++ path as a last-ditch attempt.
+
+        # ── C++ pybind11 path (families not yet ported to Python) ──
         init()
         try:
             s = _ext.Session.create(self.family)
