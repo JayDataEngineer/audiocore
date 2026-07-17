@@ -195,6 +195,41 @@ modes, and per-variant `min_vram_gb`. Consumers:
   Searches for `models/manifest.json` relative to the executable and
   the CWD; falls back to `FamilyRegistry::list()` if absent.
 
+### In-server auto-download (POST /v1/models/fetch)
+
+The server can launch `fetch_models.sh` itself so the webapp can pull a
+missing variant without dropping to a terminal. Three pieces in
+`src/server/server.cpp`:
+
+- **POST /v1/models/fetch** — body `{family, variant}` validated against
+  the manifest, then forks `bash scripts/fetch_models.sh <family>
+  <variant>` with stdout/stderr redirected to `<weights>/.fetch_logs/`.
+  Sets `AUDIOCORE_MODELS_DIR` and `AUDIOCORE_BUILD_DIR` so the script
+  downloads into the configured weights dir and finds the converters.
+  Returns immediately with `{ok, id, log_path}`. 409 if the same job is
+  already running; 503 if `scripts/fetch_models.sh` can't be located
+  relative to the executable or CWD.
+- **GET /v1/models/fetch/status** — polls active + recently-finished
+  jobs (capped at 20). `waitpid(WNOHANG)` runs on every call so zombies
+  are reaped without a background thread. Each job carries `pid`,
+  `started`/`ended` epoch seconds, `exit_code`, and a 4 KB `log_tail`
+  for the webapp to render progress.
+- **POST /v1/models/load** error path — when the loader throws and the
+  message looks like a missing-file error (heuristic: "No such file" /
+  "not found" / "cannot open" / etc), the 500 response carries
+  `fetchable:true` + `fetch_endpoint` + `fetch_payload:{family}` +
+  `status_endpoint`. The webapp uses this to morph the Load button into
+  "Fetch & Load" and run the download flow in-page.
+
+Startup logs which mode it's in:
+`[server] auto-download enabled (repo_root=…)` or
+`[server] scripts/fetch_models.sh not found … — /v1/models/fetch will
+return 503`.
+
+The webapp side lives in `webapp/public/app.js` (`open_fetch_dialog`,
+`poll_fetch_then_load`, `render_fetch_status`) and the
+`#model-fetch-status` widget in `webapp/public/index.html`.
+
 Adding a new family or variant = add a new entry to the manifest, in
 parallel with the loader.cpp registration. The CLI's `--list-supported`
 picks it up with no extra wiring.
