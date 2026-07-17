@@ -62,14 +62,6 @@ public:
                       const LoadOptions& opts,
                       const BackendConfig& backend_cfg,
                       std::string* error = nullptr) = 0;
-
-    // Voice Activity Detection. Optional — only the silero_vad family
-    // implements this currently (MarbleNet VAD will slot in here too when
-    // ported). Same void*-erasure pattern as run_tts / run_music: caller
-    // casts to VadRequest/VadResponse from tasks.h.
-    virtual bool run_vad(const void* request, void* response,
-                         std::string* error = nullptr)   { return false; }
-
     bool loaded() const { return loaded_; }
 
 protected:

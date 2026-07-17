@@ -50,33 +50,6 @@ struct AudioStreamCallbacks {
     std::function<void(const char* phase, float pct, const char* msg)> on_progress;
 };
 
-// ── Voice Activity Detection (silero_vad family) ──────────────────────────
-struct VadSegment {
-    int64_t start_sample = 0;
-    int64_t end_sample   = 0;
-    float   start_sec    = 0.0f;
-    float   end_sec      = 0.0f;
-};
-
-struct VadRequest {
-    std::string audio_path;              // input WAV (16 kHz mono expected)
-    int         sample_rate          = 16000;
-    float       threshold            = 0.5f;   // speech probability threshold
-    float       min_speech_dur_sec   = 0.0f;
-    float       max_speech_dur_sec   = 30.0f;
-    float       min_silence_dur_sec  = 2.0f;
-    float       speech_pad_ms        = 30.0f;
-    // If true, populate VadResponse.probabilities with per-chunk speech
-    // probabilities (debug / visualization). Otherwise left empty.
-    bool        emit_probabilities   = false;
-};
-
-struct VadResponse {
-    std::vector<VadSegment> segments;
-    std::vector<float>      probabilities;  // per-chunk, only if requested
-    std::string             error;
-};
-
 // ── Text-to-Speech ────────────────────────────────────────────────────────
 struct TtsRequest {
     // ── Core (every TTS family reads these) ──

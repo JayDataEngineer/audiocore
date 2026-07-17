@@ -150,20 +150,6 @@ add_library(audiocore_framework STATIC
     src/models/qwen3_tts/session.cpp
     src/models/qwen3_tts/codec.cpp
     src/models/qwen3_tts/speaker_encoder.cpp
-    # Kokoro-82M (mmwillet/TTS.cpp port — self-contained internal/ dir):
-    src/models/kokoro_tts/internal/src/models/kokoro/model.cpp
-    src/models/kokoro_tts/internal/src/models/kokoro/phonemizer.cpp
-    src/models/kokoro_tts/internal/src/models/kokoro/loader.cpp
-    src/models/kokoro_tts/internal/src/tts_model.cpp
-    src/models/kokoro_tts/internal/src/tokenizer.cpp
-    src/models/kokoro_tts/internal/ggml-patches/llama-mmap.cpp
-    src/models/kokoro_tts/internal/src/util.cpp
-    src/models/kokoro_tts/internal/src/models/loaders.cpp
-    src/models/kokoro_tts/session.cpp
-    # Silero VAD v6.2 (0xShug0/audio.cpp port — graph code pending):
-    src/models/silero_vad/loader.cpp
-    src/models/silero_vad/session.cpp
-    src/models/silero_vad/runtime.cpp
     # HTTP server factory (routes + WAV encoders). Linked into the
     # audiocore_server binary AND into the e2e HTTP test, so both share the
     # same routing code path.
@@ -218,9 +204,6 @@ target_include_directories(audiocore_framework
         third_party/httplib
         third_party/nlohmann
     PRIVATE
-        src/models/kokoro_tts/internal/src
-        src/models/kokoro_tts/internal/include
-        src/models/kokoro_tts/internal/ggml-patches
 )
 target_link_libraries(audiocore_framework PUBLIC llama)
 target_compile_definitions(audiocore_framework PRIVATE ESPEAK_INSTALL)
@@ -306,9 +289,6 @@ if(ENGINE_BUILD_PYTHON)
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python")
 endif()
 
-# ── Kokoro TTS test ──────────────────────────────────────────────────────
-add_executable(test_kokoro_e2e tests/test_kokoro_e2e.cpp)
-target_link_libraries(test_kokoro_e2e PRIVATE audiocore_framework)
 
 # Voice-embedding round-trip regression: encode a generated reference WAV
 # into a saved .voice file, reload it, apply it via synthesize_with_embedding
