@@ -159,6 +159,25 @@ def judge_audio_bytes(blob: bytes, *, filename: str = "audio.flac",
         if text.endswith("```"):
             text = text[:-3]
         text = text.strip()
+    # Mimo sometimes prefixes the JSON with chain-of-thought reasoning.
+    # Extract the last {...} block in the response — that's the verdict.
+    if not text.startswith("{"):
+        # Find the LAST '{' that begins a balanced object.
+        depth = 0
+        start = -1
+        last_obj = None
+        for i, c in enumerate(text):
+            if c == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    last_obj = text[start:i + 1]
+                    start = -1
+        if last_obj is not None:
+            text = last_obj
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:

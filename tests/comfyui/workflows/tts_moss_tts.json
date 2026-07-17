@@ -4,7 +4,8 @@
     "inputs": {
       "family": "moss_tts",
       "model_path": "moss-tts",
-      "backend": "ggml_cuda"
+      "backend": "ggml_cuda",
+      "extras": "{\"extras_gguf_path\": \"/mnt/data/models/audio/moss-tts/MOSS_TTS_Q8_0.extras.gguf\"}"
     }
   },
   "2": {
