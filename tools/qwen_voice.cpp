@@ -25,7 +25,7 @@
 //           --out <voice> [--extra-wav a.wav [--extra-wav b.wav ...]]
 //       Loads a qwen3_tts session (talker+predictor+codec+encoder), encodes
 //       one or more reference WAVs, averages them, writes <voice>. The
-//       averaging improves robustness — see u/k_means_clusterfuck's rec.
+//       averaging improves robustness — see a community recommendation.
 //       Set talker/predictor/codec filenames via QWEN3TTS_TALKER /
 //       QWEN3TTS_PREDICTOR / QWEN3TTS_CODEC if non-default.
 //
