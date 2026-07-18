@@ -73,12 +73,36 @@ namespace {
 std::string id_to_token(qwen3::Runner* backbone, int32_t id) {
     std::string piece;
     std::string err;
-    if (!backbone->token_to_piece(id, &piece, &err) || piece.empty()) {
-        // Fall back to a printable sentinel so tokenization fails loudly
-        // rather than silently producing a different prompt.
-        return std::string("<UNKNOWN_TOKEN_") + std::to_string(id) + ">";
+    if (backbone->token_to_piece(id, &piece, &err) && !piece.empty()) {
+        return piece;
     }
-    return piece;
+    // token_to_piece returns empty for SPECIAL/control tokens (llama.cpp
+    // convention: special tokens have no textual piece). The MOSS prompt
+    // is built as a STRING that we re-tokenize, so we MUST substitute the
+    // actual special-token literal here — otherwise the prompt structure
+    // markers (`<|im_start|>`, `<|audio_start|>`, etc.) get dropped and
+    // the model sees a structureless blob of user text. With no valid
+    // dialogue framing the AR loop degenerates within ~5 steps and emits
+    // 30 seconds of mechanical buzz instead of speech.
+    //
+    // The literals below are the actual strings stored at these IDs in
+    // the MOSS-TTS GGUF (tokenizer.ggml.tokens array, verified by reading
+    // the array directly — llama_cpp.tokenize(special=True) confirms each
+    // literal round-trips to exactly one token of the expected id).
+    // MOSS defines its own special-token names; do NOT assume the upstream
+    // Qwen2.5 tokenizer layout (e.g. id 151654 is `<|audio_user_slot|>`
+    // here, not `<|audio_pad|>`).
+    switch (id) {
+        case 151643: return "<|endoftext|>";
+        case 151644: return "<|im_start|>";
+        case 151645: return "<|im_end|>";
+        case 151652: return "<|audio_start|>";
+        case 151653: return "<|audio_end|>";
+        case 151654: return "<|audio_user_slot|>";
+        case 151656: return "<|audio_assistant_gen_slot|>";
+        case 151662: return "<|audio_assistant_delay_slot|>";
+    }
+    return std::string("<UNKNOWN_TOKEN_") + std::to_string(id) + ">";
 }
 
 std::string default_or_none(const std::optional<std::string>& s) {
@@ -250,26 +274,17 @@ bool MossSession::embed_one_step(const int32_t* tokens,
                                   std::string* error) {
     // tokens[0] = text token, tokens[1..n_vq] = audio codec tokens.
     const int32_t hs = backbone_->hidden_size();
-    (void)error;
     embd_out->assign(static_cast<size_t>(hs), 0.0f);
 
-    // Text token embedding
+    // Text token embedding — pull from the backbone's token table.
+    // (Community extras GGUFs omit token_embd.weight; the backbone is the
+    // canonical source.)
     int32_t text_tok = tokens[0];
-    if (text_tok >= 0 && token_embd_) {
-        float* row = embd_out->data();
-        const size_t row_bytes = static_cast<size_t>(hs) *
-            (token_embd_->type == GGML_TYPE_F32 ? sizeof(float)
-                                                 : sizeof(ggml_fp16_t));
-        if (static_cast<size_t>(text_tok) * row_bytes + row_bytes <= ggml_nbytes(token_embd_)) {
-            const char* src = static_cast<const char*>(token_embd_->data)
-                              + static_cast<size_t>(text_tok) * row_bytes;
-            if (token_embd_->type == GGML_TYPE_F32) {
-                std::memcpy(row, src, row_bytes);
-            } else if (token_embd_->type == GGML_TYPE_F16) {
-                const ggml_fp16_t* s = reinterpret_cast<const ggml_fp16_t*>(src);
-                for (int j = 0; j < hs; ++j)
-                    row[j] = ggml_fp16_to_fp32(s[j]);
-            }
+    if (text_tok >= 0) {
+        std::string lk_err;
+        if (!backbone_->embed_lookup(&text_tok, 1, embd_out->data(), &lk_err)) {
+            if (error) *error = "embed_one_step: embed_lookup failed: " + lk_err;
+            return false;
         }
     }
 
@@ -519,32 +534,36 @@ bool MossSession::run_tts(const void* request, void* response,
     }
 
     // ── 2. Build prompt embeddings ──────────────────────────────────────────
+    // We need the per-position input embedding = text_tok_embed + Σ_s audio_embed[s][code_s].
+    // The text-token table is the Qwen3 backbone's token_embd.weight (kept
+    // inside the runner); the audio codebook tables live in the MOSS extras
+    // GGUF (audio_embed_[s]). The legacy code assumed token_embd_ (an
+    // extras-side tensor also named "token_embd.weight") was always present
+    // — but community extras GGUFs that ship only the codec + audio
+    // embed/head tensors leave it null, silently producing an all-zero
+    // prompt embedding and a degenerate AR loop (30 s of mechanical buzz).
+    // Use the backbone's embed_lookup() to populate the text half of every
+    // row first, then sum in audio codebook rows for reference-audio positions.
     std::vector<float> prompt_embeds(static_cast<size_t>(total_S) * hs, 0.0f);
-    for (int32_t i = 0; i < total_S; i++) {
-        float* row = prompt_embeds.data() + static_cast<size_t>(i) * hs;
-        const int32_t text_tok = all_ids[size_t(i)][0];
-
-        if (text_tok >= 0 && token_embd_) {
-            const size_t row_bytes = static_cast<size_t>(hs) *
-                (token_embd_->type == GGML_TYPE_F32 ? sizeof(float)
-                                                     : sizeof(ggml_fp16_t));
-            if (static_cast<size_t>(text_tok) * row_bytes + row_bytes <= ggml_nbytes(token_embd_)) {
-                const char* src = static_cast<const char*>(token_embd_->data)
-                                  + static_cast<size_t>(text_tok) * row_bytes;
-                if (token_embd_->type == GGML_TYPE_F32) {
-                    std::memcpy(row, src, row_bytes);
-                } else if (token_embd_->type == GGML_TYPE_F16) {
-                    const ggml_fp16_t* s = reinterpret_cast<const ggml_fp16_t*>(src);
-                    for (int j = 0; j < hs; ++j)
-                        row[j] = ggml_fp16_to_fp32(s[j]);
-                }
-            }
+    {
+        std::vector<int32_t> text_only(static_cast<size_t>(total_S));
+        for (int32_t i = 0; i < total_S; ++i)
+            text_only[size_t(i)] = all_ids[size_t(i)][0];
+        std::string emb_err;
+        if (!backbone_->embed_lookup(text_only.data(), total_S,
+                                      prompt_embeds.data(), &emb_err)) {
+            if (error) *error = "moss_tts: embed_lookup failed: " + emb_err;
+            return false;
         }
-
-        // Sum audio embeddings for each stream (reference-audio rows only).
-        // The text rows have AUDIO_PAD_CODE in channels 1..n_vq.
+    }
+    // Sum audio codebook embeddings for reference-audio rows (those whose
+    // text channel is the user-slot marker). Text rows have AUDIO_PAD_CODE
+    // in channels 1..n_vq and contribute nothing here.
+    for (int32_t i = 0; i < total_S; i++) {
+        const int32_t text_tok = all_ids[size_t(i)][0];
         const bool is_ref_row = (text_tok == cfg_.tok_user_slot);
         if (!is_ref_row) continue;
+        float* row = prompt_embeds.data() + static_cast<size_t>(i) * hs;
         for (int s = 0; s < cfg_.n_vq; ++s) {
             int32_t code = all_ids[size_t(i)][1 + s];
             if (code < 0 || code == cfg_.audio_pad_code) continue;
@@ -623,6 +642,11 @@ bool MossSession::run_tts(const void* request, void* response,
             ? (hidden_buf.data() + static_cast<size_t>(total_S - 1) * hs)
             : step_hidden.data();
 
+        // Logits index into the most recent decode batch:
+        //   step == 0 → the prefill batch (total_S tokens, last_only=true).
+        //               output_ids[total_S - 1] is the only logits-enabled
+        //               row, so get_logits_ith(total_S - 1) resolves to it.
+        //   step > 0  → a 1-token AR forward; output_ids[0] is the only row.
         const float* text_logits = backbone_->get_logits_ith(
             (step == 0) ? (total_S - 1) : 0);
         if (!text_logits) {
