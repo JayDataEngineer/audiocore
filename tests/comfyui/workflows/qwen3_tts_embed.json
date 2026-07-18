@@ -5,7 +5,7 @@
       "family": "qwen3_tts",
       "model_path": "qwen3-tts",
       "backend": "ggml_cuda",
-      "extras": "{\"speaker_encoder_path\": \"/mnt/data/models/audio/qwen3_tts/qwen3tts-speaker-encoder.gguf\"}"
+      "extras": "{\"variant\": \"base\", \"speaker_encoder_path\": \"/mnt/data/models/audio/qwen3_tts/qwen3tts-speaker-encoder.gguf\"}"
     }
   },
   "2": {

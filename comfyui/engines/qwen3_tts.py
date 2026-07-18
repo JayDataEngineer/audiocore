@@ -47,21 +47,28 @@ class Qwen3TtsEngine:
     def load(self, path: str, **extras: Any) -> bool:
         """Load Qwen3TTSModel from `path` (HF source dir with config.json).
 
-        Accepts the legacy GGUF dir names and remaps to the HF source dir
-        (qwen3-tts GGUF dir → Qwen3-TTS-12Hz-0.6B-CustomVoice in the HF
-        cache). The CustomVoice variant is the most capable single-pkg
-        model: it supports generate_custom_voice for plain TTS with
-        predefined speakers.
+        Variant selection: the qwen_tts package gates features per model
+        variant. The default load picks CustomVoice (plain TTS with
+        predefined speakers). Pass `variant='base'` via extras for voice
+        cloning, or `variant='voicedesign'` for instructed voice design.
+
+        extras (JSON object from the LoadAudiocoreModel node):
+          - variant:           'customvoice' (default) | 'base' | 'voicedesign'
+          - speaker_encoder_path: ignored (the Base HF dir ships its own)
         """
         import contextlib
         import io
 
-        hf_dir = self._resolve_model_dir(path)
+        variant_hint = str(extras.get("variant", "")).lower().strip()
+        # Treat empty/missing hint as None so _resolve_model_dir uses the
+        # path-suffix detection (default → customvoice).
+        hint = variant_hint or None
+        hf_dir = self._resolve_model_dir(path, variant_hint=hint)
         if hf_dir is None:
             raise RuntimeError(
-                f"qwen3_tts: could not resolve an HF source dir from {path!r}. "
-                f"Point model_path at a Qwen3-TTS HF dir (containing "
-                f"config.json + model.safetensors)."
+                f"qwen3_tts: could not resolve an HF source dir from {path!r} "
+                f"(variant_hint={hint!r}). Point model_path at a Qwen3-TTS "
+                f"HF dir (containing config.json + model.safetensors)."
             )
 
         # The qwen_tts package prints a flash-attn warning to stdout on
@@ -151,19 +158,31 @@ class Qwen3TtsEngine:
                 f"qwen3_tts: compute_embedding needs a valid wav_path, "
                 f"got {wav_path!r}")
 
-        # create_voice_clone_prompt builds a VoiceClonePromptItem carrying
-        # the x-vector embedding extracted from the reference audio.
-        prompt_item = self.model.create_voice_clone_prompt(
+        # create_voice_clone_prompt returns a LIST of VoiceClonePromptItem
+        # (one per reference sample). Take the first.
+        # x_vector_only_mode=True skips the in-context-learning path so we
+        # don't need a ref_text transcript — we only want the x-vector.
+        prompt_items = self.model.create_voice_clone_prompt(
             ref_audio=wav_path,
             ref_text=None,
-            x_vector_only_mode=False,
+            x_vector_only_mode=True,
         )
-        # Pull the x-vector out of the prompt dict / dataclass.
+        if not prompt_items:
+            raise RuntimeError(
+                "qwen3_tts: create_voice_clone_prompt returned an empty list"
+            )
+        prompt_item = prompt_items[0]
+        # Pull the speaker embedding out of the VoiceClonePromptItem
+        # dataclass (qwen_tts names it `ref_spk_embedding`).
         emb = None
-        if hasattr(prompt_item, "x_vector"):
+        if hasattr(prompt_item, "ref_spk_embedding"):
+            emb = getattr(prompt_item, "ref_spk_embedding", None)
+        elif hasattr(prompt_item, "x_vector"):
             emb = getattr(prompt_item, "x_vector", None)
         elif isinstance(prompt_item, dict):
-            emb = prompt_item.get("x_vector") or prompt_item.get("embedding")
+            emb = (prompt_item.get("ref_spk_embedding")
+                   or prompt_item.get("x_vector")
+                   or prompt_item.get("embedding"))
         if emb is None:
             raise RuntimeError(
                 "qwen3_tts: could not extract x-vector from voice-clone "
@@ -222,10 +241,11 @@ class Qwen3TtsEngine:
             # re-extracting from a reference WAV.
             try:
                 prompt_item = self._build_prompt_from_embedding(emb)
+                # generate_voice_clone takes a LIST of VoiceClonePromptItem.
                 audios, sr = self.model.generate_voice_clone(
                     text=text,
                     language=language,
-                    voice_clone_prompt=prompt_item,
+                    voice_clone_prompt=[prompt_item],
                     **gen_kwargs,
                 )
                 return self._to_pcm(audios, sr)
@@ -260,15 +280,34 @@ class Qwen3TtsEngine:
         return self._to_pcm(audios, sr)
 
     def _build_prompt_from_embedding(self, emb: Any) -> Any:
-        """Wrap a pre-computed x-vector into a VoiceClonePromptItem."""
+        """Wrap a pre-computed speaker embedding into a VoiceClonePromptItem."""
         from qwen_tts import VoiceClonePromptItem
         import torch
         import numpy as np
+        # Unwrap the AUDIOCORE_EMBEDDING envelope from the ComfyUI node.
+        if isinstance(emb, dict) and "vector" in emb:
+            emb = emb["vector"]
         if isinstance(emb, list):
             emb = torch.tensor(emb, dtype=torch.float32)
         elif isinstance(emb, np.ndarray):
             emb = torch.from_numpy(emb).float()
-        return VoiceClonePromptItem(x_vector=emb)
+        elif isinstance(emb, torch.Tensor):
+            emb = emb.float()
+        else:
+            raise RuntimeError(
+                f"qwen3_tts: unsupported speaker_embedding type "
+                f"{type(emb).__name__}"
+            )
+        # VoiceClonePromptItem fields (per qwen_tts source):
+        #   ref_code, ref_spk_embedding, x_vector_only_mode, icl_mode, ref_text
+        # x_vector_only_mode + no ref_code → use the embedding directly.
+        return VoiceClonePromptItem(
+            ref_code=None,
+            ref_spk_embedding=emb,
+            x_vector_only_mode=True,
+            icl_mode=False,
+            ref_text=None,
+        )
 
     # ── helpers ─────────────────────────────────────────────────────────
 
@@ -316,8 +355,18 @@ class Qwen3TtsEngine:
         }.get(s, s)
 
     @staticmethod
-    def _resolve_model_dir(path: str) -> str | None:
+    def _resolve_model_dir(path: str, variant_hint: str | None = None) -> str | None:
         """Resolve `path` to an HF source dir containing config.json.
+
+        Variant detection (in priority order):
+          1. `variant_hint` arg ('base' / 'customvoice' / 'voicedesign')
+             — set from the `variant` key in extras JSON.
+          2. Path suffix: '*-base', '*-voicedesign', '*-customvoice'.
+
+        The qwen_tts package gates features per variant:
+          - customvoice  → generate_custom_voice (default TTS)
+          - base         → generate_voice_clone + create_voice_clone_prompt
+          - voicedesign  → generate_voice_design
 
         Handles four inputs:
           1. Absolute HF dir → return as-is if it has config.json.
@@ -327,10 +376,42 @@ class Qwen3TtsEngine:
         """
         roots = [
             os.environ.get("AUDIOCORE_MODELS_DIR", "/mnt/data/models/audio"),
-            os.path.join(os.environ.get("AUDIOCORE_MODELS_DIR",
-                                        "/mnt/data/models/audio")),
             "/mnt/data/models/hf_cache",
         ]
+
+        # Determine which variant to load.
+        want_variant = "customvoice"  # default
+        if variant_hint:
+            hint = variant_hint.lower()
+            if "base" in hint or "clone" in hint:
+                want_variant = "base"
+            elif "design" in hint:
+                want_variant = "voicedesign"
+            elif "custom" in hint or "voice" in hint:
+                want_variant = "customvoice"
+        else:
+            # Fall back to path-suffix detection.
+            path_lc = path.lower().rstrip("/")
+            tail = os.path.basename(path_lc).replace("-", "_").replace(".", "_")
+            if "base" in tail or "voiceclone" in tail or "voice_clone" in tail:
+                want_variant = "base"
+            elif "design" in tail:
+                want_variant = "voicedesign"
+
+        # Per-variant HF repo IDs (for snapshot_download lookup).
+        variant_hf_repos = {
+            "base": [
+                "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+            ],
+            "customvoice": [
+                "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            ],
+            "voicedesign": [
+                "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+            ],
+        }[want_variant]
 
         candidates: list[str] = []
         if os.path.isabs(path):
@@ -339,23 +420,51 @@ class Qwen3TtsEngine:
             for root in roots:
                 candidates.append(os.path.join(root, path))
 
-        # Always try these remap candidates (legacy GGUF dir → HF source):
-        # CustomVoice 0.6B is the best general-purpose variant for TTS.
-        remaps = [
-            # legacy "qwen3-tts" or "qwen3_tts" relative name
-            os.path.join(roots[0], "qwen3_tts", "0.6b-customvoice"),
-            os.path.join(roots[0], "qwen3_tts", "1.7b-customvoice"),
-            os.path.join(roots[1], "qwen3_tts", "0.6b-base"),
-            # HF cache layouts
-            os.path.join(roots[2], "Qwen3-TTS-12Hz-0.6B-CustomVoice"),
-            os.path.join(roots[2], "Qwen3-TTS-12Hz-1.7B-CustomVoice"),
-            os.path.join(roots[2], "Qwen3-TTS-12Hz-0.6B-Base"),
-            os.path.join(roots[2], "Qwen3-TTS-12Hz-1.7B-Base"),
-        ]
-        for c in candidates:
-            if os.path.isfile(os.path.join(c, "config.json")):
-                return c
-        for c in remaps:
-            if os.path.isfile(os.path.join(c, "config.json")):
-                return c
+        # Only honor absolute/relative candidates that match the requested
+        # variant (so a GGUF dir at /mnt/data/models/audio/qwen3-tts doesn't
+        # shadow the Base variant when variant_hint='base').
+        want_suffix = {
+            "base": "-base",
+            "voicedesign": "-voicedesign",
+            "customvoice": "-customvoice",
+        }[want_variant]
+        if variant_hint:
+            filtered = [c for c in candidates if want_suffix in c.lower()]
+            for c in filtered:
+                if os.path.isfile(os.path.join(c, "config.json")):
+                    return c
+        else:
+            for c in candidates:
+                if os.path.isfile(os.path.join(c, "config.json")):
+                    return c
+
+        # Variant-specific HF cache lookup. The repo short-name (after the
+        # last "/") appears in two layouts under <hf_root>:
+        #   1. Flat dir (manual download):
+        #        <hf_root>/Qwen3-TTS-12Hz-0.6B-CustomVoice/config.json
+        #   2. HF cache layout (snapshot_download):
+        #        <hf_root>/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots/<hash>/config.json
+        # Try the flat layout first (fast), then snapshot_download.
+        hf_root = roots[1]
+        for repo_id in variant_hf_repos:
+            short = repo_id.split("/")[-1]
+            flat = os.path.join(hf_root, short)
+            if os.path.isfile(os.path.join(flat, "config.json")):
+                return flat
+
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError:
+            return None
+        for repo_id in variant_hf_repos:
+            try:
+                resolved = snapshot_download(
+                    repo_id=repo_id,
+                    cache_dir=hf_root,
+                    local_files_only=True,  # don't hit network at inference time
+                )
+                if resolved and os.path.isfile(os.path.join(resolved, "config.json")):
+                    return resolved
+            except Exception:
+                continue
         return None

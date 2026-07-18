@@ -228,7 +228,8 @@ def test_voice_clone_output_matches_reference_voice_gender(
     has_base = False
     if os.path.isdir(hf_root):
         for d in os.listdir(hf_root):
-            if d.startswith("Qwen3-TTS-12Hz-") and d.endswith("-Base"):
+            dl = d.lower()
+            if "qwen3-tts" in dl and dl.endswith("-base"):
                 has_base = True
                 break
     if not has_base:

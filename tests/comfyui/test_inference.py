@@ -242,12 +242,16 @@ def test_qwen3_tts_voice_embedding_roundtrip(
     # The qwen_tts package gates create_voice_clone_prompt /
     # generate_voice_clone on tts_model_type == "base". The host
     # HF cache mirrors what's mounted into the container.
+    # Layouts accepted:
+    #   /mnt/data/models/hf_cache/Qwen3-TTS-12Hz-*-Base/config.json
+    #   /mnt/data/models/hf_cache/models--Qwen--Qwen3-TTS-12Hz-*-Base/...
     import os
     hf_root = "/mnt/data/models/hf_cache"
     has_base = False
     if os.path.isdir(hf_root):
         for d in os.listdir(hf_root):
-            if d.startswith("Qwen3-TTS-12Hz-") and d.endswith("-Base"):
+            dl = d.lower()
+            if "qwen3-tts" in dl and dl.endswith("-base"):
                 has_base = True
                 break
     if not has_base:
