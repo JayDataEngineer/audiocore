@@ -1,0 +1,20 @@
+{
+  "1": {"class_type": "LoadAudiocoreModel", "inputs": {
+    "family": "qwen3_tts",
+    "model_path": "qwen3-tts",
+    "backend": "ggml_cuda",
+    "extras": "{\"variant\": \"voicedesign\"}"
+  }},
+  "2": {"class_type": "AudiocoreTTS", "inputs": {
+    "model": ["1", 0],
+    "text": "Hello, this is a test of the voice design feature. I can create any voice you describe.",
+    "mode": "design",
+    "instruct": "A deep, warm, authoritative male voice with a British accent, speaking slowly and clearly.",
+    "language": "english",
+    "seed": 42
+  }},
+  "3": {"class_type": "SaveAudio", "inputs": {
+    "audio": ["2", 0],
+    "filename_prefix": "audiocore_test_qwen3_voicedesign"
+  }}
+}

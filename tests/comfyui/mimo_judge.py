@@ -126,8 +126,19 @@ def judge_audio_bytes(blob: bytes, *, filename: str = "audio.flac",
         json={
             "model": MIMO_MODEL,
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": 400,
-            "temperature": 0.0,
+            # max_tokens=1500 (was 400): Mimo emits chain-of-thought
+            # reasoning before the JSON verdict. 400 truncates mid-JSON,
+            # leaving the parser with a schema echo or a partial object.
+            # 1500 leaves comfortable headroom for ~3 sentences of
+            # reasoning + the JSON verdict.
+            "max_tokens": 1500,
+            # temperature=0.2 (was 0.0): at exactly 0.0 Mimo sometimes
+            # deterministically echoes the schema template from the prompt
+            # instead of filling it in (the "bool"/"int 1-10" type
+            # placeholders come back verbatim). A small temperature nudge
+            # is enough to break the echo without sacrificing consistency
+            # of the actual verdict values.
+            "temperature": 0.2,
         },
         timeout=timeout,
     )

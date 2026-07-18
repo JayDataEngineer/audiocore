@@ -53,18 +53,22 @@ fi
 # ── filter args ────────────────────────────────────────────────────────────
 FILTER_FAMILY=""
 FILTER_VARIANT=""
+PYTHON_ENGINE_MODE=0
+POS_ARGS=()
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
+        --python-engine) PYTHON_ENGINE_MODE=1 ;;
         --*) echo "unknown flag: $arg" >&2; exit 2 ;;
         *)
-            if [ -z "$FILTER_FAMILY" ]; then FILTER_FAMILY="$arg"
-            elif [ -z "$FILTER_VARIANT" ]; then FILTER_VARIANT="$arg"
-            else echo "too many args: $arg" >&2; exit 2
-            fi
+            POS_ARGS+=("$arg")
             ;;
     esac
 done
+# Positional args: family and variant (scoped filtering)
+if [ ${#POS_ARGS[@]} -ge 1 ]; then FILTER_FAMILY="${POS_ARGS[0]}"; fi
+if [ ${#POS_ARGS[@]} -ge 2 ]; then FILTER_VARIANT="${POS_ARGS[1]}"; fi
+if [ ${#POS_ARGS[@]} -ge 3 ]; then echo "too many args: ${POS_ARGS[2]}" >&2; exit 2; fi
 
 # ── helpers ────────────────────────────────────────────────────────────────
 build_hf_url() {
@@ -320,7 +324,82 @@ download_one() {
     fi
 }
 
+# ── Python engine HF source provisioning ──────────────────────────────────
+# The qwen3_tts Python engine consumes HF source dirs directly (no GGUF
+# conversion). snapshot_download lays them down in either flat or models--
+# cache layout. This is the IAC path for the Python engine variants
+# declared under families.<f>.python_engine.variants in the manifest.
+fetch_python_engine() {
+    # Args: [family] [variant]   (both optional; empty = all)
+    local want_family="${1:-}"
+    local want_variant="${2:-}"
+    local hf_root="${AUDIOCORE_PYTHON_HF_ROOT:-/mnt/data/models/hf_cache}"
+    local fams
+    if [ -n "$want_family" ]; then
+        fams="$(jq -c --arg f "$want_family" 'if (.families[$f].python_engine) then [$f] else [] end' "$MANIFEST")"
+    else
+        fams="$(jq -c '[.families | to_entries[] | select(.value.python_engine) | .key]' "$MANIFEST")"
+    fi
+    if [ "$fams" = "[]" ]; then
+        echo "fetch_python_engine: no families with a python_engine section matched" >&2
+        return 1
+    fi
+    echo "── python_engine provisioning (hf_root=$hf_root) ───────────────────"
+    command -v python3 >/dev/null 2>&1 || { echo "error: python3 required for python_engine provisioning" >&2; return 2; }
+    local fam variant repo rev display
+    for fam in $(jq -r '.[]' <<<"$fams"); do
+        echo "  family: $fam"
+        local variants_json
+        if [ -n "$want_variant" ]; then
+            # Single variant scope: emit only if it exists under this family.
+            variants_json="$(jq -c --arg f "$fam" --arg v "$want_variant" \
+                'if (.families[$f].python_engine.variants[$v]) then "\($v)" else empty end' "$MANIFEST")"
+        else
+            variants_json="$(jq -c --arg f "$fam" '.families[$f].python_engine.variants | keys[]' "$MANIFEST")"
+        fi
+        while IFS= read -r variant_quoted; do
+            [ -z "$variant_quoted" ] && continue
+            variant="${variant_quoted//\"/}"
+            repo="$(jq -r --arg f "$fam" --arg v "$variant" \
+                '.families[$f].python_engine.variants[$v].hf_repo' "$MANIFEST")"
+            rev="$(jq -r --arg f "$fam" --arg v "$variant" \
+                '.families[$f].python_engine.variants[$v].hf_revision // "main"' "$MANIFEST")"
+            display="$(jq -r --arg f "$fam" --arg v "$variant" \
+                '.families[$f].python_engine.variants[$v].display' "$MANIFEST")"
+            echo "    ▸ $variant — $display"
+            echo "      hf_repo: $repo @$rev → $hf_root"
+            if [ "$DRY_RUN" = "1" ]; then
+                echo "      (dry-run) would call snapshot_download"
+                continue
+            fi
+            HF_TOKEN="${HF_TOKEN:-}" python3 - "$hf_root" "$repo" "$rev" <<'PYEOF' || return 1
+import os, sys
+hf_root, repo, rev = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    from huggingface_hub import snapshot_download
+except ImportError as e:
+    print(f"      error: huggingface_hub not installed: {e}", file=sys.stderr)
+    sys.exit(2)
+os.makedirs(hf_root, exist_ok=True)
+path = snapshot_download(
+    repo_id=repo, revision=rev, cache_dir=hf_root,
+    local_files_only=False,
+)
+print(f"      → {path}")
+PYEOF
+        done <<<"$variants_json"
+    done
+}
+
 # ── main loop ──────────────────────────────────────────────────────────────
+# --python-engine: alternative mode that runs only the HF source download
+# path for the Python engine (no GGUF conversion). Pass an optional family
+# name to scope it. Runs AFTER fetch_python_engine is defined above.
+if [ "$PYTHON_ENGINE_MODE" = "1" ]; then
+    fetch_python_engine "$FILTER_FAMILY" "$FILTER_VARIANT"
+    exit $?
+fi
+
 families_json="$(jq -c '.families | keys[]' "$MANIFEST")"
 status=0
 while IFS= read -r family_quoted; do

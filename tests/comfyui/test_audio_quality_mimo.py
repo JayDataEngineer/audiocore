@@ -250,3 +250,131 @@ def test_voice_clone_output_matches_reference_voice_gender(
     assert mimo.is_clean_audio(verdict, min_score=4), (
         f"voice-clone audio failed Mimo cleanliness check: {verdict}"
     )
+
+
+def test_qwen3_tts_voice_design_matches_instruct(
+    session, comfyui, submit, empty_queue, available_families, mimo
+):
+    """Voice Design mode: instruct text → generated voice matching description.
+
+    Requires the VoiceDesign HF variant
+    (Qwen3-TTS-12Hz-1.7B-VoiceDesign); skip cleanly if not downloaded.
+    The workflow asks for a "deep, warm, authoritative male voice" — Mimo
+    must hear speech matching that description.
+    """
+    _require_mimo(mimo)
+    if "qwen3_tts" not in available_families:
+        pytest.skip("qwen3_tts not registered")
+
+    import os
+    hf_root = "/mnt/data/models/hf_cache"
+    has_design = False
+    if os.path.isdir(hf_root):
+        for d in os.listdir(hf_root):
+            dl = d.lower()
+            if "qwen3-tts" in dl and "voicedesign" in dl:
+                has_design = True
+                break
+    if not has_design:
+        pytest.skip(
+            "no Qwen3-TTS-12Hz-*-VoiceDesign HF dir under "
+            "/mnt/data/models/hf_cache — voice design requires the "
+            "VoiceDesign variant (separate from Base/CustomVoice)"
+        )
+
+    p = submit.queue(session, comfyui, "qwen3_tts_voicedesign.json")
+    history = submit.wait(session, comfyui, p, timeout=900)
+    assert history["status"].get("completed") is True, (
+        f"voicedesign workflow failed: "
+        f"{history['status'].get('messages', [])[:3]}"
+    )
+
+    blob = _fetch_audio(session, comfyui, history, output_key="3")
+    _assert_valid_audio(blob, min_bytes=10_000)
+
+    design_question = (
+        "This clip was generated to match this voice instruction: "
+        "'A deep, warm, authoritative male voice with a British accent, "
+        "speaking slowly and clearly.' The text should be: 'Hello, this "
+        "is a test of the voice design feature. I can create any voice "
+        "you describe.' Respond with ONLY a JSON object (no markdown "
+        "fences): {\"speech_present\": bool, \"intelligible\": bool, "
+        "\"matches_text\": bool, \"voice_gender\": \"male\"|\"female\", "
+        "\"voice_pitch\": \"low\"|\"medium\"|\"high\", "
+        "\"matches_instruct\": bool, \"quality_score\": int 1-10, "
+        "\"description\": string}."
+    )
+    verdict = mimo.judge_audio_bytes(
+        blob, filename="voicedesign.flac", question=design_question
+    )
+    print(f"\nMimo verdict for voicedesign: {verdict}")
+    assert verdict.get("speech_present") is True, (
+        f"voicedesign audio: no speech: {verdict}"
+    )
+    assert verdict.get("intelligible") is True, (
+        f"voicedesign audio: not intelligible: {verdict}"
+    )
+    assert verdict.get("voice_gender") == "male", (
+        f"voicedesign audio: expected male voice per instruct, got "
+        f"{verdict.get('voice_gender')}: {verdict}"
+    )
+    assert verdict.get("voice_pitch") == "low", (
+        f"voicedesign audio: expected low pitch per instruct, got "
+        f"{verdict.get('voice_pitch')}: {verdict}"
+    )
+    assert int(verdict.get("quality_score", 0)) >= 5, (
+        f"voicedesign audio quality too low: {verdict}"
+    )
+
+
+def test_qwen3_tts_multilingual_speaker_selection(
+    session, comfyui, submit, empty_queue, available_families, mimo
+):
+    """Multi-speaker + multi-language: Aiden (English) voice selection.
+
+    Verifies the CustomVoice variant's speaker dropdown works end-to-end:
+    passing speaker='Aiden' produces a male English voice distinct from
+    the default 'Vivian' (female Chinese). Catches regressions in the
+    speaker parameter plumbing through the engine.
+    """
+    _require_mimo(mimo)
+    if "qwen3_tts" not in available_families:
+        pytest.skip("qwen3_tts not registered")
+
+    p = submit.queue(session, comfyui, "qwen3_tts_multilingual.json")
+    history = submit.wait(session, comfyui, p, timeout=600)
+    assert history["status"].get("completed") is True, (
+        f"multilingual workflow failed: "
+        f"{history['status'].get('messages', [])[:3]}"
+    )
+
+    blob = _fetch_audio(session, comfyui, history, output_key="3")
+    _assert_valid_audio(blob, min_bytes=5_000)
+
+    speaker_question = (
+        "This clip should be ENGLISH SPEECH in a MALE voice (speaker "
+        "'Aiden') saying: 'The quick brown fox jumps over the lazy dog "
+        "at noon.' Respond with ONLY a JSON object (no markdown fences): "
+        "{\"speech_present\": bool, \"language\": \"english\"|\"chinese\"|"
+        "\"japanese\"|\"other\", \"voice_gender\": \"male\"|\"female\", "
+        "\"matches_text\": bool, \"quality_score\": int 1-10, "
+        "\"description\": string}."
+    )
+    verdict = mimo.judge_audio_bytes(
+        blob, filename="aiden_en.flac", question=speaker_question
+    )
+    print(f"\nMimo verdict for multilingual/speaker: {verdict}")
+    assert verdict.get("speech_present") is True, (
+        f"multilingual audio: no speech: {verdict}"
+    )
+    assert verdict.get("language") == "english", (
+        f"multilingual audio: expected english, got "
+        f"{verdict.get('language')}: {verdict}"
+    )
+    assert verdict.get("voice_gender") == "male", (
+        f"multilingual audio: expected male (Aiden), got "
+        f"{verdict.get('voice_gender')}: {verdict}"
+    )
+    assert int(verdict.get("quality_score", 0)) >= 5, (
+        f"multilingual audio quality too low: {verdict}"
+    )

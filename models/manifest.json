@@ -236,6 +236,38 @@
           "notes": "Stage 10: fails fast with pointer at GAPS.md \u00a72.2. Chunked transport scaffold exists at /v1/audio/speech/stream."
         }
       },
+      "python_engine": {
+        "engine": "qwen_tts (pip-installed Python package)",
+        "description": "HF source dirs consumed by comfyui/engines/qwen3_tts.py. The Python engine bypasses the C++/GGUF path entirely and calls Qwen3TTSModel.from_pretrained(hf_dir) directly. Provisioning is via huggingface_hub.snapshot_download; the engine resolves both flat-dir layout (<hf_root>/<RepoShortName>/config.json) and HF cache layout (<hf_root>/models--<org>--<name>/snapshots/<hash>/config.json). Set AUDIOCORE_PYTHON_HF_ROOT (defaults to /mnt/data/models/hf_cache) to choose where these land.",
+        "hf_root_env": "AUDIOCORE_PYTHON_HF_ROOT (default /mnt/data/models/hf_cache)",
+        "provisioning": "scripts/fetch_models.sh --python-engine qwen3_tts  (calls snapshot_download for every variant below)",
+        "variants": {
+          "qwen3-tts-0.6b-customvoice": {
+            "display": "Qwen3-TTS 0.6B CustomVoice (Python engine, HF source)",
+            "hf_repo": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            "hf_revision": "main",
+            "engine_variant_key": "customvoice",
+            "min_vram_gb": 4,
+            "notes": "Default variant for plain TTS with predefined speakers (Vivian, Serena, Aiden, Ono_Anna, Sohee, etc.). 9 premium timbres across 4 languages (zh, en, ja, ko)."
+          },
+          "qwen3-tts-0.6b-base": {
+            "display": "Qwen3-TTS 0.6B Base (Python engine, HF source)",
+            "hf_repo": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            "hf_revision": "main",
+            "engine_variant_key": "base",
+            "min_vram_gb": 4,
+            "notes": "Required for zero-shot voice cloning (compute_embedding + generate_voice_clone). Same footprint as CustomVoice but exposes create_voice_clone_prompt."
+          },
+          "qwen3-tts-1.7b-voicedesign": {
+            "display": "Qwen3-TTS 1.7B VoiceDesign (Python engine, HF source)",
+            "hf_repo": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+            "hf_revision": "main",
+            "engine_variant_key": "voicedesign",
+            "min_vram_gb": 6,
+            "notes": "Required for instruction-following voice design (mode='design' + instruct text). Only the 1.7B variant ships VoiceDesign weights; there is no 0.6B VoiceDesign on HF."
+          }
+        }
+      },
       "variants": {
         "qwen3-tts-1.7b-base": {
           "display": "Qwen3-TTS 1.7B Base",
