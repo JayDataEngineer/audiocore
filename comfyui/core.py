@@ -135,10 +135,9 @@ def _estimate_vram(model_path: str) -> int:
     return total
 
 
-# Rough VRAM estimates for Python-engine families (no .gguf files to sum).
-# Values are upper bounds for bf16 weights + KV + activation working set.
 _PYTHON_ENGINE_VRAM = {
     "moss_sfx_v2":   4 * 1024 * 1024 * 1024,   # 1.3B DiT + DAC VAE + Qwen3-TE bf16
+    "qwen3_tts":     2 * 1024 * 1024 * 1024,   # 0.6B talker + predictor + speech_tokenizer bf16
 }
 
 

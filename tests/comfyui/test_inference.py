@@ -203,19 +203,10 @@ def test_ace_step_inference_produces_valid_audio(
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "KNOWN ISSUE (2026-07-17): qwen3_tts cold-load + inference crashes "
-        "the prompt_worker thread in the current container build (container "
-        "auto-restarts via unless-stopped policy). Inference path needs the "
-        ".so rebuilt from current source; remove xfail once that's done."
-    ),
-    strict=False,
-)
 def test_qwen3_tts_inference_produces_valid_audio(
     session, comfyui, submit, empty_queue, available_families
 ):
-    """End-to-end TTS with qwen3_tts (1.7B talker + predictor)."""
+    """End-to-end TTS with qwen3_tts via the Python engine (qwen-tts pkg)."""
     if "qwen3_tts" not in available_families:
         pytest.skip("qwen3_tts not registered in this build")
     p = submit.queue(session, comfyui, "tts_qwen3_tts.json")
@@ -233,45 +224,36 @@ def test_qwen3_tts_inference_produces_valid_audio(
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "KNOWN ISSUE (2026-07-17): qwen3_tts inference path is unstable in "
-        "the current container build (crashes prompt_worker); voice-embed "
-        "roundtrip inherits that. Remove xfail once the .so is rebuilt."
-    ),
-    strict=False,
-)
 def test_qwen3_tts_voice_embedding_roundtrip(
     session, comfyui, submit, empty_queue, available_families
 ):
     """Full voice-clone pipeline: load w/ speaker_encoder → compute embedding
     from a reference WAV → TTS with that embedding → real cloned audio.
 
-    This is the qwen3_tts-specific path that bypasses per-call ECAPA.
-    Requires the qwen3tts-speaker-encoder.gguf on disk.
+    Voice cloning requires the *Base* model variant
+    (Qwen3-TTS-12Hz-{0.6B,1.7B}-Base); the CustomVoice variant rejects
+    `create_voice_clone_prompt`. Skip cleanly if no Base variant is
+    downloaded so this test only runs in environments that actually
+    ship voice-clone support.
     """
     if "qwen3_tts" not in available_families:
         pytest.skip("qwen3_tts not registered in this build")
-    # The encoder GGUF lives at a known path; skip cleanly if absent.
-    # (Cheaper than a one-shot workflow probe.)
-    import requests
-    # Use the ComfyUI folder API as a quick existence check.
-    models_r = session.get(
-        f"{comfyui}/models/audiocore?filter=qwen3tts-speaker", timeout=5
-    )
-    encoder_present = False
-    if models_r.status_code == 200:
-        try:
-            for p in models_r.json():
-                if "speaker-encoder" in p.lower():
-                    encoder_present = True
-                    break
-        except Exception:
-            pass
-    if not encoder_present:
+
+    # The qwen_tts package gates create_voice_clone_prompt /
+    # generate_voice_clone on tts_model_type == "base". The host
+    # HF cache mirrors what's mounted into the container.
+    import os
+    hf_root = "/mnt/data/models/hf_cache"
+    has_base = False
+    if os.path.isdir(hf_root):
+        for d in os.listdir(hf_root):
+            if d.startswith("Qwen3-TTS-12Hz-") and d.endswith("-Base"):
+                has_base = True
+                break
+    if not has_base:
         pytest.skip(
-            "qwen3tts-speaker-encoder.gguf not found under /models/audiocore; "
-            "skipping voice-embed roundtrip"
+            "no Qwen3-TTS-12Hz-*-Base HF dir under /mnt/data/models/hf_cache — "
+            "voice cloning requires the Base variant (CustomVoice alone won't do)"
         )
 
     p = submit.queue(session, comfyui, "qwen3_tts_embed.json")

@@ -66,7 +66,6 @@ def test_moss_tts_audio_passes_mimo_cleanliness_check(
     )
 
 
-@pytest.mark.xfail(reason=("Inherits qwen3_tts cold-load crash from test_inference.test_qwen3_tts_inference_produces_valid_audio. Remove xfail when the .so is rebuilt."), strict=False)
 def test_qwen3_tts_audio_passes_mimo_cleanliness_check(
     session, comfyui, submit, empty_queue, available_families, mimo
 ):
@@ -206,7 +205,6 @@ def test_moss_sfx_v2_audio_passes_mimo_sfx_check(
     )
 
 
-@pytest.mark.xfail(reason=("Inherits qwen3_tts cold-load crash from test_inference.test_qwen3_tts_voice_embedding_roundtrip. Remove xfail when the .so is rebuilt."), strict=False)
 def test_voice_clone_output_matches_reference_voice_gender(
     session, comfyui, submit, empty_queue, available_families, mimo
 ):
@@ -215,26 +213,29 @@ def test_voice_clone_output_matches_reference_voice_gender(
 
     This is the highest-level e2e check for the qwen3_tts clone path:
     embedding extraction → voice-conditioned TTS → real audible speech.
+
+    Requires the *Base* model variant (Qwen3-TTS-12Hz-*-Base); the
+    CustomVoice variant rejects voice cloning at the package level.
     """
     _require_mimo(mimo)
     if "qwen3_tts" not in available_families:
         pytest.skip("qwen3_tts not registered")
 
-    # Need the speaker encoder GGUF too.
-    models_r = session.get(
-        f"{comfyui}/models/audiocore?filter=qwen3tts-speaker", timeout=5
-    )
-    encoder_present = False
-    if models_r.status_code == 200:
-        try:
-            for p in models_r.json():
-                if "speaker-encoder" in p.lower():
-                    encoder_present = True
-                    break
-        except Exception:
-            pass
-    if not encoder_present:
-        pytest.skip("speaker_encoder GGUF missing — can't run clone pipeline")
+    # Voice cloning requires the Base HF variant — same predicate as
+    # test_qwen3_tts_voice_embedding_roundtrip in test_inference.py.
+    import os
+    hf_root = "/mnt/data/models/hf_cache"
+    has_base = False
+    if os.path.isdir(hf_root):
+        for d in os.listdir(hf_root):
+            if d.startswith("Qwen3-TTS-12Hz-") and d.endswith("-Base"):
+                has_base = True
+                break
+    if not has_base:
+        pytest.skip(
+            "no Qwen3-TTS-12Hz-*-Base HF dir under /mnt/data/models/hf_cache — "
+            "voice cloning requires the Base variant"
+        )
 
     p = submit.queue(session, comfyui, "qwen3_tts_embed.json")
     history = submit.wait(session, comfyui, p, timeout=900)

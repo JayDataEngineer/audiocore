@@ -10,8 +10,9 @@ from typing import Any
 _ENGINES: dict[str, str] = {
     # family_id → "module.ClassName" inside this package
     "moss_sfx_v2": "moss_sfx_v2.MossSfxV2Engine",
-    # moss_tts, qwen3_tts, ace_step: still on C++ for now.
-    # Port these in Phase 2 once moss_sfx_v2 pattern is proven in prod.
+    "qwen3_tts": "qwen3_tts.Qwen3TtsEngine",
+    # moss_tts, ace_step: still on C++ for now.
+    # Port these next once qwen3_tts pattern is proven in prod.
 }
 
 
