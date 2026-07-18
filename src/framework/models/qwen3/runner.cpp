@@ -264,6 +264,9 @@ bool Runner::forward_embeddings(const float* embd, int32_t n_tokens, int32_t n_p
 
         // Only copy the last position's hidden state, and only from the
         // final chunk (that's the only slot callers actually read).
+        // last_only=true marks only batch position (chunk_size - 1) for
+        // output, so output_ids[chunk_size - 1] resolves to the only
+        // logits-enabled row regardless of chunk_size.
         if (is_last && hidden) {
             const float* row = llama_get_embeddings_ith(ctx_, chunk_size - 1);
             if (!row) {
